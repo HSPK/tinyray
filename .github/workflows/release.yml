@@ -81,11 +81,12 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64
             manylinux: auto
-          - runner: macos-13
-            target: x86_64
-            manylinux: "off"
+          # One universal2 wheel covers both Apple Silicon and Intel, so the
+          # release does not depend on the macos-13 Intel runners, which are
+          # being retired and queue for a long time when they are available at
+          # all.
           - runner: macos-14
-            target: aarch64
+            target: universal2-apple-darwin
             manylinux: "off"
     steps:
       - uses: actions/checkout@v4
