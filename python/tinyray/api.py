@@ -506,6 +506,7 @@ def launch_process(
     strategy: str = "PACK",
     cwd: Optional[str] = None,
     host: Optional[str] = None,
+    max_restarts: int = 0,
 ):
     """Start and supervise a process tinyray did not write.
 
@@ -537,6 +538,7 @@ def launch_process(
         startup_timeout=startup_timeout,
         cwd=cwd,
         host=host,
+        max_restarts=max_restarts,
     )
 
 

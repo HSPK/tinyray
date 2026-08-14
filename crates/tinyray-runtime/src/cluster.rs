@@ -55,6 +55,18 @@ impl Resources {
         }
     }
 
+    /// Cap every field at `total`, so a double release cannot create capacity.
+    pub fn clamp_to(&mut self, total: &Resources) {
+        self.num_cpus = self.num_cpus.min(total.num_cpus);
+        self.num_gpus = self.num_gpus.min(total.num_gpus);
+        self.memory_bytes = self.memory_bytes.min(total.memory_bytes);
+        for (name, amount) in self.custom.iter_mut() {
+            if let Some(cap) = total.custom.get(name) {
+                *amount = amount.min(*cap);
+            }
+        }
+    }
+
     pub fn add(&mut self, released: &Resources) {
         self.num_cpus += released.num_cpus;
         self.num_gpus += released.num_gpus;
@@ -336,12 +348,22 @@ impl ClusterState {
     }
 
     /// Return resources to a node.
+    ///
+    /// Clamped to the node's total. A double release is a bug in the caller,
+    /// but left unchecked it does not merely lose track of a GPU -- it invents
+    /// one, and the scheduler then places two processes on hardware that fits
+    /// one. That failure surfaces much later, somewhere else, and usually
+    /// looks like a NCCL problem.
     pub fn release(&mut self, node_id: NodeId, resources: &Resources, gpu_ids: &[u32]) {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.available.add(resources);
+            node.available.clamp_to(&node.total);
             node.free_gpus.extend_from_slice(gpu_ids);
             node.free_gpus.sort_unstable();
             node.free_gpus.dedup();
+            // Physical devices cannot exceed what the node reported either.
+            node.free_gpus
+                .retain(|gpu| (*gpu as f64) < node.total.num_gpus);
         }
     }
 
@@ -645,6 +667,31 @@ mod tests {
             .place_gang(&gpu_actor(), 2, Strategy::StrictSpread)
             .unwrap();
         assert_ne!(placements[0].0, placements[1].0);
+    }
+
+    #[test]
+    fn a_double_release_cannot_invent_capacity() {
+        // Releasing twice is a caller bug, but the consequence must be a
+        // no-op rather than a scheduler that believes in extra hardware.
+        let mut state = cluster(vec![node(1, 16.0, 2)]);
+        let (node_id, gpu_ids) = state.place(&gpu_actor(), Strategy::Pack, &[]).unwrap();
+        state.release(node_id, &gpu_actor(), &gpu_ids);
+        state.release(node_id, &gpu_actor(), &gpu_ids);
+
+        let node = state.node(node_id).unwrap();
+        assert_eq!(
+            node.available.num_cpus, 16.0,
+            "CPUs exceeded the node total"
+        );
+        assert_eq!(node.free_gpus.len(), 2, "a GPU was conjured out of nothing");
+    }
+
+    #[test]
+    fn releasing_an_unknown_gpu_id_is_ignored() {
+        let mut state = cluster(vec![node(1, 16.0, 2)]);
+        let node_id = NodeId::from_parts(0, 1);
+        state.release(node_id, &Resources::cpus(0.0), &[7, 8, 9]);
+        assert_eq!(state.node(node_id).unwrap().free_gpus, vec![0, 1]);
     }
 
     #[test]

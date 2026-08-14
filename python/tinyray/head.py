@@ -70,6 +70,9 @@ class Head:
         # torchrun jobs, anything with its own idea of how to run.
         self._supervisors: dict[str, ProcessSupervisor] = {}
         self._process_nodes: dict[str, tuple[str, float, float, list[int]]] = {}
+        self._process_specs: dict[str, dict[str, Any]] = {}
+        self._on_process_lost: Optional[Callable[[str, str], None]] = None
+        self._on_process_restarted: Optional[Callable[[str, ManagedProcess], None]] = None
 
     # -- registration ----------------------------------------------------
 
@@ -375,6 +378,23 @@ class Head:
 
         with self._lock:
             self._process_nodes[name] = (node_id, num_cpus, num_gpus, list(gpu_ids))
+            # Enough to start it again in the same shape. A restart that lost
+            # the environment would come back without its rank.
+            self._process_specs[name] = {
+                "command": list(command),
+                "num_cpus": num_cpus,
+                "num_gpus": num_gpus,
+                "memory_bytes": memory_bytes,
+                "strategy": strategy,
+                "env": dict(env or {}),
+                "allocate_port": allocate_port,
+                "ready_when": ready_when,
+                "startup_timeout": startup_timeout,
+                "max_restarts": max_restarts,
+                "cwd": cwd,
+                "host": host,
+                "restarts": 0,
+            }
         return managed
 
     def await_process_ready(self, managed: ManagedProcess, timeout: float) -> None:
@@ -386,13 +406,9 @@ class Head:
         raise KeyError(f"no supervisor owns {managed.name!r}")
 
     def stop_process(self, name: str) -> None:
-        with self._lock:
-            placement = self._process_nodes.pop(name, None)
         for supervisor in self._supervisors.values():
             supervisor.stop(name)
-        if placement is not None:
-            node_id, num_cpus, num_gpus, gpu_ids = placement
-            self.state.release(node_id, num_cpus, num_gpus, gpu_ids)
+        self._release_process(name)
 
     def processes(self) -> list[ManagedProcess]:
         out: list[ManagedProcess] = []
@@ -490,6 +506,95 @@ class Head:
         for handle in handles:
             for actor_id, exit_code in handle.agent.reap():
                 self._handle_actor_death(actor_id, reason=f"process exited with code {exit_code}")
+
+        # Managed processes need the same treatment. Without it an inference
+        # server that dies stays in the registry forever, still holding the
+        # GPUs it was given.
+        for supervisor in list(self._supervisors.values()):
+            for name, exit_code in supervisor.reap():
+                self._handle_process_death(name, exit_code)
+
+    def set_process_callbacks(
+        self,
+        *,
+        on_lost: Optional[Callable[[str, str], None]] = None,
+        on_restarted: Optional[Callable[[str, ManagedProcess], None]] = None,
+    ) -> None:
+        self._on_process_lost = on_lost
+        self._on_process_restarted = on_restarted
+
+    def _handle_process_death(self, name: str, exit_code: int) -> None:
+        with self._lock:
+            spec = self._process_specs.get(name)
+
+        if spec is None:
+            return
+
+        reason = f"exited with code {exit_code}"
+        if spec["restarts"] >= spec["max_restarts"]:
+            self._release_process(name)
+            if self._on_process_lost is not None:
+                self._on_process_lost(name, reason)
+            return
+
+        # Hand the reservation back before asking for it again, so a restart
+        # onto the same node does not need a second set of GPUs to exist.
+        #
+        # Exactly one owner releases a reservation, and it is whoever holds the
+        # record. Popping and releasing together is what makes that true: a
+        # second release does not lose a GPU, it invents one, and the scheduler
+        # then oversubscribes hardware the machine does not have.
+        self._release_process_placement(name)
+        with self._lock:
+            restarts = spec["restarts"] + 1
+
+        try:
+            managed = self.launch_process(
+                spec["command"],
+                name=name,
+                num_cpus=spec["num_cpus"],
+                num_gpus=spec["num_gpus"],
+                memory_bytes=spec["memory_bytes"],
+                strategy=spec["strategy"],
+                env=spec["env"],
+                allocate_port=spec["allocate_port"],
+                ready_when=spec["ready_when"],
+                startup_timeout=spec["startup_timeout"],
+                max_restarts=spec["max_restarts"],
+                cwd=spec["cwd"],
+                host=spec["host"],
+            )
+        except Exception as exc:
+            self._release_process(name)
+            if self._on_process_lost is not None:
+                self._on_process_lost(name, f"{reason}; restart failed: {exc}")
+            return
+
+        with self._lock:
+            self._process_specs[name]["restarts"] = restarts
+        managed.restarts = restarts
+        if self._on_process_restarted is not None:
+            self._on_process_restarted(name, managed)
+
+    def _release_process_placement(self, name: str) -> None:
+        """Return a process's reservation exactly once.
+
+        Popping the record and releasing in one step is what makes it exactly
+        once. A second release does not lose a GPU, it invents one, and the
+        scheduler goes on to place two processes on hardware that only fits
+        one -- a failure that surfaces much later and looks like a NCCL bug.
+        """
+        with self._lock:
+            placement = self._process_nodes.pop(name, None)
+        if placement is not None:
+            node_id, num_cpus, num_gpus, gpu_ids = placement
+            self.state.release(node_id, num_cpus, num_gpus, gpu_ids)
+
+    def _release_process(self, name: str) -> None:
+        """Forget a process entirely and return its reservation."""
+        self._release_process_placement(name)
+        with self._lock:
+            self._process_specs.pop(name, None)
 
     def _handle_actor_death(self, actor_id: str, *, reason: str) -> None:
         entry = self.state.actor(actor_id)

@@ -62,7 +62,7 @@ from .process import (
 from .serve import Server, serve
 from .worker_group import WorkerGroup, create_worker_group, torchrun_env
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "ActorDied",

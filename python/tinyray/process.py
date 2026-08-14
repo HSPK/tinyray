@@ -15,6 +15,7 @@ success, or a line appearing in its log.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
@@ -191,24 +192,55 @@ class ManagedProcess:
         return "".join(self.recent_log()[-lines:])
 
     def terminate(self, *, timeout: float = 15.0) -> None:
-        """Ask the process to stop, then insist.
+        """Stop the process and everything it started.
 
-        Inference servers hold GPU memory until they exit, so leaving one
-        half-dead strands a card until someone notices.
+        Signalling the whole process group is the point. `torchrun` spawns one
+        child per GPU and SGLang spawns schedulers and workers; signalling only
+        the parent leaves those children running, holding GPU memory that
+        nothing will ever reclaim. Every restart would strand another set.
         """
         if not self.is_alive():
             return
-        self.process.send_signal(signal.SIGTERM)
+        self._signal_group(signal.SIGTERM)
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            self.process.kill()
+            self._signal_group(signal.SIGKILL)
             self.process.wait(timeout=timeout)
+        # The parent is gone; make sure nothing it spawned outlived it.
+        self._reap_group()
 
     def kill(self) -> None:
         if self.is_alive():
-            self.process.kill()
+            self._signal_group(signal.SIGKILL)
             self.process.wait(timeout=15)
+        self._reap_group()
+
+    def _signal_group(self, sig: int) -> None:
+        """Signal the whole process group, falling back to the parent alone."""
+        try:
+            os.killpg(os.getpgid(self.process.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            # No group of its own, or already gone.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                self.process.send_signal(sig)
+
+    def _reap_group(self, grace: float = 2.0) -> None:
+        """Kill anything left in the group after the parent exited."""
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                pgid = os.getpgid(self.process.pid)
+            except (ProcessLookupError, OSError):
+                # The parent is gone, so the group id is no longer reachable
+                # through it; nothing further we can target safely.
+                return
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, OSError):
+                return
+            os.killpg(pgid, signal.SIGKILL)
+            time.sleep(0.1)
 
 
 def _substitute(values: Sequence[str], port: Optional[int]) -> list[str]:
@@ -280,6 +312,10 @@ class ProcessSupervisor:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                # Its own process group, so stopping it stops everything it
+                # spawned. Without this, torchrun's per-GPU children and
+                # SGLang's schedulers survive their parent and keep the GPUs.
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise ProcessStartupError(

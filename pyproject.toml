@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tinyray"
-version = "0.2.0"
+version = "0.2.1"
 description = "An HTTP control plane for ML experiments: placement, ranks, supervision. Rust core, Python API."
 readme = "README.md"
 requires-python = ">=3.9"
