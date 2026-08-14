@@ -182,7 +182,9 @@ class TestActorRegistry:
 
 class TestGangCreation:
     def test_create_actors_starts_them_all(self, ray):
-        @tinyray.remote
+        # A slice of a CPU each: the point is that four processes start
+        # atomically, not that the machine has four spare cores.
+        @tinyray.remote(num_cpus=0.1)
         class Worker:
             def __init__(self, tag):
                 self.tag = tag

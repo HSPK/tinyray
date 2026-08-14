@@ -31,7 +31,14 @@ def ray():
     tinyray.shutdown()
 
 
-@tinyray.remote
+# These tests exercise the *shape* of a workload, not resource accounting, so
+# the actors ask for a slice of a CPU rather than a whole one. With the default
+# of one CPU each, a four-core CI runner cannot host the group and gang
+# placement correctly refuses -- a failure about the runner, not about tinyray.
+LIGHT = {"num_cpus": 0.1}
+
+
+@tinyray.remote(**LIGHT)
 class Rollout:
     """Stands in for an environment sampler."""
 
@@ -61,7 +68,7 @@ class Rollout:
         return {"steps": self.steps, "weights_version": self.weights_version}
 
 
-@tinyray.remote
+@tinyray.remote(**LIGHT)
 class Learner:
     """Consumes rollouts and produces the next weights."""
 
@@ -145,7 +152,7 @@ class TestRolloutLoop:
 
 class TestHyperparameterSweep:
     def test_sweep_with_early_stopping(self, ray):
-        @tinyray.remote
+        @tinyray.remote(**LIGHT)
         class Trial:
             def __init__(self, learning_rate):
                 self.learning_rate = learning_rate
@@ -175,7 +182,7 @@ class TestHyperparameterSweep:
         assert ray.get(trials[1].evaluate.remote())["lr"] == 0.01
 
     def test_pool_streams_results_as_they_finish(self, ray):
-        @tinyray.remote
+        @tinyray.remote(**LIGHT)
         class Trial:
             def run(self, config):
                 time.sleep(0.05 * (config % 3))
@@ -188,7 +195,7 @@ class TestHyperparameterSweep:
 
 class TestFailureModes:
     def test_one_failing_trial_does_not_take_down_the_sweep(self, ray):
-        @tinyray.remote
+        @tinyray.remote(**LIGHT)
         class Trial:
             def __init__(self, should_fail):
                 self.should_fail = should_fail
