@@ -54,7 +54,12 @@ jobs:
       - run: ruff format --check python/ tests/ benchmarks/ scripts/
 
       - name: Build and install the extension
-        run: maturin develop --release
+        # `maturin develop` insists on a virtualenv; setup-python gives us a
+        # bare interpreter. Building a wheel and installing it also exercises
+        # the artefact users will actually receive.
+        run: |
+          maturin build --release --out dist
+          python -m pip install --find-links dist --force-reinstall tinyray
 
       - run: mypy
       - run: pytest tests/ -q
