@@ -32,20 +32,54 @@ same eight actors must still attend the next barrier -- see `tinyray.collective`
 
 ## What it is, and is not
 
-Built for one workload: RL rollouts and hyperparameter sweeps, ~32 actors,
-~10 MB payloads, ~200 ms per call.
+**tinyray is an HTTP control plane. The data plane belongs to the framework.**
+
+SGLang, vLLM, Megatron and `torchrun` already do distributed compute well. What
+they want from a cluster manager is placement, rank assignment, supervision and
+restart -- and then to be left alone.
 
 * **Actors only.** No stateless tasks. ML workers hold models and CUDA contexts.
-* **HTTP for control and results.** At 200 ms per call a ~200 µs round trip is
-  0.1% overhead, and every message is inspectable with ordinary tools.
-* **No object store.** A result stays in the actor that produced it; consumers
-  fetch it directly. No plasma, no spilling, no distributed refcounting.
-* **NCCL for weights.** tinyray implements no collective transport at all. It
-  assigns ranks and manages the epoch state machine; `torch.distributed` moves
-  the bytes.
+* **HTTP for control.** At 200 ms per call a ~200 us round trip is 0.1%
+  overhead, and every message is inspectable with ordinary tools.
+* **It never claims a process-global resource.** A process has one default
+  `torch.distributed` group, one CUDA context, one set of signal handlers. Those
+  belong to your framework. tinyray assigns ranks and injects the `torchrun`
+  environment; you call `init_process_group` yourself.
+* **It supervises processes it did not write.** An SGLang server is an ordinary
+  process: give it GPUs, wait until it actually serves, label its logs, restart
+  it when it dies.
+* **No object store.** For pure-Python rollouts a result stays in the actor that
+  produced it and consumers fetch it directly. When a framework owns the data,
+  tinyray moves references and nothing else.
 
-Design notes, measurements and the decisions the implementation forced us to
-revise are kept with the source rather than published here.
+```python
+@tr.remote(num_gpus=1)
+class Trainer:
+    def __init__(self):
+        import torch.distributed as dist
+        dist.init_process_group(backend="nccl")   # yours, not tinyray's
+
+group = tr.create_worker_group(Trainer, size=8, name="trainer")
+group.run("train_step", batch)          # dispatched to all ranks, then awaited
+
+server = tr.launch_process(              # not a tinyray actor at all
+    ["python", "-m", "sglang.launch_server", "--port", "{port}"],
+    name="rollout", num_gpus=4, ready_when="http:/health",
+)
+```
+
+Two details that are load-bearing rather than cosmetic:
+
+* **Constructors run concurrently.** A framework that rendezvous in `__init__`
+  blocks rank 0 until the last rank arrives, so constructing a group serially
+  deadlocks on the first worker.
+* **Readiness is observed, not assumed.** An inference server binds its port
+  minutes before it can answer; `ready_when="http:/health"` waits for the
+  second event, not the first.
+
+`tinyray.collective` still exists for pure-tinyray NCCL groups, but it takes the
+default process group and therefore **cannot coexist with Megatron or SGLang**.
+Use `create_worker_group` unless nothing else in the process wants that group.
 
 ## Why Rust
 

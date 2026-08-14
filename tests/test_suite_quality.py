@@ -55,12 +55,12 @@ class TestNoDeadModules:
     #
     # This list is the record: a gap that is written down is a decision, and a
     # gap that is not is an oversight. Adding an entry should be uncomfortable.
-    KNOWN_UNWIRED: ClassVar[dict[str, str]] = {
-        "shm": (
-            "same-node fast path: written and unit tested, but the transport "
-            "never calls it, so same-node results still go through a socket"
-        ),
-    }
+    #: Empty on purpose. The one entry that lived here -- a same-node
+    #: shared-memory fast path -- was deleted rather than wired up: tinyray is a
+    #: control plane, tensors move inside the framework, and a data-plane
+    #: optimisation had no future. Dead code with a justification is still dead
+    #: code.
+    KNOWN_UNWIRED: ClassVar[dict[str, str]] = {}
 
     def test_every_rust_module_is_used_somewhere(self):
         runtime_src = ROOT / "crates" / "tinyray-runtime" / "src"
@@ -92,6 +92,12 @@ class TestNoDeadModules:
                 f"{module} is exempted from the wiring check with only {reason!r}; "
                 "say what it does and why nothing calls it, or wire it up"
             )
+
+    def test_the_exemption_list_stays_empty_by_preference(self):
+        assert len(self.KNOWN_UNWIRED) <= 1, (
+            "several modules are exempted from the wiring check; each one is a "
+            "feature that looks implemented and is not"
+        )
 
 
 class TestTimingConstantsAreInjectable:

@@ -4,6 +4,14 @@
 ``torch.distributed``; this module supplies the parts NCCL leaves to the caller:
 rank assignment, rendezvous, and what to do when a member dies.
 
+.. warning::
+   This module calls ``init_process_group`` on your behalf, which claims the
+   process's one and only default group. A worker that also runs Megatron,
+   SGLang, vLLM or DeepSpeed cannot use it: those frameworks need that group for
+   their own topology. Use :mod:`tinyray.worker_group` instead -- it assigns
+   ranks and injects the ``torchrun`` environment, then leaves initialisation
+   entirely to the framework.
+
 Three consequences of using NCCL are worth understanding before you build a
 group, because each one turns into a hang rather than an error if ignored.
 

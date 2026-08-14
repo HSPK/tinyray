@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "tinyray"
-version = "0.0.3"
-description = "A minimal, actor-only Ray for ML experiments. Rust core, Python API."
+version = "0.1.0"
+description = "An HTTP control plane for ML experiments: placement, ranks, supervision. Rust core, Python API."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }

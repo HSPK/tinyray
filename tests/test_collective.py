@@ -12,12 +12,19 @@ registry is the difference between a clear message and a stuck job.
 from __future__ import annotations
 
 import os
+import socket
 import time
 
 import pytest
 
 import tinyray
 from tinyray._tinyray import CollectiveRegistry, new_id
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return int(sock.getsockname()[1])
 
 
 def member(index: int, *, gpus=1.0, node="node0", gpu_ids=None, alive=True):
@@ -272,34 +279,57 @@ class TestCollectiveRun:
 
 
 class TestActorSideHelpers:
-    def test_join_requires_torch(self, ray):
-        # No torch in this environment, so joining must fail with something a
-        # user can act on rather than an obscure ImportError deep in a thread.
-        @tinyray.remote
+    def test_joining_takes_the_default_process_group(self, ray):
+        """Why `tinyray.collective` cannot coexist with Megatron or SGLang.
+
+        Joining a tinyray-managed group calls ``init_process_group``, which
+        claims the process's one and only default group. A framework that needs
+        it for its own topology then has nowhere to go, and a second call
+        raises. `tinyray.worker_group` exists precisely to avoid this: it
+        assigns ranks and lets the framework initialise its own groups.
+        """
+        torch_dist = pytest.importorskip("torch.distributed")
+        if not torch_dist.is_gloo_available():
+            pytest.skip("gloo is required")
+
+        @tinyray.remote(num_cpus=0.1)
         class Rank:
-            def ping(self):
-                return "pong"
+            def join_alone(self, rendezvous):
+                from tinyray.collective import actor_state
+
+                actor_state().join(rendezvous)
+                import torch.distributed as dist
+
+                return dist.is_initialized()
+
+            def second_init_fails(self):
+                import torch.distributed as dist
+
+                try:
+                    dist.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:1")
+                    return "unexpectedly succeeded"
+                except Exception as exc:
+                    return type(exc).__name__
 
         handle = Rank.remote()
-        with pytest.raises(tinyray.UserCodeError) as excinfo:
-            ray.get(
-                handle._submit(
-                    "__tinyray_join_collective__",
-                    (
-                        {
-                            "group_id": "g",
-                            "epoch": 0,
-                            "rank": 0,
-                            "world_size": 2,
-                            "store_host": "127.0.0.1",
-                            "store_port": 29500,
-                            "backend": "nccl",
-                        },
-                    ),
-                    {},
-                )
-            )
-        assert "torch" in str(excinfo.value)
+        rendezvous = {
+            "group_id": "solo",
+            "epoch": 0,
+            "rank": 0,
+            # A group of one so the rendezvous completes without peers.
+            "world_size": 1,
+            "store_host": "127.0.0.1",
+            "store_port": _free_port(),
+            "backend": "gloo",
+        }
+        assert ray.get(handle.join_alone.remote(rendezvous), timeout=60) is True
+
+        # The framework's own initialisation is now impossible in this process.
+        outcome = ray.get(handle.second_init_fails.remote(), timeout=60)
+        assert outcome != "unexpectedly succeeded", (
+            "a second init_process_group succeeded; the conflict this test "
+            "documents would not exist, and worker groups would be unnecessary"
+        )
 
     def test_unknown_control_method_is_rejected(self, ray):
         @tinyray.remote

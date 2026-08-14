@@ -424,6 +424,37 @@ def _construct(
     return handle
 
 
+def construct_all(
+    context: Context,
+    entries: list[dict[str, Any]],
+    cls: type,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> list[ActorHandle]:
+    """Construct a group of actors concurrently.
+
+    Every constructor is dispatched before any is awaited. Frameworks that
+    rendezvous in ``__init__`` -- Megatron, SGLang and anything else calling
+    ``init_process_group`` there -- make this mandatory rather than merely
+    faster: rank 0 blocks inside the rendezvous until the last rank arrives, so
+    constructing them one at a time deadlocks on the first one.
+    """
+    handles = []
+    refs = []
+    for entry in entries:
+        context.register_endpoint(entry["actor_id"], entry["endpoint"])
+        handle = ActorHandle(context, entry, cls.__name__)
+        handles.append(handle)
+        refs.append(handle._submit("__init__", (cls, args, kwargs), {}))
+
+    get(refs, timeout=timeout)
+    for entry in entries:
+        context.remember_constructor(entry["actor_id"], cls, args, kwargs)
+    return handles
+
+
 def create_actors(
     remote_class: RemoteClass,
     *args: Any,
@@ -460,6 +491,63 @@ def get_actor(name: str) -> ActorHandle:
         raise NotFound(f"no actor is registered under the name {name!r}")
     context.register_endpoint(entry["actor_id"], entry["endpoint"])
     return ActorHandle(context, {**entry, "pid": -1}, entry.get("name") or "actor")
+
+
+def launch_process(
+    command: list[str],
+    *,
+    name: Optional[str] = None,
+    num_cpus: float = 1.0,
+    num_gpus: float = 0.0,
+    ready_when: Any = None,
+    env: Optional[dict[str, str]] = None,
+    allocate_port: bool = True,
+    startup_timeout: float = 600.0,
+    strategy: str = "PACK",
+    cwd: Optional[str] = None,
+    host: Optional[str] = None,
+):
+    """Start and supervise a process tinyray did not write.
+
+    For inference servers and `torchrun` jobs: tinyray assigns the GPUs, injects
+    the environment, waits until the thing is actually serving, labels its logs
+    and reclaims its resources when it stops.
+
+    ``{port}`` anywhere in the command or environment is replaced with a free
+    port tinyray picked, so a server can be told where to listen without the
+    caller hunting for one.
+
+    `ready_when` accepts ``"port"``, ``"http"``, ``"http:/path"``,
+    ``"log:regex"``, ``"alive"``, or a `Readiness`. The default only checks that
+    the process is alive, which is honest but weak: a server binds its port long
+    before it can answer, so pass something stricter for anything that serves.
+    """
+    from .process import ready_when as build_readiness
+
+    context = _require_context()
+    return context.head.launch_process(
+        command,
+        name=name or f"process-{len(context.head.processes())}",
+        num_cpus=num_cpus,
+        num_gpus=num_gpus,
+        strategy=strategy,
+        env=env,
+        allocate_port=allocate_port,
+        ready_when=build_readiness(ready_when),
+        startup_timeout=startup_timeout,
+        cwd=cwd,
+        host=host,
+    )
+
+
+def stop_process(name: str) -> None:
+    """Stop a supervised process and return its resources."""
+    _require_context().head.stop_process(name)
+
+
+def processes() -> list[Any]:
+    """Every process tinyray is supervising."""
+    return _require_context().head.processes()
 
 
 def transport_stats() -> dict[str, dict[str, int]]:

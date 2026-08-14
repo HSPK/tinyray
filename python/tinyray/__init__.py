@@ -36,10 +36,13 @@ from .api import (
     get_actor,
     init,
     kill,
+    launch_process,
     nodes,
+    processes,
     release,
     remote,
     shutdown,
+    stop_process,
     transport_stats,
     wait,
 )
@@ -47,8 +50,17 @@ from .collective import CollectiveError, CollectiveGroup, GroupRebuilding
 from .head import Head, PlacementFailed
 from .launcher import ActorStartupError
 from .pool import ActorPool
+from .process import (
+    HttpOk,
+    LogMatch,
+    ManagedProcess,
+    PortOpen,
+    ProcessAlive,
+    ProcessStartupError,
+)
+from .worker_group import WorkerGroup, create_worker_group, torchrun_env
 
-__version__ = "0.0.3"
+__version__ = "0.1.0"
 
 __all__ = [
     "ActorDied",
@@ -64,23 +76,31 @@ __all__ = [
     "Frame",
     "GroupRebuilding",
     "Head",
+    "HttpOk",
     "Id",
     "Limits",
+    "LogMatch",
+    "ManagedProcess",
     "MessageTooLarge",
     "NotFound",
     "ObjectLost",
     "ObjectRef",
     "OwnerRef",
     "PlacementFailed",
+    "PortOpen",
+    "ProcessAlive",
+    "ProcessStartupError",
     "ProtocolError",
     "RemoteCallError",
     "RemoteClass",
     # Errors
     "TinyrayError",
     "UserCodeError",
+    "WorkerGroup",
     "actors",
     "collective",
     "create_actors",
+    "create_worker_group",
     "decode_message",
     "encode_message",
     "get",
@@ -88,12 +108,16 @@ __all__ = [
     # API
     "init",
     "kill",
+    "launch_process",
     "new_id",
     "nodes",
+    "processes",
     "release",
     "remote",
     "serde",
     "shutdown",
+    "stop_process",
+    "torchrun_env",
     "transport_stats",
     "wait",
 ]

@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 
 from ._tinyray import ClusterState, detect_cpus, detect_gpus, new_id
 from .launcher import ActorProcess, Launcher
+from .process import ManagedProcess, ProcessSupervisor, Readiness
 
 #: How often the supervisor checks for dead nodes and dead actors.
 SUPERVISE_INTERVAL_SECONDS = 1.0
@@ -65,6 +66,10 @@ class Head:
         self._supervisor: Optional[threading.Thread] = None
         self._on_actor_moved: Optional[Callable[[str, str], None]] = None
         self._on_actor_lost: Optional[Callable[[str, str], None]] = None
+        # Processes tinyray supervises but did not write: inference servers,
+        # torchrun jobs, anything with its own idea of how to run.
+        self._supervisors: dict[str, ProcessSupervisor] = {}
+        self._process_nodes: dict[str, tuple[str, float, float, list[int]]] = {}
 
     # -- registration ----------------------------------------------------
 
@@ -163,12 +168,19 @@ class Head:
         strategy: str = "SPREAD",
         max_restarts: int = 0,
         max_pending_calls: int = 1000,
+        env_builder: Optional[Callable[[dict[str, Any]], dict[str, str]]] = None,
     ) -> list[dict]:
         """Place and start `count` actors atomically.
 
         All or nothing on purpose. A group that comes up halfway cannot form a
         collective, and the run then hangs waiting for ranks that will never
         arrive -- a failure that is far harder to diagnose than a clean refusal.
+
+        `env_builder` receives one dict per actor describing where it landed
+        -- rank, node, local rank, local world size, and the hostname of rank
+        zero -- and returns environment variables for that process. Placement
+        has to happen first: LOCAL_RANK is a property of the assignment, not
+        something the caller can predict.
         """
         try:
             placements = self.state.place_gang(
@@ -181,9 +193,34 @@ class Head:
         except Exception as exc:
             raise PlacementFailed(str(exc)) from exc
 
+        # LOCAL_RANK counts within a node, so it can only be derived once the
+        # gang has actually been placed: it is a property of the assignment,
+        # not something the caller can predict.
+        ranks_on_node: dict[str, int] = {}
+        for node_id, _endpoint, _gpus in placements:
+            ranks_on_node[node_id] = ranks_on_node.get(node_id, 0) + 1
+        master_hostname = self._hostname_of(placements[0][0]) if placements else "127.0.0.1"
+        next_local: dict[str, int] = {}
+
         started: list[dict] = []
         try:
             for index, (node_id, _endpoint, gpu_ids) in enumerate(placements):
+                local_rank = next_local.get(node_id, 0)
+                next_local[node_id] = local_rank + 1
+                env = None
+                if env_builder is not None:
+                    env = env_builder(
+                        {
+                            "rank": index,
+                            "world_size": count,
+                            "node_id": node_id,
+                            "hostname": self._hostname_of(node_id),
+                            "local_rank": local_rank,
+                            "local_world_size": ranks_on_node[node_id],
+                            "master_hostname": master_hostname,
+                            "gpu_ids": list(gpu_ids),
+                        }
+                    )
                 started.append(
                     self._start_placed(
                         node_id=node_id,
@@ -196,6 +233,7 @@ class Head:
                         max_pending_calls=max_pending_calls,
                         actor_name=None,
                         detached=False,
+                        env=env,
                     )
                 )
         except Exception:
@@ -223,6 +261,7 @@ class Head:
         store_ttl_seconds: Optional[float] = None,
         actor_name: Optional[str],
         detached: bool,
+        env: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         with self._lock:
             handle = self.nodes[node_id]
@@ -238,6 +277,10 @@ class Head:
                 max_pending_calls=max_pending_calls,
                 store_max_bytes=store_max_bytes,
                 store_ttl_seconds=store_ttl_seconds,
+                env=env,
+                # A worker that needs its own environment cannot be served by a
+                # pre-warmed process, which was started without it.
+                allow_prewarm=env is None,
             )
         except Exception:
             self.state.release(node_id, num_cpus, num_gpus, gpu_ids)
@@ -268,6 +311,97 @@ class Head:
         }
 
     # -- lookup ----------------------------------------------------------
+
+    def launch_process(
+        self,
+        command: list[str],
+        *,
+        name: str,
+        num_cpus: float = 1.0,
+        num_gpus: float = 0.0,
+        memory_bytes: int = 0,
+        strategy: str = "PACK",
+        env: Optional[dict[str, str]] = None,
+        allocate_port: bool = True,
+        ready_when: Optional[Readiness] = None,
+        startup_timeout: float = 600.0,
+        max_restarts: int = 0,
+        cwd: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> ManagedProcess:
+        """Place and start a process tinyray did not write.
+
+        Goes through the same scheduler as an actor, so an inference server and
+        a trainer cannot be handed the same GPU -- which is the entire reason
+        this belongs in the head rather than in a helper.
+        """
+        try:
+            node_id, _endpoint, gpu_ids = self.state.place(
+                num_cpus=num_cpus,
+                num_gpus=num_gpus,
+                memory_bytes=memory_bytes,
+                strategy=strategy,
+            )
+        except Exception as exc:
+            raise PlacementFailed(str(exc)) from exc
+
+        supervisor = self._supervisor_for(node_id)
+
+        try:
+            managed = supervisor.start(
+                command,
+                name=name,
+                gpu_ids=gpu_ids,
+                env=env,
+                cwd=cwd,
+                allocate_port=allocate_port,
+                # Loopback until nodes report a routable address of their own.
+                # A hostname that does not resolve to what the process actually
+                # bound produces an endpoint that looks right and refuses
+                # connections.
+                host=host or "127.0.0.1",
+                ready_when=ready_when,
+                startup_timeout=startup_timeout,
+                num_cpus=num_cpus,
+                num_gpus=num_gpus,
+                max_restarts=max_restarts,
+            )
+        except Exception:
+            # A process that never came up must not keep its GPUs reserved.
+            self.state.release(node_id, num_cpus, num_gpus, gpu_ids)
+            raise
+
+        with self._lock:
+            self._process_nodes[name] = (node_id, num_cpus, num_gpus, list(gpu_ids))
+        return managed
+
+    def stop_process(self, name: str) -> None:
+        with self._lock:
+            placement = self._process_nodes.pop(name, None)
+        for supervisor in self._supervisors.values():
+            supervisor.stop(name)
+        if placement is not None:
+            node_id, num_cpus, num_gpus, gpu_ids = placement
+            self.state.release(node_id, num_cpus, num_gpus, gpu_ids)
+
+    def processes(self) -> list[ManagedProcess]:
+        out: list[ManagedProcess] = []
+        for supervisor in self._supervisors.values():
+            out.extend(supervisor.all_processes())
+        return out
+
+    def _supervisor_for(self, node_id: str) -> ProcessSupervisor:
+        with self._lock:
+            supervisor = self._supervisors.get(node_id)
+            if supervisor is None:
+                supervisor = ProcessSupervisor()
+                self._supervisors[node_id] = supervisor
+            return supervisor
+
+    def _hostname_of(self, node_id: str) -> str:
+        with self._lock:
+            handle = self.nodes.get(node_id)
+        return handle.hostname if handle is not None else "127.0.0.1"
 
     def get_actor(self, actor_id: str) -> Optional[dict[str, Any]]:
         return self.state.actor(actor_id)
@@ -310,6 +444,8 @@ class Head:
         with self._lock:
             agents = [handle.agent for handle in self.nodes.values()]
             self.nodes.clear()
+        for supervisor in list(self._supervisors.values()):
+            supervisor.shutdown()
         for agent in agents:
             agent.shutdown()
 
@@ -448,7 +584,7 @@ class LocalNodeAgent:
 
     def start_actor(self, *, allow_prewarm: bool = True, **kwargs: Any) -> ActorProcess:
         process = None
-        if allow_prewarm and self._is_default_shaped(kwargs):
+        if allow_prewarm and kwargs.get("env") is None and self._is_default_shaped(kwargs):
             # A warm process was started with default settings, so it can only
             # serve an actor that wants them.
             process = self.pool.acquire(gpu_ids=kwargs.get("gpu_ids"))
