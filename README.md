@@ -101,15 +101,20 @@ python scripts/mutate.py             # 19 mutants: do the tests actually work?
 
 ### Testing the tests
 
-A green suite proves nothing about the tests. Two mechanisms keep them honest:
+A green suite proves nothing about the tests. Three mechanisms keep them honest:
 
 * `tests/test_suite_quality.py` -- structural checks encoding the six blind
   spots that let real bugs through: unwired modules, timing constants that only
   ever run at their production value, options accepted but ignored, collapsed
   error taxonomies, untested lock branches, and design claims with no test.
-* `scripts/mutate.py` -- deliberately breaks 19 invariants and reports which
-  ones the suite catches. It has already found two tests that passed while the
-  behaviour they claimed to check was disabled.
+* `tests/test_driver_byte_budget.py` -- parks a 32 MB result in an actor,
+  exercises every driver-side operation and asserts what crossed the driver's
+  wire. The design's central claim is that payloads move between actors and
+  never through the driver; this is where that claim is enforced for *every*
+  operation rather than one.
+* `scripts/mutate.py` -- deliberately breaks 21 invariants and reports which
+  ones the suite catches. It has already found three tests that passed while
+  the behaviour they claimed to check was disabled.
 
 Each check exists because a real bug got through in that exact shape.
 

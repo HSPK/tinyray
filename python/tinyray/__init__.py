@@ -40,6 +40,7 @@ from .api import (
     release,
     remote,
     shutdown,
+    transport_stats,
     wait,
 )
 from .collective import CollectiveError, CollectiveGroup, GroupRebuilding
@@ -47,7 +48,7 @@ from .head import Head, PlacementFailed
 from .launcher import ActorStartupError
 from .pool import ActorPool
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 __all__ = [
     "ActorDied",
@@ -93,5 +94,6 @@ __all__ = [
     "remote",
     "serde",
     "shutdown",
+    "transport_stats",
     "wait",
 ]

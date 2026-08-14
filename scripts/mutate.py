@@ -121,6 +121,14 @@ MUTANTS: list[Mutant] = [
         command=["cargo", "test", "-p", "tinyray-runtime", "--test", "end_to_end", "wait_"],
     ),
     Mutant(
+        name="driver-relays-on-ref-passing",
+        why="resolving a reference driver-side turns every hand-off into a relay",
+        path="python/tinyray/worker_main.py",
+        old="            args, kwargs = resolve_arguments(args, kwargs)",
+        new="            pass  # MUTANT: leave refs unresolved",
+        command=["pytest", "tests/test_driver_byte_budget.py", "-x", "-q"],
+    ),
+    Mutant(
         name="ordering-ignored",
         why="dispatching on arrival instead of sequence reorders actor calls",
         path="crates/tinyray-runtime/src/queue.rs",

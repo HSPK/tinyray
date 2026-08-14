@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use tinyray_core::ActorId;
 use tinyray_runtime::client::{ClientError, ClientRuntime, OwnerRef};
 use tinyray_runtime::transport::client::ClientConfig;
@@ -228,6 +228,27 @@ impl PyClientRuntime {
         let handle = tokio_handle()?;
         py.detach(move || handle.block_on(async move { inner.release(&reference).await }));
         Ok(())
+    }
+
+    /// Per-peer transport counters, keyed by `host:port`.
+    ///
+    /// The byte counts are the point: a code path that quietly moves a payload
+    /// looks identical to a correct one from the outside, and only a byte count
+    /// tells them apart. `wait()` once answered a readiness question by
+    /// fetching the whole result and discarding it, which no functional test
+    /// could see.
+    fn transport_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        for (endpoint, stats) in self.inner.transport().stats() {
+            let entry = PyDict::new(py);
+            entry.set_item("requests", stats.requests)?;
+            entry.set_item("retries", stats.retries)?;
+            entry.set_item("failures", stats.failures)?;
+            entry.set_item("bytes_sent", stats.bytes_sent)?;
+            entry.set_item("bytes_received", stats.bytes_received)?;
+            out.set_item(endpoint, entry)?;
+        }
+        Ok(out)
     }
 
     /// Read a plain-text endpoint such as `/health` or `/introspect`.

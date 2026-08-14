@@ -365,3 +365,75 @@ class TestTypeStubsMatchTheExtension:
         assert (PY_PACKAGE / "py.typed").exists(), (
             "without py.typed, type checkers ignore the annotations entirely"
         )
+
+
+class TestDriverOperationsHaveAByteBudget:
+    """Every driver-side operation must be covered by the byte budget.
+
+    This is the check that would have caught `wait`. It relayed whole payloads
+    through the driver -- violating the design's central claim -- and no test
+    noticed, because the results were correct and every test used small ones.
+
+    The general lesson is that an invariant verified at one call site is not an
+    invariant. `tests/test_driver_byte_budget.py` enumerates the operations
+    instead, and this test enumerates the enumeration.
+    """
+
+    #: Operations that talk to actors but move payloads by definition.
+    BY_DESIGN: ClassVar[set[str]] = {"get"}
+
+    #: Defined in api.py but executed inside the actor process, so their cost
+    #: never lands on the driver. Each still needs a budget assertion proving
+    #: that, which is why the reason is recorded rather than assumed.
+    ACTOR_SIDE: ClassVar[dict[str, str]] = {
+        "resolve_arguments": (
+            "runs in the callee when a call arrives, so a reference passed "
+            "between actors is fetched by the consumer and never by the driver; "
+            "see test_argument_resolution_happens_in_the_actor"
+        ),
+    }
+
+    @staticmethod
+    def _driver_operations() -> set[str]:
+        """Public functions in api.py that talk to an actor over the wire."""
+        tree = ast.parse((PY_PACKAGE / "api.py").read_text())
+        operations = set()
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+                continue
+            source = ast.dump(node)
+            # `client.<method>` or the shared fetch client: either way, bytes
+            # cross the driver's wire.
+            if "'client'" in source or "_fetch_client" in source:
+                operations.add(node.name)
+        return operations
+
+    def test_every_wire_touching_operation_is_budgeted(self):
+        budget = (TEST_DIR / "test_driver_byte_budget.py").read_text()
+        untested = sorted(
+            operation
+            for operation in self._driver_operations() - self.BY_DESIGN - set(self.ACTOR_SIDE)
+            if f"tinyray.{operation}(" not in budget and f".{operation}(" not in budget
+        )
+        assert not untested, (
+            f"driver operations with no byte budget: {untested}. Each moves data "
+            "over the wire, and a functional test cannot tell a correct one from "
+            "one that relays the whole payload."
+        )
+
+    def test_actor_side_exemptions_are_still_verified(self):
+        """An exemption is a claim, and the claim needs its own test."""
+        budget = (TEST_DIR / "test_driver_byte_budget.py").read_text()
+        for operation, reason in self.ACTOR_SIDE.items():
+            assert len(reason) > 60, f"{operation} is exempted without a real reason"
+            assert operation in budget, (
+                f"{operation} is exempted as actor-side, but nothing in the byte "
+                "budget demonstrates that it does not cost the driver"
+            )
+
+    def test_the_budget_has_a_positive_control(self):
+        budget = (TEST_DIR / "test_driver_byte_budget.py").read_text()
+        assert "moved >= PAYLOAD" in budget, (
+            "the budget needs an operation that is expected to transfer, or a "
+            "runtime that moves nothing at all would satisfy every assertion"
+        )

@@ -344,6 +344,15 @@ class ClientRuntime:
     def release(self, reference: OwnerRef) -> None:
         """Tell the owner a result is no longer needed. Best effort."""
 
+    def transport_stats(self) -> dict[str, dict[str, int]]:
+        """Per-peer transport counters, keyed by ``host:port``.
+
+        Each value has ``requests``, ``retries``, ``failures``, ``bytes_sent``
+        and ``bytes_received``. The byte counts exist because a code path that
+        quietly moves a payload is indistinguishable from a correct one until
+        you count what crossed the wire.
+        """
+
     def get_text(self, endpoint: str, path: str) -> str:
         """Read a plain-text endpoint such as ``/health`` or ``/introspect``."""
 

@@ -462,6 +462,16 @@ def get_actor(name: str) -> ActorHandle:
     return ActorHandle(context, {**entry, "pid": -1}, entry.get("name") or "actor")
 
 
+def transport_stats() -> dict[str, dict[str, int]]:
+    """Bytes and requests this driver has exchanged with each actor.
+
+    Answers "is my driver relaying data it should not be?". In a healthy run
+    the driver's byte counts stay small: it moves references, and the actors
+    move payloads between themselves.
+    """
+    return _require_context().client.transport_stats()
+
+
 def nodes() -> list[dict]:
     """Every node in the cluster, with its resources."""
     return _require_context().head.nodes_info()
