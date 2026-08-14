@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tinyray-core",
+    "crates/tinyray-py",
+    "crates/tinyray-runtime",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/HSPK/tinyray"
+homepage = "https://github.com/HSPK/tinyray"
+
+[workspace.dependencies]
+tinyray-core = { path = "crates/tinyray-core" }
+tinyray-runtime = { path = "crates/tinyray-runtime" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "process", "signal"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }
+http-body-util = "0.1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+bytes = "1.6"
+serde = { version = "1.0", features = ["derive"] }
+rmp-serde = "1.1"
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true

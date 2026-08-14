@@ -1,0 +1,190 @@
+name: release
+
+# Publishes to PyPI via a trusted publisher. No API token and no environment:
+# the workflow proves its identity with the OIDC token GitHub mints for it,
+# which is why `id-token: write` below is load-bearing.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_to:
+        description: Where to publish
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Never publish something that does not pass its own tests. Cheap, compared
+  # to yanking a release.
+  check:
+    name: lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Python tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin ruff mypy pytest pytest-timeout numpy typing_extensions
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - run: ruff check python/ tests/ benchmarks/ scripts/
+      - run: ruff format --check python/ tests/ benchmarks/ scripts/
+
+      - name: Build and install the extension
+        run: maturin develop --release
+
+      - run: mypy
+      - run: pytest tests/ -q
+
+  # No abi3: the buffer protocol that makes results zero-copy is missing from
+  # the limited API on older interpreters, so wheels are built per version.
+  wheels:
+    name: wheels ${{ matrix.platform.target }} py${{ matrix.python-version }}
+    needs: check
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: auto
+          - runner: macos-13
+            target: x86_64
+            manylinux: "off"
+          - runner: macos-14
+            target: aarch64
+            manylinux: "off"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: >-
+            --release
+            --out dist
+            --interpreter python${{ matrix.python-version }}
+          sccache: "true"
+
+      - name: Check the wheel imports and carries its types
+        # A wheel that builds but will not import is the failure worth catching
+        # here, along with type metadata that silently went missing.
+        if: runner.os == 'Linux' && matrix.platform.target == 'x86_64'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --find-links dist --force-reinstall tinyray
+          python - <<'PY'
+          import pathlib
+
+          import tinyray
+
+          print("tinyray", tinyray.__version__, "core", tinyray._tinyray.version)
+          package = pathlib.Path(tinyray.__file__).parent
+          assert (package / "py.typed").exists(), "py.typed missing from the wheel"
+          assert (package / "_tinyray.pyi").exists(), "type stubs missing from the wheel"
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}-${{ matrix.python-version }}
+          path: dist
+
+  sdist:
+    name: sdist
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: publish to ${{ inputs.publish_to || 'pypi' }}
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    # Tags publish to PyPI; a manual run has to say where it is going.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      # Mints the OIDC token the trusted publisher validates. Without this the
+      # upload is rejected, and there is no API token to fall back on.
+      id-token: write
+      # Attaching artefacts to the GitHub release.
+      contents: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: List what is about to be published
+        run: ls -lh dist
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
+
+      - name: Publish to TestPyPI
+        if: inputs.publish_to == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+
+      - name: Publish to PyPI
+        if: inputs.publish_to != 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+      - name: Attach artefacts to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

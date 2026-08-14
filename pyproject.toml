@@ -1,0 +1,113 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tinyray"
+version = "0.0.1"
+description = "A minimal, actor-only Ray for ML experiments. Rust core, Python API."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+keywords = ["actor", "distributed", "ray", "machine-learning", "reinforcement-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+dependencies = ["cloudpickle>=2.2"]
+
+[project.urls]
+Homepage = "https://github.com/HSPK/tinyray"
+Repository = "https://github.com/HSPK/tinyray"
+Issues = "https://github.com/HSPK/tinyray/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "pytest-timeout>=2.1", "numpy>=1.21"]
+dev = [
+    "pytest>=7.0",
+    "pytest-timeout>=2.1",
+    "numpy>=1.21",
+    "ruff>=0.6",
+    "mypy>=1.8",
+    "pre-commit>=3.5",
+    "typing_extensions>=4.6",
+]
+
+[project.scripts]
+tinyray = "tinyray.cli:main"
+
+[tool.maturin]
+manifest-path = "crates/tinyray-py/Cargo.toml"
+module-name = "tinyray._tinyray"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["python", "tests", "benchmarks", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "B",        # bugbear: the ones that are usually real bugs
+    "UP",       # pyupgrade
+    "C4",       # comprehensions
+    "SIM",      # simplifications
+    "RUF",      # ruff's own
+]
+ignore = [
+    # A blind `except` is deliberate in supervisors, heartbeats and log pumps:
+    # those loops must survive anything, and re-raising would take the cluster
+    # down with the failure they were meant to absorb.
+    "BLE001",
+    # tinyray targets 3.9; `X | Y` annotations are not available at runtime.
+    "UP007", "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests read better with literal values and long explanatory assertions.
+"tests/**" = ["E501"]
+"benchmarks/**" = ["E501"]
+# The mutation script embeds source snippets that must match byte for byte.
+"scripts/mutate.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tinyray"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.10"
+files = ["python/tinyray"]
+# Not strict everywhere: the goal is a trustworthy public API, not a clean
+# report on internals that talk to an untyped extension.
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# cloudpickle and torch ship no stubs, and torch is an optional dependency.
+module = ["cloudpickle.*", "torch.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --timeout=120"
+markers = [
+    "bench: performance benchmarks, not correctness tests",
+    "slow: takes more than a couple of seconds",
+]
