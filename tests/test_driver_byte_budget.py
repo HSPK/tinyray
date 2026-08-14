@@ -83,9 +83,7 @@ class TestDriverStaysOutOfTheDataPath:
         # The regression. `wait` answers "has it settled?"; fetching the value
         # to find out routed 32 rollouts x 10 MB through the driver.
         _producer, _consumer, reference = scenario
-        _, moved = self.measure(
-            lambda: tinyray.wait([reference], num_returns=1, timeout=60.0)
-        )
+        _, moved = self.measure(lambda: tinyray.wait([reference], num_returns=1, timeout=60.0))
         assert moved < BUDGET, (
             f"wait() pulled {moved:,} bytes with a {PAYLOAD:,} byte result in play; "
             "it is relaying the payload rather than probing readiness"
@@ -99,9 +97,7 @@ class TestDriverStaysOutOfTheDataPath:
     def test_passing_a_reference_in_a_list_moves_only_the_reference(self, scenario):
         # The consumer fetches the payload itself, straight from the producer.
         _producer, consumer, reference = scenario
-        (size, moved) = self.measure(
-            lambda: tinyray.get(consumer.total_size.remote([reference]))
-        )
+        (size, moved) = self.measure(lambda: tinyray.get(consumer.total_size.remote([reference])))
         assert size == PAYLOAD, "the consumer did not actually receive the data"
         assert moved < BUDGET, (
             f"the driver moved {moved:,} bytes relaying a reference; the whole "
@@ -111,9 +107,7 @@ class TestDriverStaysOutOfTheDataPath:
     def test_passing_a_reference_as_a_top_level_argument(self, scenario):
         # Resolved automatically -- but resolved *by the actor*, not the driver.
         _producer, consumer, reference = scenario
-        (size, moved) = self.measure(
-            lambda: tinyray.get(consumer.direct.remote(reference))
-        )
+        (size, moved) = self.measure(lambda: tinyray.get(consumer.direct.remote(reference)))
         assert size == PAYLOAD
         assert moved < BUDGET, (
             f"automatic resolution cost the driver {moved:,} bytes; it must "
@@ -174,9 +168,7 @@ class TestDriverStaysOutOfTheDataPath:
         is arranged to avoid.
         """
         producer, consumer, reference = scenario
-        (size, moved) = self.measure(
-            lambda: tinyray.get(consumer.direct.remote(reference))
-        )
+        (size, moved) = self.measure(lambda: tinyray.get(consumer.direct.remote(reference)))
         assert size == PAYLOAD
         assert moved < BUDGET
 
