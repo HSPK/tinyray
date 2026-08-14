@@ -328,6 +328,7 @@ class Head:
         max_restarts: int = 0,
         cwd: Optional[str] = None,
         host: Optional[str] = None,
+        wait_ready: bool = True,
     ) -> ManagedProcess:
         """Place and start a process tinyray did not write.
 
@@ -365,6 +366,7 @@ class Head:
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
                 max_restarts=max_restarts,
+                wait_ready=wait_ready,
             )
         except Exception:
             # A process that never came up must not keep its GPUs reserved.
@@ -374,6 +376,14 @@ class Head:
         with self._lock:
             self._process_nodes[name] = (node_id, num_cpus, num_gpus, list(gpu_ids))
         return managed
+
+    def await_process_ready(self, managed: ManagedProcess, timeout: float) -> None:
+        """Finish the startup of a process launched with `wait_ready=False`."""
+        for supervisor in self._supervisors.values():
+            if supervisor.get(managed.name) is managed:
+                supervisor.await_ready(managed, timeout)
+                return
+        raise KeyError(f"no supervisor owns {managed.name!r}")
 
     def stop_process(self, name: str) -> None:
         with self._lock:

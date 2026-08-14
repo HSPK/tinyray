@@ -157,6 +157,8 @@ class ManagedProcess:
     num_gpus: float = 0.0
     restarts: int = 0
     max_restarts: int = 0
+    #: Remembered so a deferred wait knows what it is waiting for.
+    readiness: Optional[Readiness] = None
     #: Ring buffer of recent output, for readiness matching and diagnostics.
     _log: list[str] = field(default_factory=list)
     _log_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -238,8 +240,9 @@ class ProcessSupervisor:
         num_cpus: float = 1.0,
         num_gpus: float = 0.0,
         max_restarts: int = 0,
+        wait_ready: bool = True,
     ) -> ManagedProcess:
-        """Start a process and wait until it is ready.
+        """Start a process and, by default, wait until it is ready.
 
         `{port}` in the command or in any environment value is replaced with
         the port tinyray allocated, so a server can be told where to listen
@@ -248,6 +251,12 @@ class ProcessSupervisor:
         The default readiness check is merely that the process is alive, which
         is honest but weak; pass :class:`HttpOk` or :class:`PortOpen` for
         anything that serves requests.
+
+        `wait_ready=False` returns as soon as the process is spawned, leaving
+        the wait to :meth:`await_ready`. That split is mandatory when starting a
+        group whose members rendezvous with each other: rank 0 blocks inside
+        ``init_process_group`` until the last rank arrives, so waiting for it
+        before starting rank 1 deadlocks the launch.
         """
         if port is None and allocate_port:
             port = free_port(host)
@@ -290,12 +299,22 @@ class ProcessSupervisor:
         )
         _forward_output(managed)
 
-        readiness = ready_when or ProcessAlive()
-        self._await_ready(managed, readiness, startup_timeout)
-
         with self._lock:
             self._processes[name] = managed
+
+        managed.readiness = ready_when or ProcessAlive()
+        if wait_ready:
+            self.await_ready(managed, startup_timeout)
         return managed
+
+    def await_ready(
+        self,
+        managed: ManagedProcess,
+        timeout: float,
+        readiness: Optional[Readiness] = None,
+    ) -> None:
+        """Block until a process started with `wait_ready=False` is up."""
+        self._await_ready(managed, readiness or managed.readiness or ProcessAlive(), timeout)
 
     @staticmethod
     def _await_ready(managed: ManagedProcess, readiness: Readiness, timeout: float) -> None:

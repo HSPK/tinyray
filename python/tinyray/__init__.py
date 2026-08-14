@@ -46,6 +46,7 @@ from .api import (
     transport_stats,
     wait,
 )
+from .attach import RemoteWorker, connect, launch_workers
 from .collective import CollectiveError, CollectiveGroup, GroupRebuilding
 from .head import Head, PlacementFailed
 from .launcher import ActorStartupError
@@ -58,9 +59,10 @@ from .process import (
     ProcessAlive,
     ProcessStartupError,
 )
+from .serve import Server, serve
 from .worker_group import WorkerGroup, create_worker_group, torchrun_env
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "ActorDied",
@@ -93,12 +95,15 @@ __all__ = [
     "ProtocolError",
     "RemoteCallError",
     "RemoteClass",
+    "RemoteWorker",
+    "Server",
     # Errors
     "TinyrayError",
     "UserCodeError",
     "WorkerGroup",
     "actors",
     "collective",
+    "connect",
     "create_actors",
     "create_worker_group",
     "decode_message",
@@ -109,12 +114,14 @@ __all__ = [
     "init",
     "kill",
     "launch_process",
+    "launch_workers",
     "new_id",
     "nodes",
     "processes",
     "release",
     "remote",
     "serde",
+    "serve",
     "shutdown",
     "stop_process",
     "torchrun_env",

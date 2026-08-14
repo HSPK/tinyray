@@ -52,21 +52,60 @@ restart -- and then to be left alone.
   produced it and consumers fetch it directly. When a framework owns the data,
   tinyray moves references and nothing else.
 
+### Minimal intrusion: your script keeps its own process
+
+The least invasive option, and the one to reach for with Megatron, DeepSpeed or
+anything else that expects to own its entrypoint. The script is unchanged apart
+from one line:
+
 ```python
-@tr.remote(num_gpus=1)
-class Trainer:
+# train.py -- your ordinary training script
+import torch.distributed as dist
+
+class Trainer:                                # not decorated, not subclassed
     def __init__(self):
-        import torch.distributed as dist
         dist.init_process_group(backend="nccl")   # yours, not tinyray's
+        self.model = build_model()                # yours
+    def train_step(self, batch): ...
 
-group = tr.create_worker_group(Trainer, size=8, name="trainer")
-group.run("train_step", batch)          # dispatched to all ranks, then awaited
+if __name__ == "__main__":
+    import tinyray
+    tinyray.serve(Trainer())                  # the only tinyray line
+```
 
-server = tr.launch_process(              # not a tinyray actor at all
-    ["python", "-m", "sglang.launch_server", "--port", "{port}"],
+```python
+# controller.py
+workers = tr.launch_workers(["python", "train.py"], size=8, gpus_per_worker=1)
+workers.run("train_step", batch)              # all ranks, then awaited
+
+server = tr.launch_process(                   # a process tinyray never imports
+    ["python", "-m", "sglang.launch_server", "--port", "{port}", "--tp", "4"],
     name="rollout", num_gpus=4, ready_when="http:/health",
 )
 ```
+
+Nothing is pickled to the worker, no class is shipped over the wire, and
+`__main__` stays yours. `tinyray.connect(endpoint)` will even drive a process
+that something else started.
+
+`examples/native_stack.py` runs a four-rank trainer and an inference server end
+to end; it uses gloo and a toy server so it works without a GPU.
+
+### The actor API
+
+Still available, and the right choice for code written for tinyray -- pure
+Python rollouts, evaluation harnesses, hyperparameter trials:
+
+```python
+@tr.remote(num_gpus=1)
+class Rollout:
+    def step(self): return self.env.rollout()
+
+rollouts = tr.create_actors(Rollout, count=32)
+```
+
+Here tinyray owns the process and constructs your class remotely, which is
+convenient and unavoidably more invasive.
 
 Two details that are load-bearing rather than cosmetic:
 

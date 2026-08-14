@@ -10,8 +10,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 echo "=== Lint and format ==="
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-.venv/bin/ruff check python/ tests/ benchmarks/ scripts/
-.venv/bin/ruff format --check python/ tests/ benchmarks/ scripts/
+.venv/bin/ruff check python/ tests/ benchmarks/ scripts/ examples/
+.venv/bin/ruff format --check python/ tests/ benchmarks/ scripts/ examples/
 .venv/bin/mypy
 
 echo

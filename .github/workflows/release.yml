@@ -50,8 +50,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-      - run: ruff check python/ tests/ benchmarks/ scripts/
-      - run: ruff format --check python/ tests/ benchmarks/ scripts/
+      - run: ruff check python/ tests/ benchmarks/ scripts/ examples/
+      - run: ruff format --check python/ tests/ benchmarks/ scripts/ examples/
 
       - name: Build and install the extension
         # `maturin develop` insists on a virtualenv; setup-python gives us a
