@@ -14,9 +14,21 @@ class Rollout:
 
 rollouts = tr.create_actors(Rollout, cfg, count=32)   # atomic, all or nothing
 refs = [r.step.remote() for r in rollouts]            # returns immediately
-ready, stragglers = tr.wait(refs, num_returns=24)
+ready, pending = tr.wait(refs, num_returns=24)        # 24 finished; 8 still running
 learner.update.remote(ready)                          # data goes rollout -> learner
 ```
+
+`wait` returns two lists of `ObjectRef`, never values: `ready` are the ones that
+have settled, `pending` the ones still running. Both are just names -- a task id
+and the address of the actor holding the result -- so the driver moves a few
+dozen bytes per reference and never the payload. Passing `ready` to the learner
+hands over those names, and the learner fetches each 10 MB batch straight from
+the rollout that produced it.
+
+Dropping the eight slow rollouts drops their *results*, not their work: they are
+still running, and their outputs still occupy the producers' stores until the
+watermark or TTL reclaims them. And if the group runs NCCL collectives, those
+same eight actors must still attend the next barrier -- see `tinyray.collective`.
 
 ## What it is, and is not
 

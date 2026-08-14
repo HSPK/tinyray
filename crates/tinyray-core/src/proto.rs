@@ -55,6 +55,14 @@ pub struct Fetch {
     /// How long the owner may hold the request open before replying that the
     /// result is not ready yet. Zero means reply immediately.
     pub timeout_ms: u64,
+    /// Ask only whether the result has settled, without sending it.
+    ///
+    /// `wait` needs to know which references are ready, not what they contain.
+    /// Without this it would drag every payload to the driver and discard it,
+    /// which is precisely the relay the design exists to avoid: 32 rollouts of
+    /// 10 MB would move 320 MB to answer a yes/no question.
+    #[serde(default)]
+    pub status_only: bool,
 }
 
 /// Header accompanying a successful result payload.
@@ -178,6 +186,7 @@ mod tests {
             Envelope::Fetch(Fetch {
                 task_id: TaskId::from_parts(1, 2),
                 timeout_ms: 5_000,
+                status_only: false,
             }),
             Envelope::Result(ResultHeader {
                 task_id: TaskId::from_parts(1, 2),
@@ -225,6 +234,7 @@ mod tests {
             Envelope::Fetch(Fetch {
                 task_id: id,
                 timeout_ms: 0,
+                status_only: true,
             }),
             Envelope::Result(ResultHeader { task_id: id }),
             Envelope::Error(RemoteError {

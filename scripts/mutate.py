@@ -113,6 +113,14 @@ MUTANTS: list[Mutant] = [
         command=["pytest", "tests/test_actors.py", "-x", "-q", "-k", "memory_bytes"],
     ),
     Mutant(
+        name="wait-relays-payloads",
+        why="answering a readiness question by shipping the whole result to the driver",
+        path="crates/tinyray-runtime/src/client.rs",
+        old="        let Ok(message) = build_fetch(reference.task_id, leg, true) else {",
+        new="        let Ok(message) = build_fetch(reference.task_id, leg, false) else {",
+        command=["cargo", "test", "-p", "tinyray-runtime", "--test", "end_to_end", "wait_"],
+    ),
+    Mutant(
         name="ordering-ignored",
         why="dispatching on arrival instead of sequence reorders actor calls",
         path="crates/tinyray-runtime/src/queue.rs",

@@ -461,3 +461,71 @@ class TestOptionsChangeBehaviour:
 
         with pytest.raises(tinyray.PlacementFailed):
             Greedy.remote()
+
+
+class TestWaitDoesNotRelayPayloads:
+    """`wait` reports which references settled; it must not fetch them.
+
+    Regression test. `wait` used to answer the readiness question by issuing a
+    full fetch and discarding the body, so a driver waiting on 32 rollouts of
+    10 MB pulled 320 MB it never looked at -- the star-shaped relay that the
+    whole no-object-store design exists to avoid. It was invisible in every
+    functional test because the results were correct and small.
+    """
+
+    def test_cost_does_not_scale_with_the_payload(self, ray, numpy):
+        @tinyray.remote(num_cpus=0.1)
+        class Producer:
+            def make(self, nbytes):
+                return numpy.zeros(nbytes, dtype=numpy.uint8)
+
+        producer = Producer.remote()
+
+        def wait_cost(megabytes):
+            ref = producer.make.remote(megabytes * 1024 * 1024)
+            ray.get(ref)  # settle it first, so we time readiness alone
+            best = float("inf")
+            for _ in range(3):
+                started = time.perf_counter()
+                ready, _pending = ray.wait([ref], num_returns=1, timeout=60.0)
+                best = min(best, time.perf_counter() - started)
+                assert len(ready) == 1
+            return best
+
+        small = wait_cost(1)
+        large = wait_cost(64)
+
+        # Transferring 64 MB takes tens of milliseconds; a status probe is a
+        # single small round trip. The bound is loose because the difference
+        # being guarded against is roughly sixtyfold.
+        assert large < max(small * 10, 0.010), (
+            f"wait() took {large * 1e3:.1f} ms for 64 MB against "
+            f"{small * 1e3:.1f} ms for 1 MB: it is fetching payloads, not "
+            "probing readiness"
+        )
+
+    def test_wait_still_reports_failures_as_settled(self, ray):
+        # A probe must not mistake a failed task for an unfinished one, or a
+        # driver would wait out the timeout on a result that will never come.
+        @tinyray.remote(num_cpus=0.1)
+        class Fragile:
+            def boom(self):
+                raise ValueError("nope")
+
+        actor = Fragile.remote()
+        ref = actor.boom.remote()
+        ready, pending = ray.wait([ref], num_returns=1, timeout=30.0)
+        assert ready == [ref]
+        assert pending == []
+        with pytest.raises(tinyray.UserCodeError, match="nope"):
+            ray.get(ref)
+
+    def test_get_after_wait_still_returns_the_value(self, ray, numpy):
+        @tinyray.remote(num_cpus=0.1)
+        class Producer:
+            def make(self):
+                return numpy.arange(100_000, dtype=numpy.int64)
+
+        ref = Producer.remote().make.remote()
+        ready, _ = ray.wait([ref], num_returns=1, timeout=30.0)
+        assert numpy.array_equal(ray.get(ready[0]), numpy.arange(100_000))

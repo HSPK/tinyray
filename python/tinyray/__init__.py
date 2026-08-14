@@ -47,7 +47,7 @@ from .head import Head, PlacementFailed
 from .launcher import ActorStartupError
 from .pool import ActorPool
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 __all__ = [
     "ActorDied",

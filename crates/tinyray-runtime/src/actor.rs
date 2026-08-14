@@ -313,9 +313,15 @@ impl ActorRuntime {
         let wait = Duration::from_millis(fetch.timeout_ms).min(self.config.max_fetch_wait);
         match self.store.get(fetch.task_id, wait).await {
             Fetched::Ready(value) => {
-                let mut frames = Vec::with_capacity(value.frames.len() + 1);
-                frames.push(value.body);
-                frames.extend(value.frames);
+                // A status-only probe gets the verdict without the payload.
+                let frames = if fetch.status_only {
+                    Vec::new()
+                } else {
+                    let mut frames = Vec::with_capacity(value.frames.len() + 1);
+                    frames.push(value.body);
+                    frames.extend(value.frames);
+                    frames
+                };
                 match Envelope::Result(ResultHeader {
                     task_id: fetch.task_id,
                 })
@@ -515,13 +521,19 @@ pub fn build_call(
 }
 
 /// Build a fetch request.
+///
+/// `status_only` asks whether the result has settled without transferring it,
+/// which is what `wait` needs: the alternative is moving every payload to the
+/// driver just to answer a yes/no question.
 pub fn build_fetch(
     task_id: TaskId,
     timeout: Duration,
+    status_only: bool,
 ) -> Result<Message, tinyray_core::error::ProtoError> {
     Envelope::Fetch(Fetch {
         task_id,
         timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+        status_only,
     })
     .into_message(vec![])
 }

@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "tinyray-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "rmp-serde",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "tinyray-py"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "tinyray-runtime"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "http-body-util",

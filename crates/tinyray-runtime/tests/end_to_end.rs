@@ -585,3 +585,120 @@ async fn thirty_two_concurrent_consumers_share_one_result() {
     actor.runtime.begin_shutdown();
     executor.await.unwrap();
 }
+
+#[tokio::test]
+async fn wait_probes_readiness_without_moving_the_payload() {
+    // `wait` answers a yes/no question. If it fetched the value to do so, a
+    // driver waiting on 32 rollouts of 10 MB would pull 320 MB it immediately
+    // discards -- the star-shaped relay this design exists to avoid.
+    let actor = start_actor(actor_config()).await;
+    let executor = spawn_echo_executor(actor.runtime.clone());
+    let client = new_client();
+    client.register_actor(actor.actor_id, actor.endpoint.clone());
+
+    let big = Bytes::from(vec![0x7F; 8 * 1024 * 1024]);
+    let reference = client
+        .submit(actor.actor_id, "produce", Bytes::new(), vec![big.clone()])
+        .await
+        .unwrap();
+    client
+        .fetch(&reference, Duration::from_secs(30))
+        .await
+        .unwrap();
+
+    // Probe directly, so the assertion is about bytes on the wire rather than
+    // about how long something took.
+    let probe =
+        tinyray_runtime::actor::build_fetch(reference.task_id, Duration::from_millis(100), true)
+            .unwrap();
+    let reply = client
+        .transport()
+        .request(
+            &actor.endpoint,
+            tinyray_runtime::transport::paths::FETCH,
+            &probe,
+        )
+        .await
+        .expect("probe");
+
+    assert!(
+        matches!(
+            tinyray_core::proto::Envelope::decode(&reply.header),
+            Ok(tinyray_core::proto::Envelope::Result(_))
+        ),
+        "a status probe must still report that the result is ready"
+    );
+    assert!(
+        reply.frames.is_empty(),
+        "status probe carried {} frame(s) totalling {} bytes; wait() is relaying payloads",
+        reply.frames.len(),
+        reply.frames.iter().map(|f| f.len()).sum::<usize>()
+    );
+
+    // And a real fetch still returns the value.
+    let value = client
+        .fetch(&reference, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(value.frames[0], big);
+
+    actor.runtime.begin_shutdown();
+    executor.await.unwrap();
+}
+
+#[tokio::test]
+async fn wait_moves_almost_no_bytes() {
+    // The assertion the previous test could not make: this one goes through
+    // `wait` itself rather than hand-building a probe, and counts the bytes
+    // that actually crossed the wire.
+    let actor = start_actor(actor_config()).await;
+    let executor = spawn_echo_executor(actor.runtime.clone());
+
+    let producer_side = new_client();
+    producer_side.register_actor(actor.actor_id, actor.endpoint.clone());
+
+    let payload = 8 * 1024 * 1024;
+    let reference = producer_side
+        .submit(
+            actor.actor_id,
+            "produce",
+            Bytes::new(),
+            vec![Bytes::from(vec![0x33; payload])],
+        )
+        .await
+        .unwrap();
+    producer_side
+        .fetch(&reference, Duration::from_secs(30))
+        .await
+        .unwrap();
+
+    // A fresh client, so its counters describe `wait` and nothing else.
+    let waiter = new_client();
+    let (ready, pending) = waiter
+        .wait(std::slice::from_ref(&reference), 1, Duration::from_secs(30))
+        .await;
+    assert_eq!(ready.len(), 1);
+    assert!(pending.is_empty());
+
+    let received: u64 = waiter
+        .transport()
+        .stats()
+        .values()
+        .map(|stats| stats.bytes_received)
+        .sum();
+    assert!(
+        received < 4096,
+        "wait() pulled {received} bytes for an {payload}-byte result; it is \
+         relaying the payload through the driver instead of probing readiness"
+    );
+
+    // The value is still retrievable in full.
+    let value = waiter
+        .fetch(&reference, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(value.frames[0].len(), payload);
+
+    actor.runtime.begin_shutdown();
+    executor.await.unwrap();
+}

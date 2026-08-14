@@ -220,7 +220,7 @@ impl ClientRuntime {
             // Long-poll: the owner holds the request open rather than making
             // us spin, but we cap each leg so a dead peer is noticed.
             let leg = remaining.min(Duration::from_secs(10));
-            let message = build_fetch(reference.task_id, leg)
+            let message = build_fetch(reference.task_id, leg, false)
                 .map_err(|err| ClientError::Transport(err.to_string()))?;
             let reply = self
                 .transport
@@ -254,7 +254,7 @@ impl ClientRuntime {
     /// Tell the owner a result is no longer needed. Best effort by design: if
     /// it does not arrive, the watermark and TTL clean up eventually.
     pub async fn release(&self, reference: &OwnerRef) {
-        let Ok(message) = build_fetch(reference.task_id, Duration::ZERO) else {
+        let Ok(message) = build_fetch(reference.task_id, Duration::ZERO, false) else {
             return;
         };
         let _ = self
@@ -335,7 +335,10 @@ async fn poll_ready(transport: &TransportClient, reference: &OwnerRef, timeout: 
             return false;
         }
         let leg = remaining.min(Duration::from_secs(10));
-        let Ok(message) = build_fetch(reference.task_id, leg) else {
+        // Status only: `wait` reports which references have settled, and
+        // pulling their payloads here would route every result through the
+        // driver -- the exact relay this design avoids.
+        let Ok(message) = build_fetch(reference.task_id, leg, true) else {
             return false;
         };
         match transport

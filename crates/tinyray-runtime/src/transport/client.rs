@@ -115,11 +115,17 @@ pub struct TransportClient {
 }
 
 /// Per-peer counters surfaced through `/introspect`.
+///
+/// The byte counters exist to answer "is this path moving data it should not?".
+/// A readiness probe that quietly ships megabytes looks identical to a correct
+/// one from the outside, and only a byte count makes the difference visible.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeerStats {
     pub requests: u64,
     pub retries: u64,
     pub failures: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 impl TransportClient {
@@ -194,6 +200,7 @@ impl TransportClient {
         path: &str,
         body: Bytes,
     ) -> Result<Message, TransportError> {
+        self.bump(endpoint, |stats| stats.bytes_sent += body.len() as u64);
         let uri = format!("http://{endpoint}{path}");
         let request = Request::builder()
             .method("POST")
@@ -231,6 +238,7 @@ impl TransportClient {
                 detail: err.to_string(),
             })?
             .to_bytes();
+        self.bump(endpoint, |stats| stats.bytes_received += bytes.len() as u64);
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             return Err(TransportError::Backpressure {
