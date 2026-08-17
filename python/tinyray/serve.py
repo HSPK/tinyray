@@ -33,7 +33,7 @@ import threading
 import traceback
 from typing import Any, Callable, Optional, Union
 
-from . import serde
+from . import mesh, serde
 from ._tinyray import ActorRuntime, new_id
 
 #: Port the driver told this process to bind. Absent means the process was not
@@ -161,7 +161,13 @@ class Server:
             from .api import resolve_arguments
 
             args, kwargs = resolve_arguments(args, kwargs)
-            result = _resolve_target(self.target, task.method)(*args, **kwargs)
+            if task.method == mesh.LINK_METHOD:
+                # Intercepted before dispatch: the roster is tinyray's business,
+                # and looking a dunder up on the user's object would be exactly
+                # the kind of reach-in this module exists to avoid.
+                result = mesh.install_roster(*args, **kwargs)
+            else:
+                result = _resolve_target(self.target, task.method)(*args, **kwargs)
         except Exception as exc:
             # The remote traceback is the only artefact the controller will
             # ever see, so it travels with the error.
@@ -219,6 +225,7 @@ def serve(
         raise ServeError(f"could not bind a control port at {resolved_bind}: {exc}") from exc
 
     server = Server(target, runtime, resolved_id)
+    mesh.mark_serving()
     _announce(server)
 
     if background:

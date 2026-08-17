@@ -50,6 +50,7 @@ from .attach import RemoteWorker, connect, launch_workers
 from .collective import CollectiveError, CollectiveGroup, GroupRebuilding
 from .head import Head, PlacementFailed
 from .launcher import ActorStartupError
+from .mesh import NotLinked, group_size, link, my_group, my_rank, peer, peers, roster
 from .pool import ActorPool
 from .process import (
     HttpOk,
@@ -85,6 +86,7 @@ __all__ = [
     "ManagedProcess",
     "MessageTooLarge",
     "NotFound",
+    "NotLinked",
     "ObjectLost",
     "ObjectRef",
     "OwnerRef",
@@ -110,16 +112,23 @@ __all__ = [
     "encode_message",
     "get",
     "get_actor",
+    "group_size",
     # API
     "init",
     "kill",
     "launch_process",
     "launch_workers",
+    "link",
+    "my_group",
+    "my_rank",
     "new_id",
     "nodes",
+    "peer",
+    "peers",
     "processes",
     "release",
     "remote",
+    "roster",
     "serde",
     "serve",
     "shutdown",

@@ -16,7 +16,7 @@ and cannot quietly stop being true.
 
 ```bash
 python examples/native_stack.py
-python examples/dataloader_to_trainer.py
+python examples/dataloader_sidecars.py
 python examples/rl_control_plane.py
 ```
 
@@ -39,47 +39,54 @@ lines swapped for toys, and the substitutions are written in the comments.
 
 ---
 
-## `dataloader_to_trainer.py` — the classic pipeline
+## `dataloader_sidecars.py` — the mesh
 
-Four loader actors feeding a four-rank DDP trainer.
+A real `torch.utils.data.DataLoader` — with its own worker processes — feeding a
+real DDP trainer, connected by sidecars.
 
 ```
-loader 0..3 ──── batches (megabytes, direct) ────► rank 0..3
-                          │
-                       driver: references only
+loader process 0..3                     trainer process 0..1
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ torch DataLoader         │            │ model + optimiser        │
+│          ▲ local         │            │          ▲ local         │
+│  ┌───────┴────────┐      │            │  ┌───────┴────────┐      │
+│  │ tinyray sidecar│◄─────┼── direct ──┼─►│ tinyray sidecar│      │
+│  └────────────────┘      │            │  └────────────────┘      │
+└──────────────────────────┘            └──────────────────────────┘
 ```
+
+tinyray is neither the dataloader nor the trainer. Each is the framework's own
+object, in a process the framework owns. tinyray is the connector.
 
 What it demonstrates:
 
-**Prefetch.** `.remote()` returns immediately, so batch *k+1* is built while the
-trainer works on *k*. The example runs the epoch twice, once serially and once
-pipelined, and reports the speedup **against the theoretical ceiling** — because
-"1.3x" means nothing until you know the ceiling was 1.36x.
+**The driver leaves.** It places two fleets, calls `tr.link` once, and says
+"go". Measured over the whole training loop: **868 bytes** through the driver
+while 13.6 MB moved between sidecars.
 
-**References, not values.** The driver never calls `get` on a batch. It hands
-the trainer a list of references; each rank fetches its own shard. The list is
-nested, so tinyray passes it through untouched — only top-level reference
-arguments are resolved, which is exactly what stops all four ranks pulling all
-four shards.
+**Discovery.** The trainer sidecar asks `tinyray.peers("loader")` who its
+loaders are and takes `[rank::world_size]`. No endpoints on any command line,
+and nothing in the worker knows the driver's address.
 
-**`wait`, not `get`, for timing.** The example times the loader by waiting for
-readiness rather than fetching. Using `get` there would drag 8 MB into the
-driver to run a stopwatch — the precise anti-pattern the whole design is built
-against.
+**Both directions.** Trainer → loader: `set_epoch` at an epoch boundary, and
+the pull itself. Loader → trainer: the batches.
 
-**Release.** Consumed batches are dropped explicitly, and so are the ones
-prefetching left over. A loader holding stale batches is memory paid for twice.
+**The DataLoader is real.** `num_workers=2, persistent_workers=True`, so each
+loader process forks its own workers — eight in total, none of them tinyray's.
 
-**Prints:** ~150 MB loader → trainer against ~90 KB through the driver.
+**Prints:** batches served, epoch boundaries pushed, forked worker processes,
+MB peer-to-peer against bytes through the driver.
 
-### The asymmetry worth noticing
+### Why the loss is reported in halves
 
-The trainer ranks read `RANK` from the environment, because torchrun's contract
-supplies it. The loader actors cannot: `create_actors` is atomic, and atomicity
-means one set of constructor arguments for the whole gang. Shard identity is a
-second, cheap call.
+Each rank alternates between its shards, and the shards sit at different
+offsets, so a single batch's loss says more about which shard it came from than
+about the model. The first version of this example reported first-batch versus
+last-batch and appeared to diverge; the numbers turned out to be exactly
+`1 + shard²`. Averaging over halves removes the confound.
 
----
+A reminder that a metric which moves is not the same as a metric that means
+something.
 
 ## `rl_control_plane.py` — actor-learner RL
 
@@ -137,7 +144,7 @@ goes through `run`.** The comment in the source now says why.
 | `gpus_per_worker=0.0` | `gpus_per_worker=1.0` |
 | gloo | nccl |
 | `np.save` / `np.load` | NCCL broadcast, or CUDA IPC |
-| `time.sleep` in the loader | a real dataset |
+| a synthetic `Dataset` | webdataset, a memmapped corpus, an index file |
 
 The controller code — placement, dispatch, `wait`, `release`, the reload signal
 — does not change. That is the claim these examples exist to support.
@@ -153,12 +160,14 @@ startup and removed in a `finally` block. A test asserts none survive.
 **`run_on` is not safe for a method with a collective in it.** See above. It
 exists for genuinely single-rank work, such as reading a metric.
 
-**One loader per rank is for clarity.** Real jobs usually have more loaders than
-ranks and pull from a pool.
+**A worker's executor is single-threaded.** While a sidecar runs a long method,
+peer calls queue behind it. The mesh example has the consumer drive the loop for
+that reason: pulling needs no backpressure protocol.
 
 ## See also
 
 - [02-native-frameworks.md](02-native-frameworks.md) — the API these examples use
 - [03-actors.md](03-actors.md) — `create_actors`, `wait`, `release`
 - [05-fault-tolerance.md](05-fault-tolerance.md) — what happens when a worker dies
+- [07-mesh.md](07-mesh.md) — the peer API the dataloader example uses
 - [05-testing.md](../04-internals/05-testing.md) — why the examples are executed, not just linted

@@ -101,6 +101,37 @@ For a framework-owned workload only the first row is active. `examples/native_st
 runs a four-rank trainer plus an inference server through three iterations and
 moves 2,163 bytes through the driver.
 
+## Topology
+
+Two shapes, and tinyray originally supported only the first.
+
+**Fan-out.** The driver at the centre, workers as leaves. It submits, collects
+and decides. Right for 32 rollouts and a learner, where the driver *is* the
+algorithm.
+
+```
+              driver
+        ┌───────┼───────┐
+     worker  worker  worker
+```
+
+**Pipeline.** One fleet produces for another, continuously, and the driver has
+nothing to contribute between steps. A dataloader fleet feeding a trainer fleet;
+a prefill tier feeding a decode tier. Routing this through the driver makes the
+controller the bottleneck at exactly the point where it adds no value.
+
+```
+     driver ─── places, introduces, then goes quiet
+
+     loader ──► loader ──►      direct, peer to peer
+        └────────┬────────► trainer ◄──► trainer
+```
+
+`tr.link(...)` pushes a roster after startup — endpoints do not exist until
+every worker has bound a port — and from then on workers address each other by
+group and rank. What the driver keeps is what only it can do: placement,
+supervision, restart. See [the mesh guide](../02-guides/07-mesh.md).
+
 ## Placement
 
 One scheduler covers all three worker kinds, which is the only way to guarantee

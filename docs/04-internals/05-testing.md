@@ -10,7 +10,7 @@ failed to catch real bugs, encoded so they cannot fail the same way again.
 | Layer | Count | Where |
 |---|---|---|
 | Rust unit tests | 117 | inline `#[cfg(test)]` |
-| Python tests | 433 | `tests/` |
+| Python tests | 469 | `tests/` |
 | Mutants | 21 | `scripts/mutate.py` |
 | Benchmarks | — | `benchmarks/` |
 
@@ -98,7 +98,7 @@ properties of the test suite itself, not of the runtime.
 Prose has no compiler, so `docs/` is the largest place where something can be
 claimed and never checked. Same failure shape, larger surface.
 
-`tests/test_docs.py` (131 tests) closes it. Extracted from the pages and
+`tests/test_docs.py` (147 tests) closes it. Extracted from the pages and
 asserted against the installed package:
 
 - every signature block matches `inspect.signature` — parameter names, order

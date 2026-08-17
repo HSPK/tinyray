@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from .api import ActorHandle, Context, _require_context, construct_all, get
 
@@ -77,6 +77,12 @@ class WorkerGroup:
     handles: list[ActorHandle]
     master_addr: str
     master_port: int
+
+    #: Marker for duck-typing that survives handle proxying. Handles forward
+    #: every public attribute to a remote method, so `hasattr(x, "world_size")`
+    #: is true for things that are not groups; underscore names are the only
+    #: ones they refuse.
+    _tinyray_group: ClassVar[bool] = True
 
     @property
     def world_size(self) -> int:

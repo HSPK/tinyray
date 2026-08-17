@@ -209,6 +209,13 @@ MAIN_LINE = [
     "nodes",
     "actors",
     "transport_stats",
+    "link",
+    "peers",
+    "peer",
+    "my_group",
+    "my_rank",
+    "group_size",
+    "roster",
 ]
 
 

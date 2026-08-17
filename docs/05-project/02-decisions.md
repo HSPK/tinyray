@@ -184,6 +184,44 @@ three times, and is now principle 5.
 
 **Now:** all members are dispatched before any is awaited.
 
+### Star topology → peer mesh
+
+**Originally:** the driver at the centre, workers as leaves, every message
+relayed through the middle. Workers had no way to address each other, and none
+of the API admitted that they might want to.
+
+**Reversed because** that is the shape of a *fan-out*, not a *pipeline*. It fits
+32 rollouts and a learner with one loop in the driver. It does not fit a
+dataloader fleet feeding a trainer fleet, where the driver has nothing to
+contribute between steps and routing through it makes the controller the
+bottleneck at exactly the point where it adds no value.
+
+The assumption came from the original scope — "32 actors, one learner, the
+driver runs the loop" — and was never revisited when the project repositioned
+as a control plane for native frameworks. Every real disaggregated stack is a
+pipeline.
+
+Three symptoms, one cause:
+
+| Symptom | Detail |
+|---|---|
+| `get_actor(name)` failed inside a worker | The registry lives in the driver's head, and a worker has no client to it |
+| Handles could not be pickled | They hold a `Context`, so a peer reference could not be sent anywhere |
+| `connect(endpoint)` "worked" | By falling through to `init()` and building a **second head** inside the worker — a phantom cluster with its own supervision loop, believing it owned the machine |
+
+The third is the telling one. Peer-to-peer was never designed; it only appeared
+to function because a driver would silently bootstrap itself inside any worker
+that tried.
+
+**Now:** `tr.link(...)` pushes a roster after startup, `tinyray.peers(group)`
+resolves it, handles are picklable, and a worker uses a client-only
+`PeerContext` with no head at all. Measured on the dataloader example: **868
+bytes** through the driver for an entire training loop that moved 13.6 MB
+between sidecars.
+
+**Cost.** One more concept, and a roster that is a snapshot rather than a live
+view — a worker that restarts after `link` is stale until you link again.
+
 ### Independent processes → process groups
 
 **Originally:** plain `subprocess`.

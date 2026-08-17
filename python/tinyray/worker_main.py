@@ -25,7 +25,7 @@ import threading
 import traceback
 from typing import Any, Optional
 
-from . import serde
+from . import mesh, serde
 from ._tinyray import ActorRuntime, Task
 
 #: How often to drop results past their TTL. Overridable through
@@ -127,6 +127,10 @@ class ActorHost:
 
             actor_state().abort(args[0])
             return None
+        if method == mesh.LINK_METHOD:
+            # An actor can be a mesh member too. Handled here rather than on the
+            # user object, for the same reason as the collective methods above.
+            return mesh.install_roster(*args, **kwargs)
 
         if method == "__init__":
             cls, init_args, init_kwargs = args
@@ -187,6 +191,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     with contextlib.suppress(AttributeError, ValueError):
         faulthandler.register(signal.SIGUSR1)
 
+    mesh.mark_serving()
     runtime = ActorRuntime(
         actor_id=args.actor_id,
         bind=args.bind,

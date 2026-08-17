@@ -54,6 +54,14 @@ communicator leaves the others blocked in a barrier.
 Needs: detect the death, abort the group on every surviving rank, restart the
 dead one, rebuild at a new epoch. The state machine exists; nothing drives it.
 
+### Automatic roster refresh
+
+`link` pushes a snapshot. When a worker restarts it comes back on a new port,
+and every peer holding the old endpoint is stale until the driver links again.
+
+The driver already knows — it performed the restart. It should re-push without
+being asked.
+
 ### Automatic collective rebuild
 
 Follows from the above. Today `GroupRebuilding` is raised and the caller decides.

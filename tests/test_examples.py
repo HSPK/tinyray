@@ -62,7 +62,7 @@ def native_stack() -> str:
 
 @pytest.fixture(scope="module")
 def dataloader() -> str:
-    return run_example("dataloader_to_trainer")
+    return run_example("dataloader_sidecars")
 
 
 @pytest.fixture(scope="module")
@@ -72,7 +72,7 @@ def rl() -> str:
 
 class TestEveryExampleIsRunnable:
     def test_no_example_is_left_unexercised(self):
-        covered = {"native_stack", "dataloader_to_trainer", "rl_control_plane"}
+        covered = {"native_stack", "dataloader_sidecars", "rl_control_plane"}
         present = {p.stem for p in EXAMPLES.glob("*.py") if not p.stem.startswith("_")}
         assert present == covered, (
             f"examples nobody runs: {sorted(present - covered)}; add them here, "
@@ -106,35 +106,52 @@ class TestNativeStack:
         )
 
 
-class TestDataloaderToTrainer:
-    def test_the_driver_stays_out_of_the_data_path(self, dataloader: str):
-        payload = number(r"data loader -> trainer:\s+([\d,.]+) MB", dataloader)
-        driver = number(r"data through the driver:\s+([\d,.]+) KB", dataloader)
-        ratio = payload * 1e6 / (driver * 1e3)
-        assert ratio > 100, (
-            f"batches were {payload:.1f} MB but the driver moved {driver:.1f} KB "
-            f"({ratio:.0f}x). References are supposed to keep the driver's share "
-            "negligible; this looks like something started fetching payloads"
+class TestDataloaderSidecars:
+    """The mesh example: sidecars beside real frameworks, talking to each other."""
+
+    def test_the_driver_goes_quiet_once_the_mesh_is_linked(self, dataloader: str):
+        during = number(r"through the driver:\s+([\d,]+) bytes for the entire", dataloader)
+        assert during < 20_000, (
+            f"the driver moved {during:,.0f} bytes during training. After link() "
+            "it should carry one dispatch and one result, not the pipeline"
         )
 
-    def test_prefetching_actually_overlaps(self, dataloader: str):
-        speedup = number(r"we reached ([\d.]+)x", dataloader)
-        ceiling = number(r"perfect overlap would be ([\d.]+)x", dataloader)
-        assert speedup > 1.0, (
-            f"prefetching gave {speedup:.2f}x, so the loader and the trainer are still taking turns"
-        )
-        assert speedup <= ceiling * 1.15, (
-            f"measured {speedup:.2f}x against a theoretical ceiling of "
-            f"{ceiling:.2f}x; the benchmark is measuring the wrong thing"
+    def test_the_data_went_peer_to_peer(self, dataloader: str):
+        payload = number(r"loader -> trainer:\s+([\d,.]+) MB, peer to peer", dataloader)
+        during = number(r"through the driver:\s+([\d,]+) bytes for the entire", dataloader)
+        assert payload * 1e6 / during > 1000, (
+            f"{payload:.1f} MB of batches against {during:,.0f} driver bytes; the "
+            "control plane is carrying data again"
         )
 
-    def test_every_rank_trained_on_data(self, dataloader: str):
-        samples = number(r"rank 0 saw (\d+) samples", dataloader)
-        assert samples > 0
+    def test_the_loaders_are_real_torch_dataloaders(self, dataloader: str):
+        workers = number(r"torch DataLoader worker processes:\s+(\d+)", dataloader)
+        assert workers > 0, (
+            "the DataLoaders reported no worker processes, so the example is not "
+            "exercising a real torch DataLoader -- which is the whole point"
+        )
 
-    def test_batches_were_produced_by_every_shard(self, dataloader: str):
-        produced = number(r"batches produced:\s+(\d+)", dataloader)
-        assert produced >= 32, f"only {produced:.0f} batches; the loaders barely ran"
+    def test_every_rank_discovered_its_loaders(self, dataloader: str):
+        found = re.findall(r"rank (\d+) pulls from (\d+) loaders", dataloader)
+        assert len(found) >= 2, "not every rank reported its loaders"
+        assert all(int(count) > 0 for _, count in found), (
+            f"a rank discovered no loaders: {found}; peers() returned nothing"
+        )
+
+    def test_the_trainer_drove_the_loaders(self, dataloader: str):
+        epochs = number(r"epoch boundaries driven by the trainer:\s+(\d+)", dataloader)
+        assert epochs >= 1, (
+            "no epoch boundary was pushed, so the trainer -> loader control direction never ran"
+        )
+
+    def test_training_made_progress(self, dataloader: str):
+        pairs = re.findall(r"mean loss ([\d.]+) -> ([\d.]+)", dataloader)
+        assert pairs, "no loss reported"
+        for first, second in pairs:
+            assert float(second) < float(first), (
+                f"loss went {first} -> {second}; the batches are arriving but the "
+                "trainer is not learning from them"
+            )
 
 
 class TestRLControlPlane:

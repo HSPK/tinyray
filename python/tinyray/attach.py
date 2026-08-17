@@ -14,9 +14,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Optional
 
-from . import serde
+from . import mesh, serde
 from ._tinyray import new_id
-from .api import Context, ObjectRef, _require_context, get
+from .api import Context, ObjectRef, _require_context, get, peer_context
 from .process import HttpOk, ManagedProcess, free_port
 from .serve import ACTOR_ID_ENV, CONTROL_PORT_ENV
 from .worker_group import WorkerGroup, torchrun_env
@@ -66,10 +66,21 @@ class RemoteWorker:
     def __repr__(self) -> str:
         return f"RemoteWorker(rank={self._rank}, {self._endpoint})"
 
+    def __reduce__(self):
+        # A peer reference has to survive being sent to another worker, which is
+        # the whole point of a mesh. The context is what makes this object
+        # unpicklable and is also the part the receiver must not inherit -- it
+        # rebuilds against its own runtime, exactly as ObjectRef does.
+        return (_reconnect, (self._endpoint, self._actor_id, self._rank))
+
     def __getattr__(self, name: str) -> RemoteMethod:
         if name.startswith("_"):
             raise AttributeError(name)
         return RemoteMethod(self, name)
+
+    def link(self, roster: dict, group: str, rank: int) -> ObjectRef:
+        """Push the topology to this worker. Driver-side; see :func:`tinyray.link`."""
+        return self._submit(mesh.LINK_METHOD, (roster, group, rank), {})
 
     def _submit(self, method: str, args: tuple, kwargs: dict) -> ObjectRef:
         body, frames = serde.serialize((args, kwargs))
@@ -208,14 +219,23 @@ def connect(endpoint: str, actor_id: Optional[str] = None) -> RemoteWorker:
     For a worker started outside tinyray -- by hand, by a scheduler, by an
     existing launch script. tinyray takes no responsibility for its lifecycle
     and simply calls into it.
+
+    Works from a driver and from inside another worker. In a worker it uses a
+    client-only context, so a sidecar calling its peer does not accidentally
+    stand up a second cluster manager.
     """
-    context = _require_context()
+    context = peer_context()
     if actor_id is None:
         import json
 
         health = json.loads(context.client.get_text(endpoint, "/health"))
         actor_id = health["actor"]
     return RemoteWorker(context, actor_id=actor_id, endpoint=endpoint)
+
+
+def _reconnect(endpoint: str, actor_id: str, rank: int) -> RemoteWorker:
+    """Rebuild a peer handle that arrived over the wire."""
+    return RemoteWorker(peer_context(), actor_id=actor_id, endpoint=endpoint, rank=rank)
 
 
 def get_all(refs: Sequence[ObjectRef], timeout: float = 600.0) -> list[Any]:

@@ -16,7 +16,7 @@ import threading
 from collections.abc import Iterable, Sequence
 from typing import Any, Callable, NoReturn, Optional, Union
 
-from . import serde
+from . import mesh, serde
 from ._tinyray import (
     ActorDied,
     ClientRuntime,
@@ -257,6 +257,51 @@ def shutdown() -> None:
         context.shutdown()
 
 
+class PeerContext:
+    """Everything a worker needs to call another worker, and nothing else.
+
+    A worker talking to a peer needs a connection pool. It does not need
+    placement, a resource table, a supervision loop or a node agent -- those
+    belong to whoever started the job.
+
+    Before this existed, ``connect()`` inside a worker fell through to
+    ``init()`` and built a **second head** in the worker process: a phantom
+    cluster with its own supervisor thread that believed it owned the machine's
+    CPUs and GPUs. It worked, which is why nothing caught it, and it would have
+    started double-counting resources the moment anyone placed anything.
+    """
+
+    def __init__(self) -> None:
+        self.client = ClientRuntime()
+
+    def register_endpoint(self, actor_id: str, endpoint: str) -> None:
+        self.client.register_actor(actor_id, endpoint)
+
+    def __repr__(self) -> str:
+        return "PeerContext(client-only)"
+
+
+_peer_context_value: Optional[PeerContext] = None
+_peer_lock = threading.Lock()
+
+
+def peer_context() -> Any:
+    """The context to make outbound calls with, wherever we are running.
+
+    In a driver this is the real :class:`Context`. In a worker it is a
+    client-only :class:`PeerContext`, deliberately without a head.
+    """
+    global _peer_context_value
+    if _context is not None:
+        return _context
+    if mesh.in_worker() or _inside_actor():
+        with _peer_lock:
+            if _peer_context_value is None:
+                _peer_context_value = PeerContext()
+            return _peer_context_value
+    return init()
+
+
 def _require_context() -> Context:
     if _context is None:
         return init()
@@ -321,6 +366,19 @@ class ActorHandle:
 
     def __repr__(self) -> str:
         return f"ActorHandle({self._class_name}, {self.name}, {self.endpoint})"
+
+    def __reduce__(self):
+        # Sent to another worker, an actor handle degrades to a peer handle: the
+        # receiver can call the actor but cannot manage it. That asymmetry is
+        # deliberate -- placement and restart belong to whoever owns the head,
+        # and a worker does not.
+        from .attach import _reconnect
+
+        return (_reconnect, (self.endpoint, self.actor_id, 0))
+
+    def link(self, roster: dict, group: str, rank: int) -> ObjectRef:
+        """Push the topology to this actor. Driver-side; see :func:`tinyray.link`."""
+        return self._submit(mesh.LINK_METHOD, (roster, group, rank), {})
 
     def _submit(self, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> ObjectRef:
         self._context.await_reconstruction(self.actor_id)

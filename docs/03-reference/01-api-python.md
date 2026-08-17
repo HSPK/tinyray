@@ -270,6 +270,64 @@ connect(endpoint, actor_id=None) -> RemoteWorker
 Drives a process that is already serving. tinyray takes no responsibility for
 its lifecycle.
 
+Works from a driver and from inside another worker. In a worker it uses a
+client-only context, so a sidecar calling a peer does not stand up a second
+cluster manager.
+
+---
+
+## Mesh
+
+For pipelines, where one fleet produces for another and the driver has nothing
+to say between steps. See [the guide](../02-guides/07-mesh.md).
+
+### `link`
+
+```python
+link(**groups) -> dict[str, list[dict]]
+```
+
+Introduces groups of workers to each other. Accepts worker groups, lists of
+handles, or single handles; actors and served processes can share one mesh.
+
+```python
+tr.link(loader=loaders, trainer=trainers)
+```
+
+A push after startup rather than an environment variable, because endpoints do
+not exist until every worker has bound a port. Idempotent, and re-callable —
+which is how survivors relearn a restarted peer's address.
+
+Returns the roster it pushed.
+
+### Inside a worker
+
+```python
+peers(group=None) -> list[RemoteWorker]
+peer(group, rank) -> RemoteWorker
+my_group() -> str
+my_rank() -> int
+group_size(group=None) -> int
+roster() -> dict[str, list[dict]]
+```
+
+`peers` is indexed by rank and defaults to the caller's own group. All six raise
+`NotLinked` before `link` has run.
+
+`peers` returns `RemoteWorker` handles, so calling a peer looks exactly like
+calling a worker from the driver.
+
+### Handles travel
+
+`RemoteWorker` and `ActorHandle` are picklable, so a peer reference can be sent
+to another worker. An `ActorHandle` arrives as a `RemoteWorker`: still callable,
+no longer manageable, because placement and restart belong to whoever owns the
+head.
+
+---
+
+## Rendezvous
+
 ### `torchrun_env`
 
 ```python
@@ -341,6 +399,12 @@ the actor, which does not exist. Naming does not require it.
 **`launch_workers` has no `max_restarts`.** `launch_process` does.
 
 **`context=` is an escape hatch**, not for normal use.
+
+**`hasattr` is meaningless on a handle.** Handles proxy every public name to a
+remote method, so `hasattr(worker, "anything")` is `True`. Check types.
+
+**The roster is a snapshot.** A worker restarted after `link` is stale until you
+link again.
 
 ## See also
 

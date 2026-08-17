@@ -109,11 +109,11 @@ they work without a GPU:
 | Example | What it shows |
 |---|---|
 | `native_stack.py` | A four-rank trainer and an inference server, end to end |
-| `dataloader_to_trainer.py` | The classic pipeline: prefetch, references not values, ~150 MB loader → trainer against ~90 KB through the driver |
+| `dataloader_sidecars.py` | A real torch DataLoader and a real DDP trainer, connected by sidecars: 13.6 MB peer to peer against 868 bytes through the driver |
 | `rl_control_plane.py` | Actor-learner RL: stragglers dropped without being abandoned, weights swapped without touching tinyray |
 
 They are executed by the test suite, which parses their output and asserts the
-numbers they print. See [the guide](docs/02-guides/07-examples.md).
+numbers they print. See [the guide](docs/02-guides/08-examples.md).
 
 ### The actor API
 

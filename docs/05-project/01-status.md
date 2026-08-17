@@ -23,6 +23,7 @@ Current release: **0.2.1**.
 | Managed processes with readiness detection | complete |
 | Process-group cleanup | complete |
 | `launch_workers` / `serve` / `connect` | complete |
+| Peer mesh: `link`, `peers`, picklable handles | complete |
 | `torchrun` environment injection | complete |
 | Supervision, heartbeats, restart with `__init__` replay | complete |
 | Prewarm pool | complete |
@@ -39,6 +40,7 @@ Current release: **0.2.1**.
 | **`max_task_retries`** | Only backpressure retries | Deliberate: replaying a stateful call is unsafe without idempotence the framework cannot know about |
 | **Worker group restart** | A dead rank stops the group | Detection works; recovery is the caller's. Restarting one rank without rebuilding the communicator hangs the rest |
 | **Automatic collective rebuild** | After a rank dies | The epoch state machine exists; nothing drives it automatically |
+| **Automatic roster refresh** | A restarted peer's new address | `link` must be called again by hand. The roster is a snapshot, not a subscription |
 | **`/metrics` (Prometheus)** | No standard scraping | `/introspect` carries the same data in custom JSON |
 | **Log aggregation** | Logs are per process | The driver prefixes forwarded output with `[name:pid]`; there is no central collection |
 | **Adaptive compression** | Bandwidth on large results | Never implemented |
