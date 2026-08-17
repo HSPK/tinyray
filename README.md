@@ -42,8 +42,8 @@ Full documentation is in [`docs/`](docs/).
 | [Internals](docs/04-internals/) | Rust core, store and queue, transport, scheduler, testing |
 | [Project](docs/05-project/) | Honest status, decisions and reversals, roadmap |
 
-New here? Start with [getting started](docs/02-guides/getting-started.md), then
-[native frameworks](docs/02-guides/native-frameworks.md).
+New here? Start with [getting started](docs/02-guides/01-getting-started.md), then
+[native frameworks](docs/02-guides/02-native-frameworks.md).
 
 ## What it is, and is not
 

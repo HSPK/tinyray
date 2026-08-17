@@ -178,6 +178,6 @@ discovery command yet. Get endpoints from `tr.actors()` or `tr.processes()`.
 
 ## See also
 
-- [fault-tolerance.md](fault-tolerance.md) — what the failures mean
-- [cli.md](../03-reference/cli.md) — full command reference
-- [protocol.md](../03-reference/protocol.md) — the endpoints
+- [05-fault-tolerance.md](05-fault-tolerance.md) — what the failures mean
+- [03-cli.md](../03-reference/03-cli.md) — full command reference
+- [02-protocol.md](../03-reference/02-protocol.md) — the endpoints

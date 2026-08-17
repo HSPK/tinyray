@@ -128,11 +128,11 @@ Not exposed in Python. Listed because they explain latency.
 | `max_message_len` | 8 GiB |
 
 Sized for ~10 MB payloads with headroom. Exceeding one is fatal to the
-connection: see [protocol](protocol.md#limits).
+connection: see [protocol](02-protocol.md#limits).
 
 ## Environment variables
 
-Listed in [cli.md](cli.md#environment-variables). Two are meant for you rather
+Listed in [03-cli.md](03-cli.md#environment-variables). Two are meant for you rather
 than for tinyray:
 
 | Variable | Default | Purpose |
@@ -171,5 +171,5 @@ moment. For anything that serves, use `"http"` or `"log:"`.
 
 ## See also
 
-- [placement.md](../02-guides/placement.md) — resources in practice
-- [fault-tolerance.md](../02-guides/fault-tolerance.md) — the timing constants in context
+- [04-placement.md](../02-guides/04-placement.md) — resources in practice
+- [05-fault-tolerance.md](../02-guides/05-fault-tolerance.md) — the timing constants in context

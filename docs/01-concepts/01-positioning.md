@@ -28,9 +28,9 @@ Reach for the least invasive option that works.
 
 | Level | What you give up | Use for |
 |---|---|---|
-| [`launch_process`](../02-guides/native-frameworks.md#supervising-a-server) | **Nothing.** The process never learns tinyray exists. | SGLang, vLLM, any server |
-| [`serve`](../02-guides/native-frameworks.md#attaching-to-a-training-script) | **One line** at the bottom of your script. | Megatron, DeepSpeed, training scripts |
-| [`@remote`](../02-guides/actors.md) | The class is decorated and shipped to the worker; tinyray owns `__main__`. | Code written for tinyray |
+| [`launch_process`](../02-guides/02-native-frameworks.md#supervising-a-server) | **Nothing.** The process never learns tinyray exists. | SGLang, vLLM, any server |
+| [`serve`](../02-guides/02-native-frameworks.md#attaching-to-a-training-script) | **One line** at the bottom of your script. | Megatron, DeepSpeed, training scripts |
+| [`@remote`](../02-guides/03-actors.md) | The class is decorated and shipped to the worker; tinyray owns `__main__`. | Code written for tinyray |
 
 The actor API is genuinely convenient, and for a pure-Python rollout or an
 evaluation harness it is the right choice. But it requires the class to be
@@ -47,7 +47,7 @@ test rather than by good intentions.
 tinyray moves call signalling, references and status. Anything larger than a
 few tens of kilobytes crossing the driver is a design smell.
 
-*Enforced by* [`tests/test_driver_byte_budget.py`](../04-internals/testing.md#the-driver-byte-budget),
+*Enforced by* [`tests/test_driver_byte_budget.py`](../04-internals/05-testing.md#the-driver-byte-budget),
 which parks a 32 MB result in an actor and asserts what every driver operation
 moves.
 
@@ -62,12 +62,12 @@ A process has exactly one default `torch.distributed` group, one CUDA context
 and one set of signal handlers. They belong to the user's framework. If tinyray
 takes any of them, the framework has nowhere to go.
 
-*Consequence:* [`tinyray.collective`](../02-guides/actors.md#collective-groups)
+*Consequence:* [`tinyray.collective`](../02-guides/03-actors.md#collective-groups)
 calls `init_process_group` on your behalf and therefore **cannot coexist with
 Megatron or SGLang**. It is documented as mutually exclusive and
-[`create_worker_group`](../02-guides/native-frameworks.md) exists to replace it.
+[`create_worker_group`](../02-guides/02-native-frameworks.md) exists to replace it.
 
-*Same principle, different resource:* the [prewarm pool](../04-internals/rust-core.md#prewarming)
+*Same principle, different resource:* the [prewarm pool](../04-internals/01-rust-core.md#prewarming)
 imports torch but never touches CUDA. A process that has initialised a CUDA
 context has its `CUDA_VISIBLE_DEVICES` frozen and can never be reused for a
 different device assignment.
@@ -128,10 +128,10 @@ removed rather than kept. Dead code with a justification is still dead code.
 
 **Do not use `tinyray.collective` with a framework.** It takes the default
 process group. The symptom is a second `init_process_group` raising, or worse,
-a hang. Use [`create_worker_group`](../02-guides/native-frameworks.md) instead.
+a hang. Use [`create_worker_group`](../02-guides/02-native-frameworks.md) instead.
 
 **Do not reach for `@remote` by default.** It is the most invasive option. If
-your code is a training script, [attach to it](../02-guides/native-frameworks.md#attaching-to-a-training-script)
+your code is a training script, [attach to it](../02-guides/02-native-frameworks.md#attaching-to-a-training-script)
 instead.
 
 **Do not assume `ObjectRef` is the point.** For a framework-owned workload it
@@ -139,7 +139,7 @@ is nearly unused: the tensors move over NCCL and tinyray moves commands.
 
 ## See also
 
-- [architecture.md](architecture.md) — how the pieces fit
-- [tradeoffs.md](tradeoffs.md) — what each choice costs
-- [native-frameworks.md](../02-guides/native-frameworks.md) — the main line, in code
-- [status.md](../05-project/status.md) — what is actually built
+- [02-architecture.md](02-architecture.md) — how the pieces fit
+- [03-tradeoffs.md](03-tradeoffs.md) — what each choice costs
+- [02-native-frameworks.md](../02-guides/02-native-frameworks.md) — the main line, in code
+- [01-status.md](../05-project/01-status.md) — what is actually built

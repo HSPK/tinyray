@@ -252,7 +252,7 @@ another, and anything they share needs to be safe against that.
 
 **`launch_workers` assumes a single node.** `LOCAL_RANK` is computed as if all
 ranks are local. Multi-node needs node agents that report a routable address,
-which is not built. See [status](../05-project/status.md).
+which is not built. See [status](../05-project/01-status.md).
 
 **`launch_workers` does not restart ranks.** `launch_process` takes
 `max_restarts`; the worker-group path does not yet, and a restarted rank would
@@ -267,7 +267,7 @@ behind `launch_process`.
 
 ## See also
 
-- [placement.md](placement.md) — how resources and gangs are allocated
-- [fault-tolerance.md](fault-tolerance.md) — restart and failure semantics
-- [observability.md](observability.md) — when something is stuck
-- [positioning.md](../01-concepts/positioning.md) — why the boundary is here
+- [04-placement.md](04-placement.md) — how resources and gangs are allocated
+- [05-fault-tolerance.md](05-fault-tolerance.md) — restart and failure semantics
+- [06-observability.md](06-observability.md) — when something is stuck
+- [01-positioning.md](../01-concepts/01-positioning.md) — why the boundary is here

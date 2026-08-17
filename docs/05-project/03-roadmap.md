@@ -109,11 +109,11 @@ and would break the ordering guarantee that makes actor semantics predictable.
 
 ## Will not be done
 
-See the non-goals in [status](status.md#non-goals). The short version: no object
+See the non-goals in [status](01-status.md#non-goals). The short version: no object
 store, no stateless tasks, no self-written collective transport, no autoscaler,
 nothing resembling Ray Data, Tune or Serve.
 
 ## See also
 
-- [status.md](status.md) — what is missing today
-- [decisions.md](decisions.md) — why the boundaries are where they are
+- [01-status.md](01-status.md) — what is missing today
+- [02-decisions.md](02-decisions.md) — why the boundaries are where they are

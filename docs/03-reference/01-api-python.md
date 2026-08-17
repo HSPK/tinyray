@@ -63,7 +63,7 @@ class B: ...
 
 Options: `num_cpus`, `num_gpus`, `memory_bytes`, `max_restarts`,
 `max_pending_calls`, `store_max_bytes`, `store_ttl_seconds`, `strategy`, `name`.
-See [configuration](configuration.md).
+See [configuration](04-configuration.md).
 
 Raises `TypeError` on a function — tinyray has no tasks.
 
@@ -86,7 +86,7 @@ Calling the class directly raises `TypeError`.
 | `.pid` | `int` | Of the original process |
 | `.gpu_ids` | `list[int]` | Physical devices assigned |
 | `.is_alive()` | `bool` | |
-| `.introspect()` | `str` | JSON; see [observability](../02-guides/observability.md) |
+| `.introspect()` | `str` | JSON; see [observability](../02-guides/06-observability.md) |
 | `.<method>` | `ActorMethod` | Any public method |
 
 `ActorMethod.remote(*args, **kwargs) -> ObjectRef`. Calling without `.remote()`
@@ -344,6 +344,6 @@ the actor, which does not exist. Naming does not require it.
 
 ## See also
 
-- [configuration.md](configuration.md) — every default in one table
-- [protocol.md](protocol.md) — what crosses the wire
-- [actors.md](../02-guides/actors.md) — the actor API in prose
+- [04-configuration.md](04-configuration.md) — every default in one table
+- [02-protocol.md](02-protocol.md) — what crosses the wire
+- [03-actors.md](../02-guides/03-actors.md) — the actor API in prose

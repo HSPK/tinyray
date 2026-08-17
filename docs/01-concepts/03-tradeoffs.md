@@ -109,7 +109,7 @@ cannot join.
 model would mean reloading them.
 
 **Cost:** no dynamic task graphs, no `ray.put`, no automatic parallelism for
-embarrassingly parallel work. [`ActorPool`](../02-guides/actors.md#actorpool)
+embarrassingly parallel work. [`ActorPool`](../02-guides/03-actors.md#actorpool)
 covers the common case.
 
 **Bonus:** no tasks means no high-frequency scheduling, so the head is a
@@ -132,7 +132,7 @@ released.
 **Cost:** no `async def` actors and `max_concurrency > 1` is unimplemented, so
 the executor is strictly single-threaded. For an async-first engine like SGLang
 this would serialise requests and destroy its throughput — which is why SGLang
-belongs behind [`launch_process`](../02-guides/native-frameworks.md#supervising-a-server)
+belongs behind [`launch_process`](../02-guides/02-native-frameworks.md#supervising-a-server)
 as its own server, not inside an actor.
 
 ## Two round trips for a small result
@@ -149,6 +149,6 @@ optional blocking submit, which is not implemented.
 
 ## See also
 
-- [positioning.md](positioning.md) — the stance these choices serve
-- [decisions.md](../05-project/decisions.md) — the decision log, including reversals
-- [testing.md](../04-internals/testing.md) — how these claims are kept honest
+- [01-positioning.md](01-positioning.md) — the stance these choices serve
+- [02-decisions.md](../05-project/02-decisions.md) — the decision log, including reversals
+- [05-testing.md](../04-internals/05-testing.md) — how these claims are kept honest

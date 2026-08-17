@@ -3,7 +3,7 @@
 ## Purpose
 
 What happens when something dies: what restarts, what does not, and what you are
-told. The governing rule is [principle 6](../01-concepts/positioning.md#6-fail-loudly-never-hang):
+told. The governing rule is [principle 6](../01-concepts/01-positioning.md#6-fail-loudly-never-hang):
 fail loudly, never hang.
 
 ## Failure taxonomy
@@ -155,6 +155,6 @@ seconds and a large model can exceed it.
 
 ## See also
 
-- [observability.md](observability.md) — diagnosing before it dies
-- [placement.md](placement.md) — how resources come back
-- [status.md](../05-project/status.md) — which of these gaps are open
+- [06-observability.md](06-observability.md) — diagnosing before it dies
+- [04-placement.md](04-placement.md) — how resources come back
+- [01-status.md](../05-project/01-status.md) — which of these gaps are open

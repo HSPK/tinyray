@@ -43,7 +43,7 @@ Current release: **0.2.1**.
 | **Log aggregation** | Logs are per process | The driver prefixes forwarded output with `[name:pid]`; there is no central collection |
 | **Adaptive compression** | Bandwidth on large results | Never implemented |
 | **`run_id` / seed propagation** | Reproducibility | Never implemented |
-| **Same-host fast path** | 10 MB same-host still goes over loopback | `shm.rs` was written, had 11 passing tests, was never wired in, and was deleted. See [decisions](decisions.md#deletions) |
+| **Same-host fast path** | 10 MB same-host still goes over loopback | `shm.rs` was written, had 11 passing tests, was never wired in, and was deleted. See [decisions](02-decisions.md#deletions) |
 
 ### Inline results
 
@@ -112,6 +112,6 @@ NCCL path is unacceptable.
 
 ## See also
 
-- [decisions.md](decisions.md) — why, including the reversals
-- [roadmap.md](roadmap.md) — what is next
-- [testing.md](../04-internals/testing.md) — how the gaps were found
+- [02-decisions.md](02-decisions.md) — why, including the reversals
+- [03-roadmap.md](03-roadmap.md) — what is next
+- [05-testing.md](../04-internals/05-testing.md) — how the gaps were found

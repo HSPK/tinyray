@@ -4,7 +4,7 @@
 
 The actor API, for code written for tinyray: pure-Python rollouts, evaluation
 harnesses, hyperparameter trials. If your code is a native framework script,
-[attach to it](native-frameworks.md) instead — this API is the most invasive of
+[attach to it](02-native-frameworks.md) instead — this API is the most invasive of
 the three.
 
 ## Concepts
@@ -46,7 +46,7 @@ trial = Rollout.options(num_gpus=0.25, name="trial-7").remote(cfg)
 | `num_cpus` | 1.0 | Fractional allowed |
 | `num_gpus` | 0.0 | `>= 1` reserves whole devices; fractional shares one |
 | `memory_bytes` | 0 | Checked against the node |
-| `max_restarts` | 0 | See [fault tolerance](fault-tolerance.md) |
+| `max_restarts` | 0 | See [fault tolerance](05-fault-tolerance.md) |
 | `max_pending_calls` | 1000 | Backpressure threshold |
 | `store_max_bytes` | 2 GiB | Result store watermark |
 | `store_ttl_seconds` | 300 | Result lifetime |
@@ -176,7 +176,7 @@ not exist yet, so accepting it would silently leak a process at shutdown.
 
 > **Do not use this with Megatron, SGLang or vLLM.** It calls
 > `init_process_group` and takes the process's one default group. Use
-> [`create_worker_group`](native-frameworks.md) instead.
+> [`create_worker_group`](02-native-frameworks.md) instead.
 
 For pure-tinyray actors that need NCCL among themselves:
 
@@ -231,7 +231,7 @@ fast method the queue never fills. That is the intended behaviour, not a bug.
 
 ## See also
 
-- [native-frameworks.md](native-frameworks.md) — the less invasive path
-- [fault-tolerance.md](fault-tolerance.md) — restart semantics in detail
-- [placement.md](placement.md) — how `num_gpus` is interpreted
-- [api-python.md](../03-reference/api-python.md) — exact signatures
+- [02-native-frameworks.md](02-native-frameworks.md) — the less invasive path
+- [05-fault-tolerance.md](05-fault-tolerance.md) — restart semantics in detail
+- [04-placement.md](04-placement.md) — how `num_gpus` is interpreted
+- [01-api-python.md](../03-reference/01-api-python.md) — exact signatures

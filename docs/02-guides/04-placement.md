@@ -143,7 +143,7 @@ rather than resource accounting.
 **There is no affinity API.** You cannot say "put this actor on the same node as
 that one" or "share these GPUs with the trainer". Colocating a trainer and an
 inference engine — standard in RL post-training — is not currently expressible.
-See [roadmap](../05-project/roadmap.md).
+See [roadmap](../05-project/03-roadmap.md).
 
 **A single node is all you get today.** The resource table and placement are
 multi-node capable and tested, but there is no head daemon or remote node agent,
@@ -151,6 +151,6 @@ so every placement lands locally.
 
 ## See also
 
-- [scheduler.md](../04-internals/scheduler.md) — the algorithm and its tests
-- [fault-tolerance.md](fault-tolerance.md) — what happens when a placement dies
-- [native-frameworks.md](native-frameworks.md) — placement in the main line
+- [04-scheduler.md](../04-internals/04-scheduler.md) — the algorithm and its tests
+- [05-fault-tolerance.md](05-fault-tolerance.md) — what happens when a placement dies
+- [02-native-frameworks.md](02-native-frameworks.md) — placement in the main line

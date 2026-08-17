@@ -16,7 +16,7 @@ than a service. There is no `tinyray start`, no daemon, and the head has no
 throughput requirement worth engineering for.
 
 The cost: the driver is a single point of failure, and there is no
-`lifetime="detached"`. See [status](../05-project/status.md).
+`lifetime="detached"`. See [status](../05-project/01-status.md).
 
 ## Resource model
 
@@ -117,7 +117,7 @@ Two things came from that. The timing constants became environment-overridable
 so a test can reach the deadline in seconds. And the test that should have
 caught it — `assert dead_nodes() == []` — turned out to be a false positive:
 it is true when the node is healthy *and* when it has already been reaped. It
-was the only survivor of the first mutation run. See [testing.md](testing.md).
+was the only survivor of the first mutation run. See [05-testing.md](05-testing.md).
 
 ### Restart
 
@@ -146,7 +146,7 @@ without rebuilding the communicator leaves the other ranks blocked in a
 barrier forever — a hang, not an error.
 
 Detection works; recovery is the caller's. See
-[fault-tolerance](../02-guides/fault-tolerance.md).
+[fault-tolerance](../02-guides/05-fault-tolerance.md).
 
 ### Process trees
 
@@ -173,6 +173,6 @@ packing would have fitted.
 
 ## See also
 
-- [placement.md](../02-guides/placement.md) — the user-facing view
-- [fault-tolerance.md](../02-guides/fault-tolerance.md) — what to do about failure
-- [configuration.md](../03-reference/configuration.md) — the timing constants
+- [04-placement.md](../02-guides/04-placement.md) — the user-facing view
+- [05-fault-tolerance.md](../02-guides/05-fault-tolerance.md) — what to do about failure
+- [04-configuration.md](../03-reference/04-configuration.md) — the timing constants

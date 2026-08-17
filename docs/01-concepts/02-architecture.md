@@ -48,7 +48,7 @@ Two properties hold throughout:
 1. **The head is never on the data path.** It participates when something is
    created, looked up, dies, or joins a group. Never when a result moves.
 2. **An actor's HTTP service is not blocked by user compute.** The server runs
-   on Rust threads that never take the GIL. See [rust-core](../04-internals/rust-core.md).
+   on Rust threads that never take the GIL. See [rust-core](../04-internals/01-rust-core.md).
 
 ## The three kinds of worker
 
@@ -86,7 +86,7 @@ An actor process runs three lines of execution that must not block each other.
 This split is why an actor grinding through a 200 ms training step still serves
 result fetches at full speed. Measured: 1.04x slowdown when four Python threads
 saturate the GIL, against 49x for the same work initiated from Python. The
-[rust-core](../04-internals/rust-core.md#the-gil-boundary) page explains why the
+[rust-core](../04-internals/01-rust-core.md#the-gil-boundary) page explains why the
 second number is the interesting one.
 
 ## Control plane and data plane
@@ -114,7 +114,7 @@ that a trainer actor and an inference server are not handed the same GPU.
   cannot complete a rendezvous, and the framework inside blocks forever on
   ranks that will never arrive.
 
-See [placement](../02-guides/placement.md) and [scheduler](../04-internals/scheduler.md).
+See [placement](../02-guides/04-placement.md) and [scheduler](../04-internals/04-scheduler.md).
 
 ## Implementation split
 
@@ -135,7 +135,7 @@ that touch Python object semantics stay in Python.**
 **The head is a library, not yet a daemon.** In the current release it runs
 inside the driver process. The state machine is multi-node capable and tested,
 but there is no `tinyray start --head` binary, so a cluster is single-machine in
-practice. See [status](../05-project/status.md).
+practice. See [status](../05-project/01-status.md).
 
 **A "node" is currently always local.** `LocalNodeAgent` is an in-process
 object. Multi-node needs it wrapped behind HTTP, which is not done.
@@ -146,6 +146,6 @@ but any collective group it belonged to stays `BROKEN` until you call
 
 ## See also
 
-- [positioning.md](positioning.md) — why the boundary is drawn here
-- [rust-core.md](../04-internals/rust-core.md) — the language boundary in detail
-- [protocol.md](../03-reference/protocol.md) — what actually crosses the wire
+- [01-positioning.md](01-positioning.md) — why the boundary is drawn here
+- [01-rust-core.md](../04-internals/01-rust-core.md) — the language boundary in detail
+- [02-protocol.md](../03-reference/02-protocol.md) — what actually crosses the wire

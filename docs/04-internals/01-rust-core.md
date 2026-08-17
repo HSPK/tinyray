@@ -141,6 +141,6 @@ this documentation are all `--release`.
 
 ## See also
 
-- [transport.md](transport.md) — the tokio side
-- [store-and-queue.md](store-and-queue.md) — what the runtime holds
-- [protocol.md](../03-reference/protocol.md) — the format `core` implements
+- [03-transport.md](03-transport.md) — the tokio side
+- [02-store-and-queue.md](02-store-and-queue.md) — what the runtime holds
+- [02-protocol.md](../03-reference/02-protocol.md) — the format `core` implements

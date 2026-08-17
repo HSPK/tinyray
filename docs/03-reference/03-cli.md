@@ -70,7 +70,7 @@ tinyray introspect HOST:PORT
 ```
 
 The raw JSON report, pretty-printed. Field meanings are in
-[observability](../02-guides/observability.md#reading-it).
+[observability](../02-guides/06-observability.md#reading-it).
 
 Exit 1 if the endpoint does not answer.
 
@@ -126,9 +126,9 @@ constant nobody tests.
 still starting, will not answer.
 
 **There is no `tinyray start`.** The head runs inside the driver process; there
-is no daemon to start. See [status](../05-project/status.md).
+is no daemon to start. See [status](../05-project/01-status.md).
 
 ## See also
 
-- [observability.md](../02-guides/observability.md) — using this in anger
-- [configuration.md](configuration.md) — every knob
+- [06-observability.md](../02-guides/06-observability.md) — using this in anger
+- [04-configuration.md](04-configuration.md) — every knob

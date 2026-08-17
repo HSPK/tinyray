@@ -99,7 +99,7 @@ means holding the acknowledgement until completion — which would make
 `.remote()` blocking, defeating the point.
 
 Listed here because it is a real gap, not a hidden feature. See
-[status](../05-project/status.md).
+[status](../05-project/01-status.md).
 
 ## Driver-side accounting
 
@@ -135,6 +135,6 @@ saturate its pool; a fifth waits.
 
 ## See also
 
-- [protocol.md](../03-reference/protocol.md) — the wire format
-- [store-and-queue.md](store-and-queue.md) — where a call lands
-- [rust-core.md](rust-core.md) — the GIL measurement behind the thread model
+- [02-protocol.md](../03-reference/02-protocol.md) — the wire format
+- [02-store-and-queue.md](02-store-and-queue.md) — where a call lands
+- [01-rust-core.md](01-rust-core.md) — the GIL measurement behind the thread model

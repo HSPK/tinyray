@@ -72,7 +72,7 @@ an adapter.
 SGLang is a server, not a class. `launch_process` came from this.
 
 **4b. Minimise intrusion, in three levels.** From
-[positioning](../01-concepts/positioning.md).
+[positioning](../01-concepts/01-positioning.md).
 
 **5. Group operations are collective-safe by default.**
 After the same deadlock appeared three times.
@@ -203,7 +203,7 @@ A same-host shared-memory fast path. 11 passing unit tests. Never called by
 transport or actor. Deleted.
 
 It is the clearest example of blind spot 2 in
-[testing](../04-internals/testing.md#2-dead-code-with-passing-unit-tests):
+[testing](../04-internals/05-testing.md#2-dead-code-with-passing-unit-tests):
 coverage of a module says nothing about whether anything uses it. The cost of
 keeping it — a maintained, tested, unreachable code path — exceeded the cost of
 losing it.
@@ -225,6 +225,6 @@ that goes stale.
 
 ## See also
 
-- [positioning.md](../01-concepts/positioning.md) — the stance in full
-- [tradeoffs.md](../01-concepts/tradeoffs.md) — each choice with its measured cost
-- [status.md](status.md) — what these decisions left unbuilt
+- [01-positioning.md](../01-concepts/01-positioning.md) — the stance in full
+- [03-tradeoffs.md](../01-concepts/03-tradeoffs.md) — each choice with its measured cost
+- [01-status.md](01-status.md) — what these decisions left unbuilt

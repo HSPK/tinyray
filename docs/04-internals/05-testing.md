@@ -10,7 +10,7 @@ failed to catch real bugs, encoded so they cannot fail the same way again.
 | Layer | Count | Where |
 |---|---|---|
 | Rust unit tests | 117 | inline `#[cfg(test)]` |
-| Python tests | 398 | `tests/` |
+| Python tests | 415 | `tests/` |
 | Mutants | 21 | `scripts/mutate.py` |
 | Benchmarks | — | `benchmarks/` |
 
@@ -98,12 +98,12 @@ properties of the test suite itself, not of the runtime.
 Prose has no compiler, so `docs/` is the largest place where something can be
 claimed and never checked. Same failure shape, larger surface.
 
-`tests/test_docs.py` (112 tests) closes it. Extracted from the pages and
+`tests/test_docs.py` (129 tests) closes it. Extracted from the pages and
 asserted against the installed package:
 
 - every signature block matches `inspect.signature` — parameter names, order
   and defaults
-- every `tr.name` a reader could copy exists
+- every `tinyray` symbol a reader could copy exists
 - every documented exception is exported
 - every documented default equals the real default
 - every environment variable the code reads is documented, and every one
@@ -201,7 +201,7 @@ Stated honestly, because an untested claim is a claim.
 - **Multi-node has never run end to end.** Placement across nodes is unit
   tested; a real second machine has not been involved.
 
-See [status](../05-project/status.md).
+See [status](../05-project/01-status.md).
 
 ## Pitfalls
 
@@ -215,5 +215,5 @@ signatures, so string replacements can silently miss. Verify the anchor exists.
 
 ## See also
 
-- [status.md](../05-project/status.md) — what is unverified
-- [decisions.md](../05-project/decisions.md) — choices and reversals
+- [01-status.md](../05-project/01-status.md) — what is unverified
+- [02-decisions.md](../05-project/02-decisions.md) — choices and reversals

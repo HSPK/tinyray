@@ -81,6 +81,61 @@ class TestTheTreeIsWhole:
 
 
 # --------------------------------------------------------------------------
+# Reading order
+# --------------------------------------------------------------------------
+
+NUMBERED = re.compile(r"^(\d{2})-[a-z0-9-]+\.md$")
+
+SECTIONS = sorted(d for d in DOCS.iterdir() if d.is_dir())
+
+
+class TestReadingOrderIsReal:
+    """The numbers in the filenames are a promise about reading order.
+
+    A promise nobody checks is how this project's worst bugs started, so the
+    numbering is asserted rather than assumed: contiguous within a section,
+    and listed in the index in the same order.
+    """
+
+    def test_sections_are_numbered(self):
+        unnumbered = [d.name for d in SECTIONS if not re.match(r"^\d{2}-[a-z-]+$", d.name)]
+        assert not unnumbered, f"sections without a reading-order prefix: {unnumbered}"
+
+    @pytest.mark.parametrize("section", SECTIONS, ids=lambda d: d.name)
+    def test_pages_are_numbered(self, section: Path):
+        unnumbered = [p.name for p in section.glob("*.md") if not NUMBERED.match(p.name)]
+        assert not unnumbered, (
+            f"{section.name} contains pages with no reading-order prefix: {unnumbered}"
+        )
+
+    @pytest.mark.parametrize("section", SECTIONS, ids=lambda d: d.name)
+    def test_numbering_is_contiguous_from_one(self, section: Path):
+        numbers = sorted(int(NUMBERED.match(p.name).group(1)) for p in section.glob("*.md"))
+        assert numbers == list(range(1, len(numbers) + 1)), (
+            f"{section.name} is numbered {numbers}; reading order must run 1..n "
+            "with no gaps and no duplicates"
+        )
+
+    @pytest.mark.parametrize("section", SECTIONS, ids=lambda d: d.name)
+    def test_the_index_lists_pages_in_reading_order(self, section: Path):
+        # Only the bullet list matters. Prose above it links pages by relevance,
+        # which is a different question from what order to read them in.
+        index = read(DOCS / "README.md")
+        listed = re.findall(rf"^- \[[^\]]+\]\({re.escape(section.name)}/([^)]+)\)", index, re.M)
+        pages = sorted(p.name for p in section.glob("*.md"))
+        assert listed == pages, (
+            f"docs/README.md lists {section.name} as {listed}, which contradicts "
+            f"the numbering {pages}; the index and the filenames disagree about "
+            "reading order"
+        )
+
+    def test_the_index_explains_the_numbering(self):
+        assert "## Reading order" in read(DOCS / "README.md"), (
+            "the numbers only mean something if the index says what they mean"
+        )
+
+
+# --------------------------------------------------------------------------
 # Names a reader would type
 # --------------------------------------------------------------------------
 
@@ -287,7 +342,7 @@ class TestSignaturesMatch:
 
 
 class TestConfigurationTableIsTrue:
-    """``configuration.md`` is the page a reader tunes from. It must be right."""
+    """``04-configuration.md`` is the page a reader tunes from. It must be right."""
 
     # (page phrase, callable, parameter, expected default)
     CLAIMS: ClassVar[list[tuple[str, str, Any]]] = [
@@ -320,7 +375,7 @@ class TestConfigurationTableIsTrue:
         )
 
     def test_the_page_states_every_claimed_default(self):
-        page = read(DOCS / "03-reference" / "configuration.md")
+        page = read(DOCS / "03-reference" / "04-configuration.md")
         missing = [
             f"{function}.{parameter}"
             for function, parameter, _ in self.CLAIMS
@@ -342,7 +397,7 @@ class TestEnvironmentVariablesAreDocumented:
         return names
 
     def test_every_variable_the_code_reads_is_documented(self):
-        page = read(DOCS / "03-reference" / "cli.md")
+        page = read(DOCS / "03-reference" / "03-cli.md")
         missing = sorted(name for name in self.used_by_the_code() if name not in page)
         assert not missing, (
             f"the code reads {missing} but the reference never mentions them; an "
@@ -350,7 +405,7 @@ class TestEnvironmentVariablesAreDocumented:
         )
 
     def test_the_docs_do_not_invent_variables(self):
-        page = read(DOCS / "03-reference" / "cli.md")
+        page = read(DOCS / "03-reference" / "03-cli.md")
         documented = set(re.findall(r"TINYRAY_[A-Z_]+", page))
         invented = sorted(documented - self.used_by_the_code())
         assert not invented, f"the reference documents variables nothing reads: {invented}"
@@ -370,7 +425,7 @@ class TestGapsStayDeclared:
     """
 
     def status(self) -> str:
-        return read(DOCS / "05-project" / "status.md")
+        return read(DOCS / "05-project" / "01-status.md")
 
     def test_detached_lifetime_is_still_refused(self):
         assert "lifetime=" in self.status()
@@ -385,18 +440,18 @@ class TestGapsStayDeclared:
     def test_multi_node_is_still_declared_missing(self):
         assert "Multi-node deployment" in self.status()
         assert not (ROOT / "python" / "tinyray" / "node_agent_main.py").exists(), (
-            "a node agent entry point appeared; status.md still says multi-node is unpackaged"
+            "a node agent entry point appeared; 01-status.md still says multi-node is unpackaged"
         )
 
     def test_the_deleted_fast_path_stays_deleted(self):
         assert not (ROOT / "crates" / "tinyray-runtime" / "src" / "shm.rs").exists(), (
-            "shm.rs is back; decisions.md records it as deleted dead code"
+            "shm.rs is back; 02-decisions.md records it as deleted dead code"
         )
 
     def test_untested_hardware_claims_are_declared(self):
         status = self.status()
         for claim in ("NCCL", "SGLang", "vLLM", "Megatron"):
             assert claim in status, (
-                f"{claim} is exercised in the codebase but status.md no longer "
+                f"{claim} is exercised in the codebase but 01-status.md no longer "
                 "states that it is unverified on real hardware"
             )

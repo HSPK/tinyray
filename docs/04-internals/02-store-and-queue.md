@@ -126,7 +126,7 @@ discarding the result. Answering "are 24 of 32 rollouts done?" moved 240 MB
 through the driver to produce a list of booleans. Measured on a settled 200 MB
 result: **237 ms → 0.14 ms.**
 
-The lesson is in [testing.md](testing.md): an invariant verified at one call
+The lesson is in [05-testing.md](05-testing.md): an invariant verified at one call
 site is not an invariant.
 
 ---
@@ -168,6 +168,6 @@ watermark and TTL clean up instead.
 
 ## See also
 
-- [protocol.md](../03-reference/protocol.md) — `Fetch`, `status_only`, `DuplicateSeq`
-- [transport.md](transport.md) — how a call gets here
-- [configuration.md](../03-reference/configuration.md) — the knobs
+- [02-protocol.md](../03-reference/02-protocol.md) — `Fetch`, `status_only`, `DuplicateSeq`
+- [03-transport.md](03-transport.md) — how a call gets here
+- [04-configuration.md](../03-reference/04-configuration.md) — the knobs

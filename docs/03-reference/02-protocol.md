@@ -191,6 +191,6 @@ magic bytes. Client and server must be the same release.
 
 ## See also
 
-- [transport.md](../04-internals/transport.md) — the implementation
-- [store-and-queue.md](../04-internals/store-and-queue.md) — what happens after a call arrives
-- [api-python.md](api-python.md) — the Python side
+- [03-transport.md](../04-internals/03-transport.md) — the implementation
+- [02-store-and-queue.md](../04-internals/02-store-and-queue.md) — what happens after a call arrives
+- [01-api-python.md](01-api-python.md) — the Python side

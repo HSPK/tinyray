@@ -117,9 +117,9 @@ That process contains no tinyray code at all.
 
 | If your code is | Use |
 |---|---|
-| A server you run as a subprocess | [`launch_process`](native-frameworks.md#supervising-a-server) |
-| A training script you can edit | [`serve`](native-frameworks.md#attaching-to-a-training-script) |
-| Written for tinyray from the start | [`@remote`](actors.md) |
+| A server you run as a subprocess | [`launch_process`](02-native-frameworks.md#supervising-a-server) |
+| A training script you can edit | [`serve`](02-native-frameworks.md#attaching-to-a-training-script) |
+| Written for tinyray from the start | [`@remote`](03-actors.md) |
 
 When in doubt, choose the first row that applies. Later rows are more invasive.
 
@@ -150,6 +150,6 @@ machine host many actors. It does not make them cheaper.
 
 ## See also
 
-- [native-frameworks.md](native-frameworks.md) — the main line
-- [actors.md](actors.md) — the actor API in full
-- [placement.md](placement.md) — resources and gangs
+- [02-native-frameworks.md](02-native-frameworks.md) — the main line
+- [03-actors.md](03-actors.md) — the actor API in full
+- [04-placement.md](04-placement.md) — resources and gangs
