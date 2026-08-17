@@ -47,6 +47,18 @@ from .api import (
     wait,
 )
 from .attach import RemoteWorker, connect, launch_workers
+from .cluster import (
+    Cluster,
+    GroupView,
+    Membership,
+    RegistryClient,
+    RegistryUnavailable,
+    attach,
+    join,
+    serve_registry,
+)
+from .cluster import group as group
+from .cluster import membership as membership
 from .collective import CollectiveError, CollectiveGroup, GroupRebuilding
 from .head import Head, PlacementFailed
 from .launcher import ActorStartupError
@@ -60,6 +72,7 @@ from .process import (
     ProcessAlive,
     ProcessStartupError,
 )
+from .registry import Registry
 from .serve import Server, serve
 from .worker_group import WorkerGroup, create_worker_group, torchrun_env
 
@@ -72,18 +85,21 @@ __all__ = [
     "ActorPool",
     "ActorStartupError",
     "Backpressure",
+    "Cluster",
     "CollectiveError",
     "CollectiveGroup",
     "Decoder",
     # Low level
     "Frame",
     "GroupRebuilding",
+    "GroupView",
     "Head",
     "HttpOk",
     "Id",
     "Limits",
     "LogMatch",
     "ManagedProcess",
+    "Membership",
     "MessageTooLarge",
     "NotFound",
     "NotLinked",
@@ -95,6 +111,9 @@ __all__ = [
     "ProcessAlive",
     "ProcessStartupError",
     "ProtocolError",
+    "Registry",
+    "RegistryClient",
+    "RegistryUnavailable",
     "RemoteCallError",
     "RemoteClass",
     "RemoteWorker",
@@ -104,6 +123,7 @@ __all__ = [
     "UserCodeError",
     "WorkerGroup",
     "actors",
+    "attach",
     "collective",
     "connect",
     "create_actors",
@@ -112,13 +132,16 @@ __all__ = [
     "encode_message",
     "get",
     "get_actor",
+    "group",
     "group_size",
     # API
     "init",
+    "join",
     "kill",
     "launch_process",
     "launch_workers",
     "link",
+    "membership",
     "my_group",
     "my_rank",
     "new_id",
@@ -131,6 +154,7 @@ __all__ = [
     "roster",
     "serde",
     "serve",
+    "serve_registry",
     "shutdown",
     "stop_process",
     "torchrun_env",

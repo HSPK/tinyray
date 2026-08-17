@@ -1,109 +1,131 @@
-# tinyray documentation
+# tinyray
 
-tinyray is an HTTP control plane for ML experiments. It places processes,
-assigns ranks, watches them and restarts them. It does not move your tensors.
+> Proposal; not the current implementation. tinyray is the generic control-plane
+> fabric for clusters it does not own: identity, membership, reconciliation and
+> discovery. It allocates nothing, launches nothing, and never touches a tensor.
+
+| Attribute | Value |
+|---|---|
+| Status | Proposal. Supersedes all prior tinyray design |
+| Target scale | 10,000+ GPU, a single experiment or a shared cluster |
+| Position | L2 in the [layering](02-architecture/01-layering.md) — between the scheduler and the application |
+| Written against | [rl-bridge cell runtime proposal](../../rl-bridge/docs/08-proposals/02-cell-based-high-availability-runtime.md) |
+| Language | English body text; identifiers keep their source spelling |
+
+## Why this document exists
+
+The previous tinyray design was wrong in a way that could not be patched. It
+assumed tinyray starts the processes, assigns the GPUs and sits at the centre of
+every message. All three collapse above a few hundred workers, and the
+measurements are in [01-overview/01-problem.md](01-overview/01-problem.md).
+
+The redesign moves tinyray to the one layer nobody supplies: the mechanics that
+every large control plane re-implements by hand — logical slots with
+generations, leases that expire, desired state that converges, discovery that
+does not grow with the cluster.
 
 ## Reading order
 
-Pages are numbered. The numbers are the order to read them in, both across
-sections and within one.
+Directories and files are numbered. The numbers are the reading order, and no
+document depends on a later one.
 
-Sections build on each other: concepts explain the shape, guides use it,
-reference pins it down, internals open it up, project says what is missing. A
-page never depends on a later one.
+**Start here:** [01-overview](01-overview/) then
+[02-architecture](02-architecture/). That is the proposal proper, and about
+thirty minutes.
 
-**Straight through** — sections 01 and 02, in order, is the intended first pass.
-About an hour, and it covers everything most people need.
+**If you are evaluating the boundary**, read
+[01-overview/02-positioning.md](01-overview/02-positioning.md) and
+[02-architecture/01-layering.md](02-architecture/01-layering.md) alone. They
+contain the whole argument about what tinyray owns.
 
-**If you are in a hurry**, the shortest useful path is three pages:
-[01-positioning](01-concepts/01-positioning.md) →
-[01-getting-started](02-guides/01-getting-started.md) →
-[02-native-frameworks](02-guides/02-native-frameworks.md).
+**If you are implementing**, [03-modules](03-modules/) is the specification and
+[04-protocols](04-protocols/) is the wire contract.
 
-Sections 03 to 05 are lookup, not narrative. Read them when you need them.
+## Authoritative locations
 
-## Where to start
+One fact is defined completely in one place. Everything else links to it.
 
-**You want to run Megatron, SGLang, vLLM or torchrun under a controller.**
-Read [positioning](01-concepts/01-positioning.md) for the stance, then
-[native frameworks](02-guides/02-native-frameworks.md) for the code. That is the
-main line and everything else is optional.
-
-**You are writing new code and want actors.** Start with
-[getting started](02-guides/01-getting-started.md), then [actors](02-guides/03-actors.md).
-
-**Something is stuck and you need to know why.** Go to
-[observability](02-guides/06-observability.md).
-
-**You are changing tinyray itself.** Read [architecture](01-concepts/02-architecture.md)
-and then the relevant page under [internals](04-internals/).
-
-## Layout
-
-| Section | Contents |
+| Information | Location |
 |---|---|
-| [01-concepts](01-concepts/) | Why tinyray is shaped this way. Read once. |
-| [02-guides](02-guides/) | How to do a particular thing. |
-| [03-reference](03-reference/) | Exact signatures, protocol and configuration. |
-| [04-internals](04-internals/) | How it works inside, for people changing it. |
-| [05-project](05-project/) | What is built, what is not, and what was decided. |
+| Why the design is what it is | [02-architecture](02-architecture/) |
+| A module's responsibility and internal state | [03-modules](03-modules/) |
+| Cross-process message order and schema | [04-protocols](04-protocols/) |
+| Running and debugging | [05-operations](05-operations/) |
+| Test evidence | [06-testing](06-testing/) |
+| Exhaustive lists: API, config, metrics | [07-reference](07-reference/) |
+| What is built, decided, and planned | [08-project](08-project/) |
 
-### Concepts
+## Contents
 
-- [01-positioning.md](01-concepts/01-positioning.md) — control plane versus framework, and the six design principles
-- [02-architecture.md](01-concepts/02-architecture.md) — components, process model, control and data planes
-- [03-tradeoffs.md](01-concepts/03-tradeoffs.md) — every major choice and what it costs
+### 00 Conventions
 
-### Guides
+- [00-conventions.md](00-conventions.md) — document structure and writing rules
 
-- [01-getting-started.md](02-guides/01-getting-started.md) — install and run something
-- [02-native-frameworks.md](02-guides/02-native-frameworks.md) — Megatron, SGLang, vLLM, torchrun
-- [03-actors.md](02-guides/03-actors.md) — the actor API, for code written for tinyray
-- [04-placement.md](02-guides/04-placement.md) — resources, gangs, placement strategies
-- [05-fault-tolerance.md](02-guides/05-fault-tolerance.md) — restarts, readiness, failure semantics
-- [06-observability.md](02-guides/06-observability.md) — finding out what is stuck
-- [07-mesh.md](02-guides/07-mesh.md) — workers talking to each other, without the driver
-- [08-examples.md](02-guides/08-examples.md) — three runnable stacks, end to end
+### 01 Overview
 
-### Reference
+- [01-problem.md](01-overview/01-problem.md) — what broke, with measurements
+- [02-positioning.md](01-overview/02-positioning.md) — tinyray is L2, and why that is the valuable layer
+- [03-principles.md](01-overview/03-principles.md) — seven principles, each traced to a failure
 
-- [01-api-python.md](03-reference/01-api-python.md) — the main-line API
-- [02-protocol.md](03-reference/02-protocol.md) — wire format, endpoints, error taxonomy
-- [03-cli.md](03-reference/03-cli.md) — the `tinyray` command
-- [04-configuration.md](03-reference/04-configuration.md) — every knob and its default
+### 02 Architecture
 
-### Internals
+- [01-layering.md](02-architecture/01-layering.md) — L0 to L4, and the ownership boundary
+- [02-topology.md](02-architecture/02-topology.md) — worker, cell, global
+- [03-state-model.md](02-architecture/03-state-model.md) — what needs consensus and what does not
+- [04-planes.md](02-architecture/04-planes.md) — control plane, data plane, and the rule between them
 
-- [01-rust-core.md](04-internals/01-rust-core.md) — crates, the GIL discipline, the language boundary
-- [02-store-and-queue.md](04-internals/02-store-and-queue.md) — results, ordering, backpressure
-- [03-transport.md](04-internals/03-transport.md) — framing, pooling, zero copy
-- [04-scheduler.md](04-internals/04-scheduler.md) — the resource table and placement
-- [05-testing.md](04-internals/05-testing.md) — the testing standard and why it exists
+### 03 Modules
 
-### Project
+- [01-identity.md](03-modules/01-identity.md) — slots, incarnations, fencing
+- [02-membership.md](03-modules/02-membership.md) — hierarchical leases
+- [03-reconciliation.md](03-modules/03-reconciliation.md) — desired and observed state
+- [04-readiness.md](03-modules/04-readiness.md) — composable readiness
+- [05-discovery.md](03-modules/05-discovery.md) — scoped lookup
+- [06-admission.md](03-modules/06-admission.md) — backpressure primitives
+- [07-transport.md](03-modules/07-transport.md) — the Rust core and the GIL boundary
+- [08-supervision.md](03-modules/08-supervision.md) — node-local process supervision
 
-- [01-status.md](05-project/01-status.md) — an honest inventory of what works
-- [02-decisions.md](05-project/02-decisions.md) — decisions, including the reversed ones
-- [03-roadmap.md](05-project/03-roadmap.md) — known gaps, in priority order
+### 04 Protocols
 
-## Conventions
+- [01-wire-format.md](04-protocols/01-wire-format.md) — framing
+- [02-membership-protocol.md](04-protocols/02-membership-protocol.md) — register, heartbeat, expire
+- [03-control-rpc.md](04-protocols/03-control-rpc.md) — calls, results, errors
 
-**Numbering.** `NN-name.md` inside `NN-section/`. The number is reading order,
-and it is stable — a page inserted later takes the next number rather than
-renumbering its neighbours.
+### 05 Operations
 
-**Page shape.** Every page opens with **Purpose** and closes with **Pitfalls**
-and **See also**. Pitfalls is not filler: it records mistakes actually made
-here, and is usually the most useful part of the page.
+- [01-deployment.md](05-operations/01-deployment.md) — deployment shapes
+- [02-failure-model.md](05-operations/02-failure-model.md) — failure and recovery matrix
+- [03-observability.md](05-operations/03-observability.md) — metrics and diagnosis
 
-**Checked, not trusted.** `tests/test_docs.py` extracts the signatures,
-defaults, symbol names, exception names, environment variables and links from
-these pages and asserts them against the installed package. A page that drifts
-from the code fails the build.
+### 06 Testing
 
-It does **not** execute the examples — most of them launch processes or want a
-GPU. What is guaranteed is that every name, argument and default you could copy
-is real; not that a snippet runs unmodified in your environment.
+- [01-standard.md](06-testing/01-standard.md) — the testing standard and its origin
+- [02-fake-cluster.md](06-testing/02-fake-cluster.md) — 10,000 to 100,000 simulated workers
+- [03-chaos.md](06-testing/03-chaos.md) — fault injection matrix
 
-**Numbers are measured**, not estimated, and the measurement is named where it
-matters.
+### 07 Reference
+
+- [01-api.md](07-reference/01-api.md) — the Python API
+- [02-configuration.md](07-reference/02-configuration.md) — every knob and default
+
+### 08 Project
+
+- [01-status.md](08-project/01-status.md) — what exists, what is proposed
+- [02-decisions.md](08-project/02-decisions.md) — decisions and reversals
+- [03-roadmap.md](08-project/03-roadmap.md) — implementation phases
+
+## Summary of the proposal
+
+**tinyray owns**: logical identity with generations and fencing; hierarchical
+lease membership; desired/observed reconciliation; composable readiness; scoped
+discovery; admission and backpressure primitives; the control RPC transport;
+node-local process supervision.
+
+**tinyray does not own**: GPU or CPU allocation; job launching; any tensor;
+consensus storage; and every domain concept — tasks, samples, model versions,
+checkpoints belong to the application.
+
+**The load-bearing claim**: a control plane at 10,000 workers fails from
+quadratic relationships and hand-written liveness, not from slow code. Removing
+both is a small, generic, testable library — and one that can be validated with
+100,000 fake workers before a single GPU is booked.
