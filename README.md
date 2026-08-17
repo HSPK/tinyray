@@ -30,6 +30,21 @@ still running, and their outputs still occupy the producers' stores until the
 watermark or TTL reclaims them. And if the group runs NCCL collectives, those
 same eight actors must still attend the next barrier -- see `tinyray.collective`.
 
+## Documentation
+
+Full documentation is in [`docs/`](docs/).
+
+| Section | For |
+|---|---|
+| [Concepts](docs/01-concepts/) | What tinyray is, and why it stops where it does |
+| [Guides](docs/02-guides/) | Getting started, native frameworks, actors, placement, fault tolerance, observability |
+| [Reference](docs/03-reference/) | Python API, protocol, CLI, every configuration default |
+| [Internals](docs/04-internals/) | Rust core, store and queue, transport, scheduler, testing |
+| [Project](docs/05-project/) | Honest status, decisions and reversals, roadmap |
+
+New here? Start with [getting started](docs/02-guides/getting-started.md), then
+[native frameworks](docs/02-guides/native-frameworks.md).
+
 ## What it is, and is not
 
 **tinyray is an HTTP control plane. The data plane belongs to the framework.**
@@ -222,7 +237,8 @@ distributed ML debugging.
 
 ```
 crates/tinyray-core/      wire protocol, framing, identifiers
-crates/tinyray-runtime/   store, ordered queue, transport, cluster, collective, shm
+crates/tinyray-runtime/   store, ordered queue, transport, cluster, collective
 crates/tinyray-py/        PyO3 bindings (all unsafe lives in buffers.rs)
 python/tinyray/           API, serde, launcher, head, collective, pool, CLI
+docs/                     concepts, guides, reference, internals, project status
 ```
