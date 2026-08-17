@@ -103,8 +103,17 @@ Nothing is pickled to the worker, no class is shipped over the wire, and
 `__main__` stays yours. `tinyray.connect(endpoint)` will even drive a process
 that something else started.
 
-`examples/native_stack.py` runs a four-rank trainer and an inference server end
-to end; it uses gloo and a toy server so it works without a GPU.
+Three runnable stacks live in [`examples/`](examples/), all on CPU with gloo so
+they work without a GPU:
+
+| Example | What it shows |
+|---|---|
+| `native_stack.py` | A four-rank trainer and an inference server, end to end |
+| `dataloader_to_trainer.py` | The classic pipeline: prefetch, references not values, ~150 MB loader → trainer against ~90 KB through the driver |
+| `rl_control_plane.py` | Actor-learner RL: stragglers dropped without being abandoned, weights swapped without touching tinyray |
+
+They are executed by the test suite, which parses their output and asserts the
+numbers they print. See [the guide](docs/02-guides/07-examples.md).
 
 ### The actor API
 

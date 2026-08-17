@@ -10,7 +10,7 @@ failed to catch real bugs, encoded so they cannot fail the same way again.
 | Layer | Count | Where |
 |---|---|---|
 | Rust unit tests | 117 | inline `#[cfg(test)]` |
-| Python tests | 415 | `tests/` |
+| Python tests | 433 | `tests/` |
 | Mutants | 21 | `scripts/mutate.py` |
 | Benchmarks | — | `benchmarks/` |
 
@@ -98,7 +98,7 @@ properties of the test suite itself, not of the runtime.
 Prose has no compiler, so `docs/` is the largest place where something can be
 claimed and never checked. Same failure shape, larger surface.
 
-`tests/test_docs.py` (129 tests) closes it. Extracted from the pages and
+`tests/test_docs.py` (131 tests) closes it. Extracted from the pages and
 asserted against the installed package:
 
 - every signature block matches `inspect.signature` — parameter names, order
@@ -179,6 +179,34 @@ it a knob and turn it down.
 
 These are regression guards. The first pair is the justification for the entire
 Rust core; if it stopped holding, the design would need revisiting.
+
+## Examples are claims too
+
+`examples/` was linted and never executed — the same shape as blind spot 2, one
+directory over. Three complete programs, checked for style, never once run.
+
+`tests/test_examples.py` runs all three and parses their own output. The
+assertions are loose on magnitude and strict on direction, because the exact
+ratio depends on the machine but "the driver moved three orders of magnitude
+less than the workers did" must not silently become false:
+
+- the driver's share of the data stays negligible
+- prefetching overlaps, and does not exceed its theoretical ceiling
+- `wait(num_returns=6)` returns exactly six
+- the workers that straggle are the slow ones, so `wait` really is ordering by
+  completion
+- the policy version advances every iteration, and reward follows it
+- no generated scratch file survives
+
+It cost 15 seconds of suite time and immediately earned it. The RL example was
+written with a `run_on` call on a method containing `dist.barrier()` — rank 0
+entered the barrier and waited forever for a rank nobody had asked. It hung with
+no error, no traceback and no failing unit test, because every component was
+individually correct.
+
+That is design principle 5, violated by the person who had just written design
+principle 5. Encoding a rule does not make you immune to it; running the thing
+does.
 
 ## Gate
 

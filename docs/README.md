@@ -62,6 +62,7 @@ and then the relevant page under [internals](04-internals/).
 - [04-placement.md](02-guides/04-placement.md) — resources, gangs, placement strategies
 - [05-fault-tolerance.md](02-guides/05-fault-tolerance.md) — restarts, readiness, failure semantics
 - [06-observability.md](02-guides/06-observability.md) — finding out what is stuck
+- [07-examples.md](02-guides/07-examples.md) — three runnable stacks, end to end
 
 ### Reference
 
