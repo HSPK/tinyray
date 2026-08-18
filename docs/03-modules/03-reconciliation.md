@@ -1,210 +1,199 @@
 # Reconciliation
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> The controller publishes what it wants; workers report what is. A loop closes
-> the gap. Nothing depends on a command having arrived.
+> 控制器发布它想要的，worker 上报实际的，一个循环消除差距。没有任何东西依赖某条命令是否
+> 送达。
 
-## 1. Scope
+## 1. 范围
 
-The desired/observed convergence loop, leadership acquisition, and epoch
-fencing. Proposed source: `python/tinyray/reconcile.py`.
+desired/observed 收敛循环、leadership 获取，以及 epoch fencing。计划源码：
+`python/tinyray/reconcile.py`。
 
-## 2. Responsibilities
+## 2. 职责
 
-- Publish desired state under a fencing token held by the current leader.
-- Collect observed state from the tier below.
-- Run a convergence function, repeatedly and idempotently.
-- Freeze healthy membership into an epoch when an operation needs a fixed set.
-- Acquire and renew leadership through a consensus adapter.
+- 由当前 leader 持有 fencing token 发布 desired state。
+- 从下层收集 observed state。
+- 反复且幂等地运行收敛函数。
+- 当某操作需要固定成员集时，把健康 membership 冻结成一个 epoch。
+- 经共识适配层获取并续约 leadership。
 
-## 3. Non-responsibilities
+## 3. 非职责
 
-| Not done here | Owner |
+| 不在此处做 | 归属 |
 |---|---|
-| The schema of desired or observed state | Application (L3) |
-| What convergence means | Application (L3) |
-| Implementing consensus | etcd or equivalent |
-| Deciding membership | [02-membership](02-membership.md) |
-| Executing the work | Application |
+| desired 或 observed state 的 schema | 应用（L3） |
+| 收敛意味着什么 | 应用（L3） |
+| 实现共识 | etcd 或等价物 |
+| 判定 membership | [02-membership](02-membership.md) |
+| 执行实际工作 | 应用 |
 
-tinyray provides the loop. The application provides both states and the function
-between them.
+tinyray 提供循环，应用提供两端状态以及中间那个函数。
 
-## 4. Position in the system
+## 4. 系统位置
 
-Sits above membership and below the application controller. Every tier that
-directs a tier below it runs a reconciler.
+位于 membership 之上、应用控制器之下。每个指挥下层的层都运行一个 Reconciler。
 
-## 5. Dependencies
+## 5. 依赖
 
-- [01-identity](01-identity.md) for fencing tokens.
-- [02-membership](02-membership.md) for observed state.
-- A consensus store for leadership and desired state.
+- [01-identity](01-identity.md) 提供 fencing token。
+- [02-membership](02-membership.md) 提供 observed state。
+- 一个共识存储，用于 leadership 和 desired state。
 
-## 6. Public contract
+## 6. 公共契约
 
 | Interface | Input | Output | Side effect | Blocking | Failure |
 |---|---|---|---|---|---|
-| `Reconciler(desired_key, observed_source, fn, interval)` | Keys and a function | Reconciler | None | No | `ValueError` |
-| `Reconciler.start()` | — | — | Runs the loop on a thread | No | None |
-| `Reconciler.publish(state)` | Desired state | Version | Writes to consensus | Yes | `NotLeader`, `ConsensusUnavailable` |
-| `Reconciler.epoch(min_ready)` | Minimum members | `Epoch` | Freezes membership | No | `InsufficientCapacity` |
-| `leadership(name)` | Name | Context manager | Acquires and renews | Yes on entry | `ConsensusUnavailable` |
+| `Reconciler(desired_key, observed_source, fn, interval)` | 键与函数 | Reconciler | 无 | 否 | `ValueError` |
+| `Reconciler.start()` | —— | —— | 在线程上运行循环 | 否 | 无 |
+| `Reconciler.publish(state)` | desired state | 版本号 | 写入共识 | 是 | `NotLeader`、`ConsensusUnavailable` |
+| `Reconciler.epoch(min_ready)` | 最小成员数 | `Epoch` | 冻结 membership | 否 | `InsufficientCapacity` |
+| `leadership(name)` | 名称 | 上下文管理器 | 获取并续约 | 进入时阻塞 | `ConsensusUnavailable` |
 
 ```python
 @tinyray.reconciler(desired="rollout/desired", observed=cell.summary, interval=2.0)
 def converge(desired, observed):
-    ...  # entirely the application's
+    ...  # 完全属于应用
 ```
 
-## 7. State ownership
+## 7. 状态所有权
 
 | State | Owner | Created | Updated by | Read by | Lifetime | Persisted |
 |---|---|---|---|---|---|---|
-| Desired state | Application, via leader | Publish | Leader only | Lower tiers | Experiment | Yes |
-| Control epoch | Leader | Election | Each election | All writers | Experiment | Yes |
-| Membership epoch | Reconciler | `epoch()` | Each freeze | Participants | One operation | No |
-| Observed state | Lower tier | Continuously | Its owner | Reconciler | One interval | No |
-| Leadership lease | Consensus | Election | Renewal | All tiers | Until lost | Yes |
+| desired state | 应用，经 leader | 发布时 | 仅 leader | 下层 | 实验期 | 是 |
+| control epoch | leader | 选举时 | 每次选举 | 所有写入者 | 实验期 | 是 |
+| membership epoch | Reconciler | `epoch()` 时 | 每次冻结 | 参与者 | 一次操作 | 否 |
+| observed state | 下层 | 持续 | 其 owner | Reconciler | 一个周期 | 否 |
+| leadership lease | 共识 | 选举时 | 续约 | 所有层 | 直到失去 | 是 |
 
-## 8. Lifecycle
+## 8. 生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Follower
-    Follower --> Leader : acquired
-    Leader --> Reconciling : interval
-    Reconciling --> Leader : converged
-    Leader --> Follower : lease lost
+    Follower --> Leader : 获取成功
+    Leader --> Reconciling : 到周期
+    Reconciling --> Leader : 已收敛
+    Leader --> Follower : 失去 lease
     Follower --> [*]
 ```
 
-A follower runs no convergence and publishes nothing. It reads desired state and
-serves lookups, so a leader election does not stop reads.
+follower 不运行收敛也不发布。它读取 desired state 并服务 lookup，因此一次 leader 选举
+不会停止读取。
 
-## 9. Main flow
+## 9. 主流程
 
 ```mermaid
 sequenceDiagram
-    participant A as Application
-    participant L as Leader reconciler
-    participant KV as Consensus
-    participant C as Lower tier
+    participant A as 应用
+    participant L as leader Reconciler
+    participant KV as 共识
+    participant C as 下层
 
     A->>L: publish(desired)
-    L->>KV: write, fenced by control_epoch
-    loop interval
+    L->>KV: 写入，由 control_epoch fencing
+    loop 每个周期
         C-->>L: observed
         L->>L: fn(desired, observed) -> actions
-        L->>C: actions, fenced
+        L->>C: actions，带 fencing
     end
-    Note over L: lease lost
-    L->>L: become follower, stop acting
+    Note over L: 失去 lease
+    L->>L: 转为 follower，停止动作
 ```
 
-The diagram cannot show: actions are idempotent, so a lost action is repeated
-next interval; a stale leader's write is rejected by `control_epoch`; and the
-lower tier keeps working while no leader exists.
+图中无法表达：action 是幂等的，因此丢失的 action 会在下个周期重发；过期 leader 的写入被
+`control_epoch` 拒绝；没有 leader 期间下层继续工作。
 
-## 10. Concurrency and distributed semantics
+## 10. 并发与分布式语义
 
-**Convergence is idempotent and repeated.** Nothing depends on a command
-arriving. A dropped action is reissued next interval, which removes the need for
-delivery guarantees on the control path.
+**收敛是幂等且反复执行的。** 没有任何东西依赖命令送达。丢掉的 action 下个周期重发，这就
+免去了控制路径上的投递保证需求。
 
-**Only the leader acts.** Followers observe. Every mutation carries
-`control_epoch`, and a recovered old leader finds its epoch stale.
+**只有 leader 动作。** follower 只观察。每次变更都携带 `control_epoch`，恢复的旧 leader
+会发现自己的 epoch 已过期。
 
-**Epochs make "all members" safe.** Where an operation genuinely needs every
-participant — building a collective communicator, for instance — the reconciler
-freezes healthy membership into an epoch. The operation requires all members *of
-that epoch*, not all members ever configured. A member that returns joins the
-next epoch.
+**epoch 使“全体成员”变得安全。** 当某操作确实需要每个参与者时 —— 例如建立 collective
+communicator —— Reconciler 把健康 membership 冻结成一个 epoch。该操作要求**该 epoch 内**
+的全部成员，而不是配置中曾经出现过的全部成员。返回的成员加入下一个 epoch。
 
-This is how [P5](../01-overview/03-principles.md) coexists with collectives:
-P5 governs membership, not the collective.
+这就是 [P5](../01-overview/03-principles.md) 与 collective 共存的方式：P5 管 membership，
+不管 collective。
 
-**Leader failover has a window** of one lease TTL, typically 10 to 15 seconds.
-The design requires that no decision be needed at sub-lease latency; if the
-per-iteration loop needs the leader, the layering is wrong.
+**leader 切换有一个窗口**，等于一个 lease TTL，通常 10 到 15 秒。设计要求没有任何决策
+需要亚 lease 级延迟；如果每轮迭代的循环需要 leader，说明分层错了。
 
-## 11. Correctness invariants
+## 11. 正确性不变量
 
-- Convergence functions are idempotent.
-- Only the current leader mutates desired state.
-- Every mutation carries the control epoch; receivers reject stale epochs.
-- Observed state is never written by the tier that reads it.
-- An epoch's membership is fixed at freeze time and never grows.
-- No global operation waits for a member outside the current epoch.
-- Losing leadership stops action within one interval.
+- 收敛函数是幂等的。
+- 只有当前 leader 变更 desired state。
+- 每次变更携带 control epoch；接收端拒绝过期 epoch。
+- observed state 绝不由读取它的那一层写入。
+- epoch 的成员集在冻结时固定，绝不增长。
+- 没有全局操作等待当前 epoch 之外的成员。
+- 失去 leadership 后在一个周期内停止动作。
 
-## 12. Failure handling
+## 12. 故障处理
 
-| Failure | Detected by | Response |
+| 故障 | 检测方 | 响应 |
 |---|---|---|
-| Leader dies | Consensus lease | New leader elected; epoch incremented |
-| Leader partitioned | Its own renewal failure | Steps down before its lease expires elsewhere |
-| Old leader returns | Epoch check | Writes rejected; becomes follower |
-| Consensus unavailable | Client | No publishing, no election; lower tiers continue |
-| Convergence function raises | Loop | Logged, retried next interval; never kills the loop |
-| Observed state unavailable | Loop | Skips this interval; does not act on partial data |
+| leader 死亡 | 共识 lease | 选出新 leader；epoch 递增 |
+| leader 被分区 | 自身续约失败 | 在其 lease 于别处过期之前主动下台 |
+| 旧 leader 返回 | epoch 校验 | 写入被拒；转为 follower |
+| 共识不可用 | 客户端 | 不发布、不选举；下层继续 |
+| 收敛函数抛出 | 循环 | 记录日志，下周期重试；绝不杀死循环 |
+| observed state 不可用 | 循环 | 跳过本周期；不基于不完整数据动作 |
 
-The last row is deliberate: acting on incomplete observation is how a controller
-scales a healthy cluster to zero.
+最后一行是有意的：基于不完整观察动作，正是控制器把一个健康集群缩容到零的方式。
 
-## 13. Configuration
+## 13. 配置
 
 | Field | Type | Default | Validation | Reader | Effect |
 |---|---|---|---|---|---|
-| `interval` | seconds | 2.0 | > 0 | Reconciler | Convergence rate |
-| `leader_ttl` | seconds | 15 | > 3 x renew | Consensus adapter | Failover window |
-| `leader_renew` | seconds | `ttl / 3` | > 0 | Leader | Renewal rate |
-| `min_ready_fraction` | ratio | 0.9 | 0..1 | `epoch()` | Refuses to freeze below this |
-| `consensus` | addresses | env `TINYRAY_CONSENSUS` | Non-empty when used | Adapter | Store location |
+| `interval` | 秒 | 2.0 | > 0 | Reconciler | 收敛频率 |
+| `leader_ttl` | 秒 | 15 | > 3 × renew | 共识适配层 | 切换窗口 |
+| `leader_renew` | 秒 | `ttl / 3` | > 0 | leader | 续约频率 |
+| `min_ready_fraction` | 比例 | 0.9 | 0..1 | `epoch()` | 低于此值拒绝冻结 |
+| `consensus` | 地址 | 环境变量 `TINYRAY_CONSENSUS` | 使用时非空 | 适配层 | 存储位置 |
 
-## 14. Observability
+## 14. 可观测性
 
 | Metric | Producer | Meaning |
 |---|---|---|
-| `reconcile_iterations_total` | Reconciler | Loop progress |
-| `reconcile_errors_total` | Reconciler | Convergence function failures |
-| `reconcile_skipped_total` | Reconciler | Intervals with incomplete observation |
-| `leader_changes_total` | Adapter | Election churn |
-| `leader_is_current` | Adapter | 1 on the leader |
-| `epoch_current` | Reconciler | Membership epoch |
-| `epoch_freeze_failures_total` | Reconciler | Below `min_ready_fraction` |
+| `reconcile_iterations_total` | Reconciler | 循环进度 |
+| `reconcile_errors_total` | Reconciler | 收敛函数失败次数 |
+| `reconcile_skipped_total` | Reconciler | 因观察不完整跳过的周期 |
+| `leader_changes_total` | 适配层 | 选举抖动 |
+| `leader_is_current` | 适配层 | leader 上为 1 |
+| `epoch_current` | Reconciler | membership epoch |
+| `epoch_freeze_failures_total` | Reconciler | 低于 `min_ready_fraction` |
 
-## 15. Testing
+## 15. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| Convergence is idempotent | `tests/test_reconcile.py` | `test_repeated_convergence_is_stable` | Unit |
-| A follower does not act | `tests/test_reconcile.py` | `test_follower_is_passive` | Unit |
-| A stale leader's write is rejected | `tests/test_reconcile.py` | `test_stale_epoch_rejected` | Unit |
-| Incomplete observation skips the interval | `tests/test_reconcile.py` | `test_partial_observation_skipped` | Unit |
-| An epoch excludes members that join later | `tests/test_reconcile.py` | `test_epoch_membership_is_frozen` | Unit |
-| A raising function does not kill the loop | `tests/test_reconcile.py` | `test_loop_survives_exceptions` | Unit |
-| Leader failover leaves lower tiers running | `tests/test_chaos.py` | `test_leader_failover` | Chaos |
-| Old leader returning is fenced | `tests/test_chaos.py` | `test_old_leader_returns` | Chaos |
+| 收敛是幂等的 | `tests/test_reconcile.py` | `test_repeated_convergence_is_stable` | Unit |
+| follower 不动作 | `tests/test_reconcile.py` | `test_follower_is_passive` | Unit |
+| 过期 leader 的写入被拒 | `tests/test_reconcile.py` | `test_stale_epoch_rejected` | Unit |
+| 观察不完整时跳过周期 | `tests/test_reconcile.py` | `test_partial_observation_skipped` | Unit |
+| epoch 排除后加入的成员 | `tests/test_reconcile.py` | `test_epoch_membership_is_frozen` | Unit |
+| 抛异常的函数不杀死循环 | `tests/test_reconcile.py` | `test_loop_survives_exceptions` | Unit |
+| leader 切换时下层继续运行 | `tests/test_chaos.py` | `test_leader_failover` | Chaos |
+| 返回的旧 leader 被 fence | `tests/test_chaos.py` | `test_old_leader_returns` | Chaos |
 
-The last case must run with the old leader **still alive and still trying**.
+最后一条必须在旧 leader **仍然存活且仍在尝试写入**的条件下运行。
 
-## 16. Limitations and trade-offs
+## 16. 限制与取舍
 
-- **Convergence is polled, not pushed.** Latency is bounded by `interval`. A
-  watch would be faster; it is on the [roadmap](../08-project/03-roadmap.md).
-- **Leader failover freezes decisions** for up to `leader_ttl`. Acceptable only
-  because the per-iteration loop does not require the leader — a constraint the
-  application must honour and tinyray cannot enforce.
-- **The convergence function is unbounded application code.** A slow one delays
-  the loop. tinyray times it and reports; it does not interrupt it.
-- **Consensus is a hard dependency for leadership.** A deployment without one is
-  single-leader by configuration, with no protection against two.
+- **收敛是轮询而非推送。** 延迟由 `interval` 限定。watch 更快，在
+  [roadmap](../08-project/03-roadmap.md) 上。
+- **leader 切换会冻结决策**最多 `leader_ttl`。这只有在每轮迭代循环不需要 leader 时才可
+  接受 —— 这是应用必须遵守而 tinyray 无法强制的约束。
+- **收敛函数是无界的应用代码。** 慢函数会拖慢循环。tinyray 计时并上报，但不中断它。
+- **leadership 硬依赖共识。** 没有共识存储的部署靠配置指定单 leader，无法防止出现两个。
 
-## 17. Source mapping
+## 17. 源码映射
 
-Proposed: `python/tinyray/reconcile.py`, `python/tinyray/consensus.py`.
+计划：`python/tinyray/reconcile.py`、`python/tinyray/consensus.py`。
 
-Related: [02-architecture/03-state-model.md](../02-architecture/03-state-model.md)
-for what belongs in consensus.
+相关：[02-architecture/03-state-model.md](../02-architecture/03-state-model.md)
+说明什么该放进共识。

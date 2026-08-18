@@ -81,6 +81,10 @@ ignore = [
 "benchmarks/**" = ["E501"]
 # The mutation script embeds source snippets that must match byte for byte.
 "scripts/mutate.py" = ["E501"]
+# The docs are written in Chinese, so this test matches Chinese punctuation on
+# purpose. RUF001-003 flag full-width characters as likely typos, which they are
+# not here.
+"tests/test_docs.py" = ["E501", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["tinyray"]

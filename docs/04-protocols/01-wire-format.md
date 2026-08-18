@@ -1,68 +1,63 @@
-# Wire format
+# Wire Format
 
-## 1. Purpose
+## 1. 目的
 
-Frame control messages so that a small header and any number of out-of-band
-byte ranges travel together without being copied through a serialiser, and so
-that a corrupt message cannot desynchronise the stream.
+对控制消息做 framing，使一个小 header 和任意数量的带外字节区一起传输而不经序列化器复制，
+并使一条损坏的消息无法让字节流失去同步。
 
-## 2. Participants
+## 2. 参与者
 
-Any two tinyray processes. The format is symmetric.
+任意两个 tinyray 进程。格式是对称的。
 
-## 3. Preconditions
+## 3. 前置条件
 
-- A TCP connection with `TCP_NODELAY` set.
-- Client and server built from the same release. The format is not versioned
-  beyond its magic bytes.
+- 一条设置了 `TCP_NODELAY` 的 TCP 连接。
+- 客户端与服务端由同一发布版本构建。除魔数外该格式没有版本协商。
 
-## 4. Data model
+## 4. 数据模型
 
 ```
-offset 0        magic         b"TRY1"          4 bytes
-offset 4        header_len    u32 big endian   4 bytes
-offset 8        n_frames      u32 big endian   4 bytes
-offset 12       frame_sizes   u32 big endian x n_frames
-offset 12+4n    header        msgpack, header_len bytes
-then            frames        concatenated, sizes as declared
+偏移 0        magic         b"TRY1"          4 字节
+偏移 4        header_len    u32 大端          4 字节
+偏移 8        n_frames      u32 大端          4 字节
+偏移 12       frame_sizes   u32 大端 × n_frames
+偏移 12+4n    header        msgpack，header_len 字节
+其后          frames        依次拼接，大小如声明
 ```
 
-Content type: `application/x-tinyray`.
+Content type：`application/x-tinyray`。
 
-Two decisions carry weight.
+两个决定值得说明。
 
-**Frame sizes live in the fixed prefix, not in the header.** The framing layer
-never parses msgpack, so it stays purely mechanical and a corrupt header cannot
-misalign the byte stream.
+**frame 大小放在固定前缀里，不放在 header 里。** framing 层因此从不解析 msgpack，保持
+纯机械，且损坏的 header 无法让字节流错位。
 
-**Frames are out of band.** Large buffers are handed to the transport separately
-from the small serialised body and reach the socket without being concatenated.
-Inlining them copies every buffer through the serialiser; **measured** on the
-previous implementation, a 10 MB array produced a 400,153-byte body instead of
-135 bytes when this was configured wrongly.
+**frame 是带外的。** 大缓冲区与小的序列化体分开交给 transport，不经拼接即抵达 socket。
+内联它们会让每个缓冲区都被复制穿过序列化器；在此前的实现上**实测**，配置错误时一个 10 MB
+数组产生了 400,153 字节的 body 而不是 135 字节。
 
-### 4.1 Limits
+### 4.1 上限
 
-Decoding allocates based on values read off the wire, so every one is bounded.
+解码会依据从 wire 上读到的值分配内存，因此每个值都有上限。
 
-| Limit | Default |
+| 上限 | 默认值 |
 |---|---|
 | `max_header_len` | 1 MiB |
 | `max_frames` | 4096 |
 | `max_frame_len` | 4 GiB |
 | `max_message_len` | 8 GiB |
 
-## 5. Normal sequence
+## 5. 正常顺序
 
-1. Sender writes the fixed prefix.
-2. Sender writes the frame size table.
-3. Sender writes the msgpack header.
-4. Sender writes each frame in declared order.
-5. Receiver reads the prefix, validates the limits, allocates, then reads.
+1. 发送方写入固定前缀。
+2. 发送方写入 frame 大小表。
+3. 发送方写入 msgpack header。
+4. 发送方按声明顺序写入每个 frame。
+5. 接收方读取前缀，校验上限，分配，然后读取。
 
-The receiver never allocates before validating.
+接收方在校验之前从不分配。
 
-## 6. State transitions
+## 6. 状态转换
 
 ```mermaid
 stateDiagram-v2
@@ -78,78 +73,71 @@ stateDiagram-v2
     Frames --> Poisoned
 ```
 
-`Poisoned` is terminal for the connection. See §11.
+`Poisoned` 对该连接是终态。见 §11。
 
-## 7. Ordering constraints
+## 7. 顺序约束
 
-- Frames arrive in declared order.
-- A message is complete only when every declared frame has been read.
-- Messages on one connection do not interleave.
+- frame 按声明顺序到达。
+- 只有在每个声明的 frame 都读完后消息才算完整。
+- 同一连接上的消息不交错。
 
-Ordering *between* messages is not provided here; it is the control RPC's, using
-per-caller sequence numbers
-([03-control-rpc.md](03-control-rpc.md)).
+消息**之间**的顺序不在此处提供，那属于控制 RPC，使用 per-caller 序号
+（[03-control-rpc.md](03-control-rpc.md)）。
 
-## 8. Timeouts
+## 8. Timeout
 
-Framing itself imposes none. The transport applies a per-request deadline
-(default 300 s), and a partially read message at the deadline closes the
-connection.
+framing 本身不施加任何 timeout。transport 施加每请求 deadline（默认 300 s），到期时仍
+读到一半的消息会关闭连接。
 
-## 9. Retry and idempotence
+## 9. Retry 与幂等性
 
-Framing is not retryable. A message that failed to decode is not re-requested at
-this layer; the connection is closed and the caller retries at the RPC layer, if
-the operation permits.
+framing 不可 retry。解码失败的消息不在这一层重新请求；连接被关闭，调用方在 RPC 层按操作
+是否允许来决定是否重试。
 
 ## 10. Backpressure
 
-None here. Backpressure is applied after decoding, by admission
-([03-modules/06-admission.md](../03-modules/06-admission.md)), because a
-rejection must name the request it refuses.
+此处没有。Backpressure 在解码之后由 Admission 施加
+（[03-modules/06-admission.md](../03-modules/06-admission.md)），因为拒绝必须指明它拒绝的
+是哪个请求。
 
-## 11. Failure semantics
+## 11. 故障语义
 
-| Failure | Detection | Response |
+| 故障 | 检测 | 响应 |
 |---|---|---|
-| Bad magic | Prefix read | Poison, close |
-| Any limit exceeded | Before allocation | Poison, close |
-| Truncated stream | Read returns short | Poison, close |
-| Header not valid msgpack | Header decode | Poison, close |
+| 魔数错误 | 读前缀时 | 中毒，关闭 |
+| 任一上限被超出 | 分配之前 | 中毒，关闭 |
+| 流被截断 | 读取返回不足 | 中毒，关闭 |
+| header 不是合法 msgpack | header 解码 | 中毒，关闭 |
 
-**A framing error is never recovered from.** A binary framing has no
-resynchronisation point: after a bad length there is no way to find the next
-message boundary without guessing. The decoder poisons itself deliberately so
-that a corrupt stream fails loudly instead of producing plausible garbage.
+**framing 错误绝不恢复。** 二进制 framing 没有重新同步点：读到一个错误长度之后，除了猜
+没有办法找到下一个消息边界。解码器有意让自己中毒，使损坏的流大声失败，而不是产出看似合理
+的垃圾。
 
-## 12. Correctness invariants
+## 12. 正确性不变量
 
-- No allocation occurs before the corresponding limit is checked.
-- A poisoned decoder never returns a message.
-- Frame bytes are never copied through the header serialiser.
-- The framing layer never interprets the header's contents.
-- Decoding is byte-for-byte reversible with encoding.
+- 在对应上限被检查之前不发生分配。
+- 中毒的解码器绝不返回消息。
+- frame 字节绝不经 header 序列化器复制。
+- framing 层从不解释 header 内容。
+- 解码与编码逐字节可逆。
 
-## 13. Compatibility
+## 13. 兼容性
 
-The magic bytes identify the format. There is no negotiation: mixed versions in
-one cluster are unsupported, and the failure is a clean rejection rather than a
-misparse.
+魔数标识格式。没有协商：一个集群内混用版本不被支持，且失败表现为干净的拒绝而不是错误解析。
 
-Adding a field to the header is compatible if readers ignore unknown keys.
-Changing the prefix layout is not.
+向 header 增加字段是兼容的，只要读取方忽略未知键。改变前缀布局不兼容。
 
-## 14. Testing
+## 14. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| Encode and decode round-trip | `tests/test_framing.py` | `test_roundtrip` | Unit |
-| Round-trip with many frames | `tests/test_framing.py` | `test_roundtrip_with_frames` | Unit |
-| Each limit is enforced | `tests/test_framing.py` | `test_limits_enforced` | Unit |
-| A poisoned decoder stays poisoned | `tests/test_framing.py` | `test_poison_is_terminal` | Unit |
-| Frames are not copied | `tests/test_buffers.py` | `test_zero_copy_out` | Unit |
-| Large buffers stay out of the body | `tests/test_serde.py` | `test_body_stays_small` | Unit |
-| Arbitrary byte streams do not panic | `tests/test_framing.py` | `test_fuzz_decoder` | Fuzz |
+| 编解码往返一致 | `tests/test_framing.py` | `test_roundtrip` | Unit |
+| 多 frame 往返一致 | `tests/test_framing.py` | `test_roundtrip_with_frames` | Unit |
+| 每个上限被强制 | `tests/test_framing.py` | `test_limits_enforced` | Unit |
+| 中毒的解码器保持中毒 | `tests/test_framing.py` | `test_poison_is_terminal` | Unit |
+| frame 未被复制 | `tests/test_buffers.py` | `test_zero_copy_out` | Unit |
+| 大缓冲区不进入 body | `tests/test_serde.py` | `test_body_stays_small` | Unit |
+| 任意字节流不导致 panic | `tests/test_framing.py` | `test_fuzz_decoder` | Fuzz |
 
-`test_body_stays_small` asserts the *cost*, not just that the value survives.
-The round-trip test alone passed while the payload was silently doubling.
+`test_body_stays_small` 断言的是**代价**，不只是值能存活。仅有往返测试时，payload 在
+悄悄翻倍而测试全绿。

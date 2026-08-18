@@ -1,163 +1,153 @@
-# Layering
+# 分层
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> Five layers, and tinyray occupies exactly one. The boundary is enforced by
-> naming, for every capability, which layer owns it.
+> 五层，tinyray 只占其中一层。边界通过为每项能力指明归属层来强制。
 
-## 1. Problem
+## 1. 问题
 
-Distributed ML systems conflate resource allocation, process lifecycle,
-membership, and application semantics into one runtime. That works until any one
-of them needs to scale independently — and at ten thousand GPUs all four do,
-in different directions.
+分布式 ML 系统把资源分配、进程生命周期、membership 和应用语义混成一个 runtime。这在
+其中任何一项需要独立扩展之前都能用 —— 而在万卡规模上，四项都需要，且方向各不相同。
 
-## 2. Goals
+## 2. 目标
 
-- Give every capability exactly one owning layer.
-- Make the boundary checkable in review rather than a matter of taste.
-- Let each layer be replaced without rewriting the others.
+- 每项能力恰好有一个归属层。
+- 边界在评审中可核对，而不是靠品味。
+- 每层可被替换而不需要重写其他层。
 
-## 3. Non-goals
+## 3. 非目标
 
-- Defining the layers below and above tinyray. They are described only to the
-  extent needed to fix the boundary.
-- Prescribing a scheduler, a transport or an application design.
+- 定义 tinyray 之上和之下的层。它们只在确定边界所需的范围内被描述。
+- 规定调度器、传输方式或应用设计。
 
-## 4. Design
+## 4. 设计
 
-| Layer | Contents | Owner | Replaceable by |
+| 层 | 内容 | 归属 | 可替换为 |
 |---|---|---|---|
-| **L4** Domain | Agents, trajectory trees, rewards, algorithms | Application | — |
-| **L3** Application control semantics | Task identity and sharding, sample deduplication, model version windows, checkpoints, step manifests | Application | — |
-| **L2** Control-plane mechanics | Identity and fencing, membership and leases, reconciliation, readiness, discovery, admission, control RPC, node supervision | **tinyray** | Hand-written equivalent |
-| **L1** Resources and process lifecycle | Node and GPU allocation, process start and stop, quotas, images | Slurm, Kubernetes, Volcano, Azure Jobs, `torchrun` | Each other |
-| **L0** Bulk transport | Weights, samples, activations | NCCL, UCX, NIXL, object storage | Each other |
+| **L4** 领域 | agent、trajectory tree、reward、algorithm | 应用 | —— |
+| **L3** 应用控制语义 | task 身份与分片、sample 去重、model version 窗口、checkpoint、step manifest | 应用 | —— |
+| **L2** 控制面机制 | identity 与 fencing、membership 与 lease、reconciliation、Readiness、discovery、Admission、控制 RPC、节点监督 | **tinyray** | 手写等价物 |
+| **L1** 资源与进程生命周期 | 节点与 GPU 分配、进程启停、配额、镜像 | Slurm、Kubernetes、Volcano、Azure Jobs、`torchrun` | 彼此 |
+| **L0** 大数据传输 | weight、sample、activation | NCCL、UCX、NIXL、对象存储 | 彼此 |
 
-### 4.1 The two boundaries that matter
+### 4.1 真正重要的两条边界
 
-**L2 / L1.** tinyray never allocates or launches. It *observes* what L1 did —
-reading `RANK`, `LOCAL_RANK`, `CUDA_VISIBLE_DEVICES` — and never writes them.
+**L2 / L1。** tinyray 从不分配也不拉起。它**观察** L1 做了什么 —— 读取 `RANK`、
+`LOCAL_RANK`、`CUDA_VISIBLE_DEVICES` —— 从不写入它们。
 
-The exception is node-local supervision
-([03-modules/08-supervision.md](../03-modules/08-supervision.md)): when L1 hands
-tinyray a node and asks it to run several processes on it, tinyray supervises
-them. It still does not decide *which* node or *how many* GPUs.
+例外是节点内监督
+（[03-modules/08-supervision.md](../03-modules/08-supervision.md)）：当 L1 把一个节点交给
+tinyray 并要求在上面跑若干进程时，tinyray 监督这些进程。它仍然不决定**哪个**节点或
+**多少**张 GPU。
 
-**L2 / L3.** tinyray provides mechanism; L3 provides policy and every domain
-noun. If a tinyray API mentions a task, a sample, a model version or a
-checkpoint, the boundary has been crossed.
+**L2 / L3。** tinyray 提供机制，L3 提供策略和全部领域名词。如果某个 tinyray API 里出现
+task、sample、model version 或 checkpoint，边界就已经被越过。
 
-### 4.2 Capability assignment
+### 4.2 能力归属
 
-| Capability | Layer | Note |
+| 能力 | 层 | 说明 |
 |---|---|---|
-| Which node runs what | L1 | tinyray reads the result |
-| GPU assignment | L1 | Reported by tinyray, never chosen |
-| Process start and stop | L1, or L2 within one node | See §4.1 |
-| Process tree cleanup | L2 | L1 rarely does this correctly for a process it did not fork |
-| Liveness of a worker | L2 | By lease, not by parenthood |
-| Aggregating liveness upward | L2 | Hierarchical |
-| Who exists and where | L2 | Scoped lookup |
-| Instance identity across restarts | L2 | Slot + incarnation |
-| Rejecting a stale writer | L2 | Fencing in the transport |
-| Leader election | L2 adapter over etcd | tinyray wraps, does not implement |
-| Desired configuration | L3 defines, L2 delivers | Schema is L3's |
-| Convergence loop | L2 | The loop, not the state |
-| "Is this worker ready" | L2 composes, L3 supplies predicates | |
-| Refusing work when overloaded | L2 | The bound is L3's |
-| Control messages | L2 | Kilobytes |
-| Sample and weight bytes | L0 | Never through L2 |
-| What a task is | L3 | |
-| Retry and deduplication of work | L3 | tinyray provides at-most-once delivery of a *call*, not of a *task* |
-| Durability of results | L3 | |
+| 哪个节点跑什么 | L1 | tinyray 读取结果 |
+| GPU 分配 | L1 | tinyray 上报，从不选择 |
+| 进程启停 | L1，或节点内的 L2 | 见 §4.1 |
+| 进程树清理 | L2 | L1 对自己没 fork 的进程很少能做对 |
+| worker 存活性 | L2 | 用 lease，不用父子关系 |
+| 存活性向上聚合 | L2 | 分层 |
+| 谁存在、在哪 | L2 | 作用域 lookup |
+| 跨重启的实例 identity | L2 | Slot + Incarnation |
+| 拒绝过期写入者 | L2 | transport 内的 fencing |
+| leader 选举 | L2 适配 etcd | tinyray 封装，不实现 |
+| desired 配置 | L3 定义，L2 投递 | schema 属于 L3 |
+| 收敛循环 | L2 | 循环属于 L2，状态不属于 |
+| “这个 worker 就绪了吗” | L2 组合，L3 提供谓词 | |
+| 过载时拒绝工作 | L2 | 界限属于 L3 |
+| 控制消息 | L2 | KB 级 |
+| sample 与 weight 字节 | L0 | 绝不经过 L2 |
+| task 是什么 | L3 | |
+| 工作的 retry 与去重 | L3 | tinyray 提供**一次调用**的至多一次投递，不是**一个 task** 的 |
+| 结果持久化 | L3 | |
 
-## 5. Normal flow
+## 5. 正常流程
 
 ```mermaid
 sequenceDiagram
-    participant S as L1 Scheduler
-    participant W as Worker process
+    participant S as L1 调度器
+    participant W as worker 进程
     participant R as L2 Registry
-    participant C as L3 Controller
+    participant C as L3 控制器
 
-    S->>W: allocate GPUs, start process, set RANK
-    W->>W: init_process_group, build model (L4/L3)
+    S->>W: 分配 GPU、拉起进程、设置 RANK
+    W->>W: init_process_group、构建模型（L4/L3）
     W->>R: join(slot, incarnation)
-    loop lease interval
+    loop lease 间隔
         W->>R: heartbeat(incarnation)
     end
     C->>R: lookup(group, scope)
-    R-->>C: endpoints for the requested scope
-    C->>W: control call, fenced by incarnation
-    W-->>C: result (kilobytes)
-    Note over W: bulk data goes L0, never through R or C
+    R-->>C: 所请求作用域的 endpoint
+    C->>W: 控制调用，由 incarnation fencing
+    W-->>C: 结果（KB 级）
+    Note over W: 大数据走 L0，绝不经过 R 或 C
 ```
 
-The diagram cannot show: the heartbeat is to the *cell*, not to a global
-registry ([02-topology.md](02-topology.md)); the lookup is served from cache
-when the registry is unreachable; and the control call is rejected if the
-incarnation is stale.
+图中无法表达：heartbeat 发往 **Cell** 而非全局 Registry
+（[02-topology.md](02-topology.md)）；Registry 不可达时 lookup 由缓存服务；以及
+Incarnation 过期时控制调用会被拒绝。
 
-## 6. State and ownership
+## 6. 状态与所有权
 
-| State | Owner | Layer | Persisted |
+| State | Owner | 层 | Persisted |
 |---|---|---|---|
-| Node and GPU allocation | Scheduler | L1 | Scheduler's store |
-| Slot roster and endpoints | Registry | L2 | No — soft state |
-| Incarnation per slot | Worker, recorded by registry | L2 | No |
-| Cell leadership, desired configuration | Consensus store | L2 adapter | Yes |
-| Task, sample, version, checkpoint state | Application | L3 | Application's store |
+| 节点与 GPU 分配 | 调度器 | L1 | 调度器的存储 |
+| Slot 名册与 endpoint | Registry | L2 | 否 —— 软状态 |
+| 每个 Slot 的 Incarnation | worker，由 Registry 记录 | L2 | 否 |
+| Cell leadership、desired 配置 | 共识存储 | L2 适配层 | 是 |
+| task、sample、version、checkpoint 状态 | 应用 | L3 | 应用的存储 |
 
-## 7. Correctness invariants
+## 7. 正确性不变量
 
-- No L2 interface accepts or returns a resource quantity.
-- No L2 interface names a domain noun.
-- No payload above the control-message bound crosses L2.
-- L2 reads launcher environment variables and never writes them.
-- Every L2 write carries an incarnation; receivers reject stale ones.
-- L2 state, other than the consensus slice, is re-derivable from its owners
-  within one lease period.
+- 没有任何 L2 接口接受或返回资源数量。
+- 没有任何 L2 接口出现领域名词。
+- 超过控制消息上限的 payload 不跨越 L2。
+- L2 读取 launcher 环境变量，从不写入。
+- 每次 L2 写入都携带 Incarnation；接收端拒绝过期的。
+- 除共识那一片之外，L2 状态都能由其 owner 在一个 lease 周期内重建。
 
-The first two are checked structurally by `tests/test_suite_quality.py`.
+前两条由 `tests/test_suite_quality.py` 结构性检查。
 
-## 8. Failure and recovery
+## 8. 故障与恢复
 
-| Layer fails | Effect on tinyray | Effect on the job |
+| 失效的层 | 对 tinyray 的影响 | 对作业的影响 |
 |---|---|---|
-| L0 transport | None; tinyray does not use it | Application handles |
-| L1 scheduler unreachable | No new processes start | Running work continues |
-| L2 registry unreachable | Lookups served from cache | Continues; no membership changes |
-| L2 consensus unreachable | No leadership or configuration change | Continues under the last known configuration |
-| L3 controller down | tinyray unaffected | No new decisions |
+| L0 传输 | 无；tinyray 不使用它 | 由应用处理 |
+| L1 调度器不可达 | 无法拉起新进程 | 运行中的工作继续 |
+| L2 Registry 不可达 | lookup 走缓存 | 继续；membership 不变更 |
+| L2 共识不可达 | leadership 与配置无法变更 | 在最后已知配置下继续 |
+| L3 控制器宕机 | tinyray 不受影响 | 不做新决策 |
 
-That every row degrades rather than stops is the point of the layering.
+每一行都是降级而非停止 —— 这正是分层的目的。
 
-## 9. Observability
+## 9. 可观测性
 
-Each layer reports separately, and tinyray does not aggregate other layers'
-metrics. It exposes membership, lease, fencing and admission counters — see
-[05-operations/03-observability.md](../05-operations/03-observability.md).
+每层各自上报，tinyray 不聚合其他层的指标。它暴露 membership、lease、fencing 和
+Admission 计数器，见
+[05-operations/03-observability.md](../05-operations/03-observability.md)。
 
-## 10. Trade-offs
+## 10. 取舍
 
-- **More moving parts than a single runtime.** Four systems instead of one, and
-  four failure modes to learn. Bought back by each being independently
-  replaceable and independently tested.
-- **tinyray cannot prevent resource conflicts.** With no ledger, two processes
-  can be given the same GPU. The scheduler must prevent that; tinyray will
-  report the collision but not stop it.
-- **The boundary needs defending.** The easiest way to make an L3 problem go
-  away is to add an L2 API for it. The capability table in §4.2 exists to be
-  cited when that is proposed.
+- **组件数比单一 runtime 多。** 四个系统而不是一个，四套故障模式要学。换回来的是每个都
+  可独立替换、独立测试。
+- **tinyray 无法阻止资源冲突。** 没有账本，两个进程可能拿到同一张 GPU。必须由调度器阻止；
+  tinyray 会报告冲突但不会阻止它。
+- **边界需要防守。** 让一个 L3 问题消失的最简单办法就是给它加一个 L2 API。§4.2 的能力表
+  就是用来在有人提出时引用的。
 
-## 11. Implementation and testing
+## 11. 实现与测试
 
-Structural tests assert the boundary rather than trusting review:
+用结构性测试断言边界，而不是依赖评审：
 
-| Behaviour | Test |
+| Behavior | Test file |
 |---|---|
-| No public API accepts a resource quantity | `tests/test_suite_quality.py` |
-| No public API names a domain noun | `tests/test_suite_quality.py` |
-| Every control operation has a byte budget | `tests/test_driver_byte_budget.py` |
-| Environment variables are read, never written | `tests/test_suite_quality.py` |
+| 没有公共 API 接受资源数量 | `tests/test_suite_quality.py` |
+| 没有公共 API 出现领域名词 | `tests/test_suite_quality.py` |
+| 每个控制操作都有字节预算 | `tests/test_driver_byte_budget.py` |
+| 环境变量只读不写 | `tests/test_suite_quality.py` |

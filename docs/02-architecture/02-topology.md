@@ -1,218 +1,200 @@
-# Topology
+# 拓扑
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> Three tiers — worker, cell, global — because every quantity that must not grow
-> with the cluster is bounded by a tier boundary.
+> 三层 —— worker、Cell、global —— 因为每一个不允许随集群增长的量，都由一条层边界限制住。
 
-## 1. Problem
+## 1. 问题
 
-A flat control plane makes three quantities proportional to cluster size: the
-number of heartbeats one process receives, the number of endpoints one process
-knows, and the number of calls one process makes. At ten thousand workers all
-three are fatal; the measurements are in
-[01-overview/01-problem.md](../01-overview/01-problem.md).
+扁平控制面让三个量与集群规模成正比：一个进程收到的 heartbeat 数、一个进程知道的
+endpoint 数、一个进程发出的调用数。万卡下三者都是致命的，实测见
+[01-overview/01-problem.md](../01-overview/01-problem.md)。
 
-## 2. Goals
+## 2. 目标
 
-- Bound every fan-out by a tier, not by the cluster.
-- Make the failure unit smaller than the job.
-- Keep the consensus store's write rate independent of worker count.
+- 每个扇出都由层限制，而不是由集群规模限制。
+- 故障单元小于作业。
+- 共识存储的写入速率与 worker 数无关。
 
-## 3. Non-goals
+## 3. 非目标
 
-- Choosing the cell size. That is a capacity-planning decision per deployment;
-  see §4.2.
-- Defining what runs inside a cell. tinyray does not know.
+- 选定 Cell 大小。这是每次部署的容量规划决定，见 §4.2。
+- 定义 Cell 内跑什么。tinyray 不知道。
 
-## 4. Design
+## 4. 设计
 
 ```mermaid
 flowchart TB
-    KV[(Consensus store<br/>leadership, desired config)]
-    G[Global tier<br/>3 or 5 replicas]
+    KV[(共识存储<br/>leadership、desired 配置)]
+    G[global 层<br/>3 或 5 副本]
     C0[Cell 0]
     C1[Cell N]
     N0[Node Agent]
     N1[Node Agent]
-    W0[Workers]
-    W1[Workers]
+    W0[worker]
+    W1[worker]
 
     G <--> KV
     G <-->|cell lease + summary| C0
     G <-->|cell lease + summary| C1
     C0 <-->|node lease| N0
     C1 <-->|node lease| N1
-    N0 <-->|local| W0
-    N1 <-->|local| W1
+    N0 <-->|本地| W0
+    N1 <-->|本地| W1
 ```
 
-### 4.1 What each tier is responsible for
+### 4.1 各层职责
 
-| Tier | Knows about | Fan-out | Holds |
+| 层 | 知道 | 扇出 | 持有 |
 |---|---|---|---|
-| **Global** | Cells | O(cells) | Leadership, desired configuration, cell roster |
-| **Cell** | Its nodes and workers | O(workers per cell) | Worker membership, local state |
-| **Node Agent** | Its own processes | O(processes per node) | Process supervision, local health |
-| **Worker** | Its scoped peers | O(scope) | Its own registration |
+| **global** | Cell | O(cells) | leadership、desired 配置、Cell 名册 |
+| **Cell** | 自己的节点与 worker | O(每 Cell worker 数) | worker membership、本地状态 |
+| **Node Agent** | 自己的进程 | O(每节点进程数) | 进程监督、本地健康 |
+| **worker** | 自己作用域内的 peer | O(scope) | 自己的注册 |
 
-The invariant that makes this work:
+使这套成立的不变量：
 
-> No tier addresses more members than its own tier contains.
+> 任何一层寻址的成员数都不超过该层自身的成员数。
 
-### 4.2 Cell sizing
+### 4.2 Cell 大小
 
-The cell is the failure and membership unit. tinyray does not choose its size,
-but records the forces:
+Cell 是故障与 membership 单元。tinyray 不选择它的大小，但记录各方作用力：
 
-| Factor | Cell too small | Cell too large |
+| 因素 | Cell 太小 | Cell 太大 |
 |---|---|---|
-| Number of cell controllers | More | Fewer |
-| Cross-cell traffic | More | Less |
-| Blast radius of one cell failure | Smaller | Larger |
-| Locality with the network fabric | May be cut across | May span fault domains |
-| Consensus write rate | Higher | Lower |
+| Cell 控制器数量 | 增多 | 减少 |
+| 跨 Cell 流量 | 增多 | 减少 |
+| 单 Cell 故障爆炸半径 | 更小 | 更大 |
+| 与网络 fabric 的局部性 | 可能被切碎 | 可能跨越多个故障域 |
+| 共识写入速率 | 更高 | 更低 |
 
-**Recommendation**: the cell boundary should coincide with the **collective
-communicator scope**.
+**建议**：Cell 边界应与 **collective communicator 作用域**重合。
 
-The reason is not aesthetic. NCCL is not fault tolerant: a rank's death poisons
-its communicator, and every surviving rank blocks at the next collective. If the
-control unit and the communicator scope differ, one death either crosses several
-control units or leaves one half-dead. When they coincide, one death is one cell
-rebuild and the other cells never notice.
+理由不是美学。NCCL 不容错：一个 rank 的死亡会毒化它所在的 communicator，其余每个 rank
+都会阻塞在下一次 collective 上。如果控制单元与 communicator 作用域不同，一次死亡要么
+跨掉多个控制单元，要么留下一个半死的。两者重合时，一次死亡就是一次 Cell 重建，其余
+Cell 完全不会察觉。
 
-**Derived**, at 5,000 rollout GPUs and 128 GPUs per cell: 40 cells; one cell
-lost is 2.56% of rollout capacity.
+**推导**，5,000 张 rollout GPU、每 Cell 128 GPU：40 个 Cell；损失一个 Cell 相当于 2.56%
+的 rollout 容量。
 
-### 4.3 Why the consensus store survives
+### 4.3 共识存储为何撑得住
 
-**Derived** load on the consensus store, 10,000 workers, 128 GPUs per cell:
+**推导**共识存储负载，10,000 个 worker，每 Cell 128 GPU：
 
-| Design | Lease holders | Renewals at 10 s |
+| 设计 | lease 持有者 | 10 s 续约速率 |
 |---|---:|---:|
-| Flat, per worker | 10,000 | 1,000/s |
-| Hierarchical, per cell | ~78 | 7.8/s |
+| 扁平，每 worker | 10,000 | 1,000/s |
+| 分层，每 Cell | 约 78 | 7.8/s |
 
-Kubernetes officially supports 5,000 nodes and documents node leases as a source
-of etcd pressure ([large-cluster
-guidance](https://kubernetes.io/docs/setup/best-practices/cluster-large/)). The
-flat design asks for twice that node budget, in addition to whatever the cluster
-is already doing. The hierarchical one asks for a rounding error.
+Kubernetes 官方支持 5,000 节点，并把节点 lease 记录为 etcd 压力来源
+（[大集群指南](https://kubernetes.io/docs/setup/best-practices/cluster-large/)）。扁平
+设计要的是该节点预算的两倍，还要叠加在集群自身负载之上；分层设计要的是一个舍入误差。
 
-Worker heartbeats terminate at the cell and are aggregated into one summary per
-cell per interval.
+worker heartbeat 终止于 Cell，并按每 Cell 每周期一份 summary 向上聚合。
 
-### 4.4 Degenerate topologies
+### 4.4 退化拓扑
 
-The same code must run at every scale, or development happens against a
-different system than production.
+同一份代码必须在所有规模上运行，否则开发时面对的就不是生产时的那个系统。
 
-| Deployment | Global | Cells | Node Agents |
+| 部署 | global | Cell | Node Agent |
 |---|---|---|---|
-| Laptop, one process | In-process | 1 | 0 |
-| Single node, several processes | In-process | 1 | 1 |
-| Small cluster | 1 replica | 1 per node | 1 per node |
-| Production | 3 or 5 replicas + consensus | 1 per fault domain | 1 per node |
+| 笔记本单进程 | 进程内 | 1 | 0 |
+| 单节点多进程 | 进程内 | 1 | 1 |
+| 小集群 | 1 副本 | 每节点 1 | 每节点 1 |
+| 生产 | 3 或 5 副本 + 共识 | 每故障域 1 | 每节点 1 |
 
-A tier is collapsed, never removed. `tinyray.join()` is identical in all four.
+层是被**折叠**，不是被移除。`tinyray.join()` 在四种形态下完全一致。
 
-## 5. Normal flow
+## 5. 正常流程
 
 ```mermaid
 sequenceDiagram
-    participant W as Worker
+    participant W as worker
     participant C as Cell
-    participant G as Global
-    participant KV as Consensus
+    participant G as global
+    participant KV as 共识
 
     W->>C: register(slot, incarnation, endpoint)
-    C-->>W: lease, heartbeat interval
-    loop worker interval (~2 s)
+    C-->>W: lease、heartbeat 间隔
+    loop worker 间隔（约 2 s）
         W->>C: heartbeat(incarnation)
     end
-    loop cell interval (~10 s)
-        C->>G: CellSummary + renew cell lease
-        G->>KV: renew only on change
+    loop Cell 间隔（约 10 s）
+        C->>G: CellSummary + 续约 cell lease
+        G->>KV: 仅在变更时写入
     end
-    G-->>C: desired configuration, control epoch
-    C-->>W: converged local state
+    G-->>C: desired 配置、control epoch
+    C-->>W: 收敛后的本地状态
 ```
 
-The diagram cannot show: worker heartbeats never reach Global; the cell summary
-is fixed-size regardless of worker count; and Global writes to consensus only
-when membership or configuration changes, not per interval.
+图中无法表达：worker heartbeat 永不到达 global；Cell summary 大小与 worker 数无关；
+global 只在 membership 或配置变更时写共识，而不是每个周期都写。
 
-## 6. State and ownership
+## 6. 状态与所有权
 
-| State | Owner | Tier | Persisted | Rebuildable |
+| State | Owner | 层 | Persisted | 可重建自 |
 |---|---|---|---|---|
-| Worker registration | Worker | Cell | No | One heartbeat |
-| Cell membership | Cell | Cell | No | One heartbeat round |
-| Cell summary | Cell | Global | No | One cell interval |
-| Cell roster | Global | Consensus | Yes | No |
-| Leadership | Consensus | Consensus | Yes | No |
-| Desired configuration | Application via Global | Consensus | Yes | No |
+| worker 注册 | worker | Cell | 否 | 一次 heartbeat |
+| Cell membership | Cell | Cell | 否 | 一轮 heartbeat |
+| Cell summary | Cell | global | 否 | 一个 Cell 周期 |
+| Cell 名册 | global | 共识 | 是 | 否 |
+| leadership | 共识 | 共识 | 是 | 否 |
+| desired 配置 | 应用经 global | 共识 | 是 | 否 |
 
-The rebuildable column is the design: everything below the consensus line is
-soft state, which is why replication of it needs no agreement. See
-[03-state-model.md](03-state-model.md).
+“可重建自”这一列就是设计本身：共识线以下全是软状态，所以复制它不需要达成一致。见
+[03-state-model.md](03-state-model.md)。
 
-## 7. Correctness invariants
+## 7. 正确性不变量
 
-- No tier holds a per-member record for a tier below its children.
-- A cell controller holds no state its workers cannot re-assert. A restarted
-  controller is correct after one heartbeat period.
-- Consensus writes are O(membership changes + configuration changes), never
-  O(workers x time).
-- A cell that loses its lease stops accepting new work; it does not stop
-  existing work.
-- A worker whose lease expires is removed from lookups, regardless of whether
-  anything supervises its process.
+- 任何一层都不为“比自己子层更低的层”保存 per-member 记录。
+- Cell 控制器不持有任何其 worker 无法重新告知它的状态。重启后的控制器在一个 heartbeat
+  周期后即正确。
+- 共识写入是 O(membership 变更 + 配置变更)，绝不是 O(worker × 时间)。
+- 失去 lease 的 Cell 停止接受新工作，但不停止已有工作。
+- lease 过期的 worker 从 lookup 中移除，无论是否有任何东西在监督它的进程。
 
-## 8. Failure and recovery
+## 8. 故障与恢复
 
-| Failure | Detected by | Bound | Effect |
+| 故障 | 检测方 | 时限 | 影响 |
 |---|---|---|---|
-| Worker dies | Lease expiry at its cell | Worker TTL | Removed from lookups; cell capacity drops |
-| Node Agent dies | Node lease expiry | Node TTL | Its processes are reclaimed |
-| Cell controller dies | Standby takes over with a new generation | Cell TTL | Cell schedules nothing briefly; running work continues |
-| Cell partitioned from Global | Cell lease expiry | Cell TTL | Cell finishes valid work, requests none |
-| Global leader dies | Consensus leader election | Election timeout | No configuration changes; cells continue |
-| Consensus unavailable | Client | — | No leadership or configuration change; everything else continues |
+| worker 死亡 | 其 Cell 的 lease 过期 | worker TTL | 从 lookup 移除；Cell 容量下降 |
+| Node Agent 死亡 | node lease 过期 | node TTL | 其进程被回收 |
+| Cell 控制器死亡 | standby 以新 generation 接管 | Cell TTL | Cell 短暂不再调度；运行中工作继续 |
+| Cell 与 global 分区 | cell lease 过期 | Cell TTL | Cell 完成有效工作，不再申请新的 |
+| global leader 死亡 | 共识 leader 选举 | 选举超时 | 不做配置变更；Cell 继续 |
+| 共识不可用 | 客户端 | —— | leadership 与配置不可变更；其余一切继续 |
 
-Every row degrades. None stops the job.
+每一行都是降级，没有一行会停掉作业。
 
-## 9. Observability
+## 9. 可观测性
 
-Per tier, not aggregated across tiers:
+按层上报，不跨层聚合：
 
-| Tier | Reports |
+| 层 | 上报 |
 |---|---|
-| Worker | Own readiness, admission state, incarnation |
-| Cell | Ready capacity, lease expiries, membership churn, control latency |
-| Global | Live cells, unavailable capacity, leader changes, consensus write rate |
+| worker | 自身 readiness、队列、inflight、Admission |
+| Cell | ready 容量、lease 过期数、membership 抖动、控制延迟 |
+| global | 存活 Cell 数、不可用容量、leader 变更、共识写入速率 |
 
-## 10. Trade-offs
+## 10. 取舍
 
-- **Detection is slower.** Worker death reaches Global in worker TTL + cell
-  interval, not immediately. Accepted: Global does not need to know quickly, and
-  the cell — which does — knows in one TTL.
-- **A cell controller is a local single point.** A cell without its controller
-  schedules nothing new. Mitigated by soft state making standby takeover cheap,
-  and by running work continuing regardless.
-- **Cell sizing is a real decision with no default.** Getting it wrong costs
-  either controller sprawl or blast radius. §4.2 gives the forces, not an answer.
+- **检测更慢。** worker 死亡到达 global 需要 worker TTL 加一个 Cell 周期，而非立即。
+  可接受：global 不需要快速知道，而需要快速知道的 Cell 在一个 TTL 内就知道了。
+- **Cell 控制器是局部单点。** 没有控制器的 Cell 不再调度新工作。缓解手段是软状态使
+  standby 接管很便宜，以及运行中的工作不受影响。
+- **Cell 大小是一个没有默认值的真实决定。** 选错的代价是控制器泛滥或爆炸半径过大。
+  §4.2 给出的是作用力，不是答案。
 
-## 11. Implementation and testing
+## 11. 实现与测试
 
-| Behaviour | Test |
+| Behavior | Test file |
 |---|---|
-| Worker heartbeats never reach the global tier | `tests/test_membership.py` |
-| Cell summary size is independent of worker count | `tests/test_membership.py` |
-| Consensus write rate is independent of worker count | `tests/test_fake_cluster.py` |
-| A restarted cell controller recovers from heartbeats alone | `tests/test_chaos.py` |
-| All four deployment shapes run the same worker code | `tests/test_deployment_shapes.py` |
+| worker heartbeat 永不到达 global 层 | `tests/test_membership.py` |
+| Cell summary 大小与 worker 数无关 | `tests/test_membership.py` |
+| 共识写入速率与 worker 数无关 | `tests/test_fake_cluster.py` |
+| 重启的 Cell 控制器仅靠 heartbeat 恢复 | `tests/test_chaos.py` |
+| 四种部署形态运行同一份 worker 代码 | `tests/test_deployment_shapes.py` |
 
-Scale validation runs against simulated workers before real hardware —
-[06-testing/02-fake-cluster.md](../06-testing/02-fake-cluster.md).
+规模验证在真实硬件之前先用模拟 worker 完成 ——
+[06-testing/02-fake-cluster.md](../06-testing/02-fake-cluster.md)。

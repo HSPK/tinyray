@@ -1,189 +1,167 @@
-# Decisions
+# 决策
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> Each decision with its reason and its cost. Reversals are included: a design
-> that never changed its mind was not tested against reality.
+> 每个决策连同理由与代价。反转也包含在内：一个从未改变过主意的设计，是没有被现实检验过的
+> 设计。
 
-## 1. Scope decisions
+## 1. 范围决策
 
-### tinyray occupies L2 only
+### tinyray 只占 L2
 
-**Why.** L1 is solved by schedulers with far more operational history. L3 is the
-product. L2 is what every large control plane writes by hand — one proposal
-reviewed for this work contained **15 identity types**, each needing its own
-generation and fencing check.
+**理由。** L1 已被运维历史远超 tinyray 的调度器解决。L3 是产品本身。L2 是每个大型控制面都
+手写一遍的东西 —— 为本工作评审的一份提案里有 **15 种 identity 类型**，每种都需要自己的
+generation 与 fencing 校验。
 
-**Cost.** tinyray is a library, not a runtime. It will not run your job.
+**代价。** tinyray 是库不是 runtime，它不会替你跑作业。
 
-### No resource management
+### 不做资源管理
 
-**Why.** Slurm or Kubernetes allocated the GPUs before tinyray was imported. A
-second ledger can only disagree with the first.
+**理由。** Slurm 或 Kubernetes 在 tinyray 被 import 之前就已分配 GPU。第二本账只会与第一本
+矛盾。
 
-**Cost.** tinyray cannot prevent two processes claiming one device. That
-protection moves to the scheduler, where it is stronger.
+**代价。** tinyray 无法阻止两个进程占用同一张设备。这项保护移交给调度器，在那里更强。
 
-### No launching, except within a node
+### 不拉起进程，节点内除外
 
-**Why.** `torchrun`, `srun` and Kubernetes own `__main__`.
+**理由。** `torchrun`、`srun` 和 Kubernetes 拥有 `__main__`。
 
-**Cost.** No gang start. `wait_ready(size)` refuses to proceed until the
-launcher has delivered, which gives the same guarantee where it matters.
+**代价。** 没有 gang start。`wait_ready(size)` 在 launcher 交付之前拒绝往下走，这在真正
+重要的那个点上给出同样的保证。
 
-### No data plane
+### 没有数据面
 
-**Why.** NCCL, UCX and NIXL are better at it and already present.
+**理由。** NCCL、UCX 和 NIXL 做得更好，而且已经在那里。
 
-**Cost.** tinyray cannot make a slow data path fast.
+**代价。** tinyray 无法把一条慢的数据路径变快。
 
-## 2. Mechanism decisions
+## 2. 机制决策
 
-### Self-registration, not roster push
+### 自注册，不是 roster 推送
 
-**Why.** **Measured**: a roster push is O(N) calls carrying O(N) bytes — 2.3 GB
-out of one process at 8,192 workers. Self-registration is O(1) per worker, issued
-from ten thousand places instead of arriving at one.
+**理由。** **实测**：roster 推送是 O(N) 次调用携带 O(N) 字节 —— 8,192 worker 时从一个进程
+发出 2.3 GB。自注册是每 worker O(1)，从一万个地方发出而不是汇聚到一处。
 
-**Cost.** Membership is eventually consistent. Fencing makes that safe.
+**代价。** membership 是最终一致的。fencing 使其安全。
 
-### Hierarchical leases
+### 分层 lease
 
-**Why.** Kubernetes supports 5,000 nodes and documents node leases as a source
-of etcd pressure. Ten thousand worker leases is twice that budget on top of the
-cluster's own. Workers lease against their cell; cells lease against consensus.
-**Derived**: 7.8 consensus writes/s instead of 1,000.
+**理由。** Kubernetes 支持 5,000 节点，并把节点 lease 记录为 etcd 压力来源。一万个 worker
+lease 是该预算的两倍，还要叠加集群自身负载。worker 对其 Cell 持有 lease，Cell 对共识持有
+lease。**推导**：7.8 次共识写入/s，而不是 1,000 次。
 
-**Cost.** Death reaches the global tier in worker TTL plus one cell interval.
+**代价。** 死亡到达 global 层需要 worker TTL 加一个 Cell 周期。
 
-### Soft state replicated without consensus
+### 软状态复制，不需要共识
 
-**Why.** Every membership record is re-asserted by its owner each heartbeat, so a
-replica that loses everything is correct one lease later. There is no history to
-agree about.
+**理由。** 每条 membership 记录都由其 owner 在每次 heartbeat 时重新声明，因此丢光一切的
+副本在一个 lease 之后就正确了。没有任何历史需要达成一致。
 
-**Cost.** A replica can serve a stale answer. Fencing makes it safe.
+**代价。** 副本可能返回陈旧答案。fencing 使其安全。
 
-### Reads fall back to cache
+### 读回落到缓存
 
-**Why.** **Measured**: with every replica killed, workers continued addressing
-each other and work continued. The failure that matters is not a lost record but
-a stopped job.
+**理由。** **实测**：杀掉全部副本后，worker 仍能互相寻址且工作继续。真正重要的失败不是
+一条记录丢了，而是一个作业停了。
 
-**Cost.** Staleness is unbounded during an outage.
+**代价。** 故障期间陈旧程度无上界。
 
-### Scoped lookup
+### 作用域 lookup
 
-**Why.** A worker needs its four peers, not ten thousand endpoints. Filtering
-server-side keeps the response bounded by the request.
+**理由。** 一个 worker 需要它的四个 peer，不是一万个 endpoint。服务端过滤让响应大小由请求
+决定。
 
-**Cost.** The caller must know its scope. tinyray will not compute it, because
-that mapping is a parallelism decision.
+**代价。** 调用方必须知道自己的作用域。tinyray 不会替它计算，因为那个映射是并行策略决定。
 
-### Fencing in the transport, not at call sites
+### fencing 在 transport 里，不在调用点
 
-**Why.** Fifteen hand-written checks is fifteen chances to write the one that
-always passes.
+**理由。** 十五份手写校验就是十五次写出“永远通过”那份的机会。
 
-**Cost.** Every call carries an incarnation, and a legitimate caller with a stale
-lookup is rejected and must re-look-up.
+**代价。** 每次调用都携带 Incarnation，而一个持有陈旧 lookup 结果的合法调用方会被拒绝并
+需要重新 lookup。
 
-### Only backpressure is retried
+### 只有 backpressure 被 retry
 
-**Why.** It is the one outcome where the call provably did not run. Everything
-else is a fact about state, and replaying a stateful call because it failed would
-apply it twice.
+**理由。** 它是唯一一种可以证明调用没有执行过的结果。其余都是关于状态的事实，因为失败就
+重试一个有状态调用，会把它执行两次。
 
-**Cost.** No `max_task_retries`. Application-level retry is the application's.
+**代价。** 没有 `max_task_retries`。应用级 retry 属于应用。
 
-### Linear backoff
+### 线性退避
 
-**Why.** The peer is draining a queue, not collapsing. Exponential backoff
-overshoots a queue that clears in milliseconds.
+**理由。** peer 在排空队列而不是在崩溃。指数退避会大幅超调一个几毫秒就排空的队列。
 
-### A superseded process is not killed
+### 被取代的进程不被杀掉
 
-**Why.** A library calling `os._exit` inside a training job is worse than the
-problem it solves. Supersession already stops the addressing; the callback exists
-for applications that want more.
+**理由。** 一个在训练作业里调用 `os._exit` 的库，比它要解决的问题更糟。取代本身已经停止了
+寻址；回调留给需要更多动作的应用。
 
-**Cost.** A superseded process keeps running, holding whatever it holds. That is
-L1's and the application's.
+**代价。** 被取代的进程继续运行，继续占着它占的东西。那是 L1 和应用的事。
 
-## 3. Reversals
+## 3. 反转
 
-The ones that were wrong first.
+那些一开始就错了的。
 
-### Star topology to peer mesh, and then to hierarchy
+### 星型拓扑 → peer mesh → 分层
 
-**Originally** the driver was at the centre and relayed every message.
+**最初**是 driver 在中心并中转每条消息。
 
-**Reversed because** that is the shape of a fan-out, not a pipeline. A mesh was
-built next — and was still wrong at scale, because introducing N workers to each
-other is quadratic. The third answer is hierarchy with scoped lookup: workers
-learn only the peers they need.
+**反转原因**：那是 fan-out 的形状，不是 pipeline 的形状。接下来造了 mesh —— 在规模上仍然
+错误，因为让 N 个 worker 互相认识是二次的。第三个答案是分层加作用域 lookup：worker 只认识
+它需要的那些 peer。
 
-**Lesson.** The first fix addressed the topology and kept the assumption that
-everyone must know everyone.
+**教训。** 第一次修复处理了拓扑，却保留了“每个人都必须认识每个人”这个假设。
 
-### tinyray owns the process, to tinyray supervises it, to the launcher owns it
+### tinyray 拥有进程 → tinyray 监督进程 → launcher 拥有进程
 
-**Originally** actor classes, Ray-style, with tinyray owning the interpreter.
-Then supervision of processes it started. Now: the launcher starts everything,
-and supervision is a node-local option.
+**最初**是 Ray 风格的 actor 类，tinyray 拥有解释器。然后是监督它拉起的进程。现在是：
+launcher 拉起一切，监督只是节点内的一个选项。
 
-**Lesson.** Each step gave up ownership, and each was prompted by a real
-framework refusing to give it up.
+**教训。** 每一步都在交出所有权，而每一步都是被一个拒绝交出所有权的真实框架逼出来的。
 
-### Placement, then no placement
+### 有 placement → 无 placement
 
-**Originally** a resource table, gang placement and device assignment, with
-tests. All of it is deleted.
+**最初**有资源表、gang placement 和设备分配，并且都有测试。全部删除。
 
-**Why.** At the target scale the scheduler has already done it. The code was
-correct and answering a question nobody was asking.
+**原因。** 在目标规模上调度器已经做完了。那些代码是正确的，只是在回答一个没人问的问题。
 
-### Shared registry identity, reverted immediately
+### Registry 共享 identity，随即反转
 
-**Originally** registry replicas were given one fixed identity to save a
-discovery round trip.
+**最初**为省一次发现往返，给 Registry 副本一个固定 identity。
 
-**Reversed because** clients route by identity: two replicas sharing one meant
-calls were submitted to one and fetched from the other. Every single-replica
-test passed.
+**反转原因**：客户端按 identity 路由，两个副本共享一个意味着调用提交给其中一个、结果却去
+另一个取。全部单副本测试都通过了。
 
-**Lesson.** Identity is not an optimisation site, and an availability feature
-tested with one instance is untested.
+**教训。** identity 不是优化点，而用一个实例测过的高可用特性等于没测。
 
-### Membership version bumped by heartbeat, then not
+### heartbeat 推进 membership 版本号，随即反转
 
-**Originally** any registry write moved the version.
+**最初**任何 Registry 写入都推进版本号。
 
-**Reversed because** a watcher would then re-fetch once per heartbeat per
-worker — a quadratic hidden inside a protocol that looks linear.
+**反转原因**：watcher 会因此按每 worker 每 heartbeat 的频率重新拉取 —— 一个藏在看似线性
+协议里的二次复杂度。
 
-## 4. Rejected alternatives
+## 4. 被否决的方案
 
-| Rejected | Why |
+| 否决项 | 原因 |
 |---|---|
-| Everything in etcd | Melts at ten thousand lease holders |
-| Nothing in consensus | Leadership and ownership have no owner to re-assert them |
-| Raft for membership | Nothing to agree about; it regenerates |
-| Gossip for membership | Convergence is harder to reason about than re-assertion, for no gain when every fact has an owner |
-| Occupying L1 as a `RuntimeBackend` | Already solved; reintroduces resource ownership |
-| gRPC | A protobuf toolchain and a code generator for point-to-point control traffic that needs neither. HTTP is debuggable with `curl` |
-| Push-based watch, initially | Polling a version costs a few bytes on a stable cluster. On the roadmap, not urgent |
-| Killing a superseded process | Too aggressive for a library |
+| 全部放进 etcd | 一万个 lease 持有者会压垮它 |
+| 完全不用共识 | leadership 与所有权没有 owner 可以重新声明 |
+| 用 Raft 做 membership | 没有需要达成一致的东西；它会自行重生 |
+| 用 gossip 做 membership | 在每个事实都有 owner 的前提下，收敛比重新声明更难推理，且毫无收益 |
+| 以 `RuntimeBackend` 身份占据 L1 | 已被解决；且重新引入资源所有权 |
+| gRPC | 为不需要 protobuf 工具链和代码生成器的点对点控制流量引入两者。HTTP 可以用 `curl` 调试 |
+| 一开始就做推送式 watch | 轮询一个版本号在稳定集群上只花几个字节。在 roadmap 上，不紧急 |
+| 杀掉被取代的进程 | 对一个库来说过于激进 |
 
-## 5. Decisions still open
+## 5. 仍未决定的问题
 
-| Question | Options | Blocked on |
+| 问题 | 选项 | 阻塞于 |
 |---|---|---|
-| Cell size | 64 / 128 / 256 GPU, or the communicator scope | Fabric topology and failure data |
-| Consensus store | etcd, or an existing Kubernetes API | Deployment environment |
-| Broadcast at 10k | Scoped only, thread-pooled, or tree fan-out | Whether a real broadcast is needed per iteration |
-| Authentication | mTLS, tokens, or network isolation only | Whether the cluster is shared |
-| Admission weighting | Count, bytes, or estimated duration | Real workload measurement |
+| Cell 大小 | 64 / 128 / 256 GPU，或 communicator 作用域 | fabric 拓扑与故障数据 |
+| 共识存储 | etcd，或已有的 Kubernetes API | 部署环境 |
+| 万卡广播 | 仅作用域调用、线程池、或树形扇出 | 是否真的需要每轮迭代做一次广播 |
+| 认证 | mTLS、token，或仅靠网络隔离 | 集群是否共享 |
+| Admission 权重 | 个数、字节，或估计时长 | 真实工作负载测量 |
 
-Each is recorded rather than guessed. A default chosen without the measurement
-becomes permanent by accident.
+每一项都被记录而不是猜测。**没有测量就选定的默认值会意外地变成永久的。**

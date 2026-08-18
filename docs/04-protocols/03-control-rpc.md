@@ -1,42 +1,41 @@
 # Control RPC
 
-## 1. Purpose
+## 1. 目的
 
-Deliver a method call to another process, in submission order per caller, fenced
-against stale writers, with rejection where the callee is full and retry only
-where retry is safe.
+把一次方法调用投递到另一个进程，保持 per-caller 提交顺序，对过期写入者做 fencing，在被叫方
+满载时拒绝，并且只在 retry 安全时 retry。
 
-## 2. Participants
+## 2. 参与者
 
-| Role | Responsibility |
+| 角色 | 职责 |
 |---|---|
-| Caller | Submits, carries its incarnation and sequence, retries backpressure |
-| Callee | Fences, admits, orders, executes, stores the result |
-| Consumer | Fetches a result, possibly a different process from the caller |
+| 调用方 | 提交，携带自身 Incarnation 与序号，retry backpressure |
+| 被叫方 | fencing、Admission、排序、执行、存储结果 |
+| 消费方 | 取回结果，可能与调用方不是同一个进程 |
 
-## 3. Preconditions
+## 3. 前置条件
 
-- The caller has an endpoint and incarnation from discovery.
-- The callee is serving.
-- Both are the same release ([01-wire-format.md §13](01-wire-format.md#13-compatibility)).
+- 调用方已从 discovery 获得 endpoint 与 Incarnation。
+- 被叫方正在服务。
+- 两者是同一发布版本（[01-wire-format.md §13](01-wire-format.md#13-兼容性)）。
 
-## 4. Data model
+## 4. 数据模型
 
 ```
 Call:
-  task_id       identifier of the result
+  task_id       结果的标识
   target        slot
-  incarnation   the callee's incarnation as the caller believes it
-  caller        caller identity
-  caller_inc    the caller's own incarnation
-  seq           monotonic per (caller, target)
+  incarnation   调用方所认为的被叫方 Incarnation
+  caller        调用方身份
+  caller_inc    调用方自身的 Incarnation
+  seq           per (caller, target) 单调
   method        string
-frames:         [serialised body, *out-of-band buffers]
+frames:         [序列化体, *带外缓冲区]
 
 Ack:
   task_id
   admitted      bool
-  retry_after   seconds, when not admitted
+  retry_after   未被接纳时的秒数
 
 Fetch:
   task_id
@@ -45,52 +44,50 @@ Fetch:
 
 Result:
   task_id
-frames:         [body, *buffers]   empty when status_only
+frames:         [体, *缓冲区]   status_only 时为空
 
 Error:
   task_id
-  kind          see section 11
+  kind          见第 11 节
   message
-  traceback     the remote Python traceback
+  traceback     远端 Python traceback
 ```
 
-`status_only` is the field that keeps readiness questions off the data plane.
-**Measured**: answering "is this ready" by fetching cost 237 ms for a settled
-200 MB result; with `status_only`, 0.14 ms.
+`status_only` 是把 readiness 问题挡在数据面之外的那个字段。**实测**：通过取回来回答
+“好了吗”，对一个已就绪的 200 MB 结果耗时 237 ms；用 `status_only` 是 0.14 ms。
 
-## 5. Normal sequence
+## 5. 正常顺序
 
 ```mermaid
 sequenceDiagram
-    participant C as Caller
-    participant S as Callee
-    participant Q as Ordered queue
-    participant E as Executor
+    participant C as 调用方
+    participant S as 被叫方
+    participant Q as 有序队列
+    participant E as 执行器
 
     C->>S: Call(incarnation, seq)
-    S->>S: fence, then admit
-    S->>Q: enqueue in caller order
+    S->>S: 先 fencing，再 Admission
+    S->>Q: 按调用方顺序入队
     S-->>C: Ack(admitted)
-    E->>Q: next
-    E->>E: run
-    E->>S: store result
+    E->>Q: 取下一个
+    E->>E: 执行
+    E->>S: 存储结果
     C->>S: Fetch(status_only=true)
-    S-->>C: Result with no frames
+    S-->>C: 无 frame 的 Result
     C->>S: Fetch
-    S-->>C: Result with frames
+    S-->>C: 带 frame 的 Result
 ```
 
-The `Ack` means **queued**, not completed. Treating it as completion is the
-mistake the field name exists to prevent.
+`Ack` 意味着**已入队**，不是已完成。把它当作完成，正是这个字段名要防止的错误。
 
-## 6. State transitions
+## 6. 状态转换
 
 ```mermaid
 stateDiagram-v2
     [*] --> Submitted
     Submitted --> Admitted
-    Submitted --> Rejected : admission full
-    Submitted --> Fenced : stale incarnation
+    Submitted --> Rejected : Admission 已满
+    Submitted --> Fenced : Incarnation 过期
     Admitted --> Queued
     Queued --> Running
     Running --> Stored
@@ -100,106 +97,97 @@ stateDiagram-v2
     Fetched --> Released
 ```
 
-## 7. Ordering constraints
+## 7. 顺序约束
 
-- Calls from one caller to one callee execute in `seq` order.
-- Different callers are independent; one slow caller does not block another.
-- A repeated `seq` is acknowledged and **not** re-executed.
-- Ordering is per `(caller, target)`, not global.
+- 同一调用方发往同一被叫方的调用按 `seq` 顺序执行。
+- 不同调用方彼此独立；一个慢调用方不阻塞另一个。
+- 重复的 `seq` 被确认，**不**重复执行。
+- 顺序是 per `(caller, target)` 的，不是全局的。
 
-HTTP provides no ordering and several connections per peer deliver concurrently,
-so the callee buffers arrivals that overtake their predecessors and dispatches in
-order.
+HTTP 不提供顺序，而每 peer 多条连接会并发投递，因此被叫方缓冲越过前序的到达并按序派发。
 
-A call genuinely lost in flight stalls that caller permanently. There is no
-automatic recovery; the condition is reported as `queue_waiting_for` naming the
-caller and sequence.
+真正在途丢失的调用会永久卡住该调用方。没有自动恢复；该状况以 `queue_waiting_for` 上报，
+并指明调用方与序号。
 
-## 8. Timeouts
+## 8. Timeout
 
-| Timeout | Default | Applies to |
+| Timeout | 默认 | 作用于 |
 |---|---:|---|
-| `request_timeout` | 300 s | One request |
-| `fetch_timeout` | caller-supplied | How long the callee holds a fetch open |
-| `result_ttl` | 300 s | Unfetched results |
+| `request_timeout` | 300 s | 一次请求 |
+| `fetch_timeout` | 调用方提供 | 被叫方保持 fetch 挂起的时长 |
+| `result_ttl` | 300 s | 未被取回的结果 |
 
-A fetch for a pending result long-polls rather than spinning; when the deadline
-passes the callee replies "ask again".
+对尚未就绪结果的 fetch 采用长轮询而非自旋；deadline 到期时被叫方回复“再问一次”。
 
-## 9. Retry and idempotence
+## 9. Retry 与幂等性
 
-| Outcome | Retryable | Why |
+| 结果 | 可 retry | 原因 |
 |---|---|---|
-| `Backpressure` | **Yes** | The identical request is safe to resend |
-| `Fenced` | No | Re-look-up first; the target moved |
-| `Unreachable` | No | Re-look-up first |
-| `UserException` | No | A fact about state |
-| `ObjectLost` | No | A fact about state |
-| `NotFound` | No | A fact about state |
-| `Internal` | No | Unknown effect |
+| `Backpressure` | **是** | 重发相同请求是安全的 |
+| `Fenced` | 否 | 先重新 lookup；目标已迁移 |
+| `Unreachable` | 否 | 先重新 lookup |
+| `UserException` | 否 | 关于状态的事实 |
+| `ObjectLost` | 否 | 关于状态的事实 |
+| `NotFound` | 否 | 关于状态的事实 |
+| `Internal` | 否 | 影响未知 |
 
-Backoff is linear — `base x min(attempt, 8)` — because the peer is draining a
-queue, not collapsing. Exponential backoff overshoots a queue that clears in
-milliseconds.
+退避是线性的 —— `base × min(attempt, 8)` —— 因为 peer 在排空队列而不是在崩溃。指数退避会
+大幅超调一个几毫秒就排空的队列。
 
-**Retrying a stateful call because it failed would apply it twice.** Backpressure
-is the only outcome where the call provably did not run.
+**因为失败就重试一个有状态调用，会把它执行两次。** backpressure 是唯一一种可以证明该调用
+没有执行过的结果。
 
 ## 10. Backpressure
 
-Rejection is immediate and carries `retry_after`. The callee never accepts a call
-it cannot run: accept-then-wait makes the queue invisible and removes the
-caller's ability to choose another peer.
+拒绝是立即的并携带 `retry_after`。被叫方绝不接受一个它跑不了的调用：先接受再等待会让队列
+不可见，并剥夺调用方另选 peer 的能力。
 
-HTTP `429` carries the same signal for non-tinyray clients.
+HTTP `429` 为非 tinyray 客户端携带同样的信号。
 
-## 11. Failure semantics
+## 11. 故障语义
 
-| `kind` | Python exception | Meaning |
+| `kind` | Python 异常 | 含义 |
 |---|---|---|
-| `UserException` | `UserCodeError` | The method raised |
-| `ObjectLost` | `ObjectLost` | The result existed and is gone |
-| `NotFound` | `NotFound` | It never existed |
-| `Fenced` | `Fenced` | The caller addressed a superseded incarnation |
-| `Backpressure` | `Backpressure` | Full; retry |
-| `Internal` | `RemoteCallError` | tinyray's fault |
+| `UserException` | `UserCodeError` | 方法抛出了异常 |
+| `ObjectLost` | `ObjectLost` | 结果曾经存在，现已消失 |
+| `NotFound` | `NotFound` | 它从未存在 |
+| `Fenced` | `Fenced` | 调用方寻址了一个已被取代的 Incarnation |
+| `Backpressure` | `Backpressure` | 已满；retry |
+| `Internal` | `RemoteCallError` | tinyray 自身的问题 |
 
-`ObjectLost` and `NotFound` are distinct on purpose. Collapsed into one, a fetch
-after eviction is indistinguishable from a typo.
+`ObjectLost` 与 `NotFound` 有意区分。合并成一个之后，驱逐后的 fetch 与拼错名字无法区分。
 
-The remote traceback travels on the wire because in a distributed run it is
-usually the only useful artefact.
+远端 traceback 走 wire 传输，因为在分布式运行中它通常是唯一有用的证据。
 
-## 12. Correctness invariants
+## 12. 正确性不变量
 
-- Every call is fenced before it is admitted.
-- Fencing is enforced by the callee, never assumed by the caller.
-- A repeated `seq` is never executed twice.
-- An `Ack` is sent on admission, never on completion.
-- A `status_only` fetch transfers no payload.
-- Only `Backpressure` is retried automatically.
-- Every error carries a kind distinguishable from every other.
-- A rejected call leaves no state on the callee.
+- 每次调用在被接纳之前完成 fencing。
+- fencing 由被叫方强制，绝不由调用方假定。
+- 重复的 `seq` 绝不执行两次。
+- `Ack` 在接纳时发送，绝不在完成时发送。
+- `status_only` 的 fetch 不传输 payload。
+- 只有 `Backpressure` 被自动 retry。
+- 每个错误携带一个可与其他错误区分的 kind。
+- 被拒绝的调用不在被叫方留下任何状态。
 
-## 13. Compatibility
+## 13. 兼容性
 
-Unversioned beyond the framing magic. Adding a header field is compatible if
-readers ignore unknown keys; adding an `ErrorKind` is not, because callers switch
-on it — a new kind must map to `Internal` for older callers.
+除 framing 魔数外没有版本化。向 header 增加字段是兼容的，只要读取方忽略未知键；增加一个
+`ErrorKind` 不兼容，因为调用方会对它做分支 —— 新增 kind 必须对旧调用方映射为 `Internal`。
 
-## 14. Testing
+## 14. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| Out-of-order arrivals are reordered | `tests/test_transport.py` | `test_ordering_restored` | Unit |
-| Callers do not block each other | `tests/test_transport.py` | `test_callers_are_independent` | Unit |
-| A repeated seq is absorbed | `tests/test_transport.py` | `test_duplicate_seq_absorbed` | Unit |
-| A stale incarnation is rejected | `tests/test_identity.py` | `test_peer_rejects_stale_incarnation` | Integration |
-| An Ack does not imply completion | `tests/test_transport.py` | `test_ack_means_queued` | Unit |
-| `status_only` moves no payload | `tests/test_driver_byte_budget.py` | `test_status_only_is_cheap` | Integration |
-| Only backpressure is retried | `tests/test_admission.py` | `test_only_backpressure_retries` | Unit |
-| Each ErrorKind is reachable and distinct | `tests/test_transport.py` | `test_error_taxonomy` | Unit |
-| A stalled queue is reported | `tests/test_transport.py` | `test_waiting_for_is_visible` | Integration |
+| 乱序到达被重排 | `tests/test_transport.py` | `test_ordering_restored` | Unit |
+| 调用方之间互不阻塞 | `tests/test_transport.py` | `test_callers_are_independent` | Unit |
+| 重复的 seq 被吸收 | `tests/test_transport.py` | `test_duplicate_seq_absorbed` | Unit |
+| 过期 Incarnation 被拒绝 | `tests/test_identity.py` | `test_peer_rejects_stale_incarnation` | Integration |
+| Ack 不意味着完成 | `tests/test_transport.py` | `test_ack_means_queued` | Unit |
+| `status_only` 不搬运 payload | `tests/test_driver_byte_budget.py` | `test_status_only_is_cheap` | Integration |
+| 只有 backpressure 被 retry | `tests/test_admission.py` | `test_only_backpressure_retries` | Unit |
+| 每个 ErrorKind 可达且可区分 | `tests/test_transport.py` | `test_error_taxonomy` | Unit |
+| 停滞的队列被上报 | `tests/test_transport.py` | `test_waiting_for_is_visible` | Integration |
 
-`test_status_only_is_cheap` asserts the byte cost across payload sizes. A budget
-checked at one size is a budget that will be violated at another.
+`test_status_only_is_cheap` 跨多个 payload 大小断言字节代价。只在一个大小上检查过的预算，
+是一个会在另一个大小上被违反的预算。

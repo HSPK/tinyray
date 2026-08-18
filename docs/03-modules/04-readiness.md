@@ -1,51 +1,48 @@
 # Readiness
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> Membership says a process exists. Readiness says it should be given work.
-> Conflating them produces a health check that returns `ok` while the worker is
-> useless.
+> membership 说一个进程存在，Readiness 说该不该给它派活。把两者混同的结果是：worker 已经
+> 没用了，健康检查还在返回 `ok`。
 
-## 1. Scope
+## 1. 范围
 
-Composable readiness predicates, their evaluation, and their publication.
-Proposed source: `python/tinyray/readiness.py`.
+可组合 Readiness 谓词、其求值与发布。计划源码：`python/tinyray/readiness.py`。
 
-## 2. Responsibilities
+## 2. 职责
 
-- Compose predicates into one readiness verdict.
-- Evaluate them off the path they are measuring.
-- Publish the verdict, and the reason when it is negative.
-- Provide generic predicates: process alive, port open, HTTP status, log match,
-  queue depth, event-loop lag.
+- 把多个谓词组合成一个 Readiness 裁决。
+- 在被测量的路径**之外**求值。
+- 发布裁决，以及否定时的原因。
+- 提供通用谓词：进程存活、端口打开、HTTP 状态、日志匹配、队列深度、事件循环延迟。
 
-## 3. Non-responsibilities
+## 3. 非职责
 
-| Not done here | Owner |
+| 不在此处做 | 归属 |
 |---|---|
-| Domain predicates — model version, KV cache, sample spool | Application (L3) |
-| Deciding what to do about unreadiness | Application (L3) |
-| Restarting an unready worker | [08-supervision](08-supervision.md) or L1 |
-| Liveness | [02-membership](02-membership.md) |
+| 领域谓词 —— model version、KV cache、sample spool | 应用（L3） |
+| 决定 unready 之后怎么办 | 应用（L3） |
+| 重启 unready 的 worker | [08-supervision](08-supervision.md) 或 L1 |
+| 存活性 | [02-membership](02-membership.md) |
 
-## 4. Position in the system
+## 4. 系统位置
 
-Between membership and discovery. A member that is live but unready is present
-in membership and excluded from a ready-filtered lookup.
+位于 membership 与 discovery 之间。一个存活但未就绪的成员出现在 membership 中，但被
+ready 过滤的 lookup 排除。
 
-## 5. Dependencies
+## 5. 依赖
 
-- [02-membership](02-membership.md) to publish the verdict with the heartbeat.
-- Nothing else. Predicates must not require the control plane.
+- [02-membership](02-membership.md) 用于随 heartbeat 发布裁决。
+- 无其他依赖。谓词不得依赖控制面。
 
-## 6. Public contract
+## 6. 公共契约
 
 | Interface | Input | Output | Side effect | Blocking | Failure |
 |---|---|---|---|---|---|
-| `readiness(*predicates)` | Predicates | `Readiness` | None | No | `TypeError` |
-| `Readiness.evaluate()` | — | `Verdict(ready, reasons)` | Runs predicates | Bounded | Never raises |
-| `Predicate.check()` | — | `bool` or `(bool, str)` | Predicate's own | Bounded | Treated as not ready |
-| `Readiness.publish(membership)` | Membership | — | Attaches to heartbeat | No | None |
+| `readiness(*predicates)` | 谓词 | `Readiness` | 无 | 否 | `TypeError` |
+| `Readiness.evaluate()` | —— | `Verdict(ready, reasons)` | 运行谓词 | 有界 | 从不抛出 |
+| `Predicate.check()` | —— | `bool` 或 `(bool, str)` | 谓词自身的 | 有界 | 视为未就绪 |
+| `Readiness.publish(membership)` | Membership | —— | 附加到 heartbeat | 否 | 无 |
 
 ```python
 tinyray.readiness(
@@ -53,153 +50,142 @@ tinyray.readiness(
     tinyray.HttpOk("/health", timeout=1.0),
     tinyray.QueueBelow(lambda: queue.qsize(), 1000),
     tinyray.EventLoopLagBelow(0.2),
-    ModelVersionInWindow(...),      # the application's
+    ModelVersionInWindow(...),      # 应用自己的
 )
 ```
 
-## 7. State ownership
+## 7. 状态所有权
 
 | State | Owner | Created | Updated by | Read by | Lifetime | Persisted |
 |---|---|---|---|---|---|---|
-| Predicate list | Worker | At construction | Never | Evaluator | Process | No |
-| Latest verdict | Worker | First evaluation | Each evaluation | Heartbeat, `/introspect` | Until next | No |
-| Reasons | Worker | On a negative verdict | Each evaluation | Operators | Until next | No |
-| Published readiness | Registry | Heartbeat | Heartbeat | Discovery | Lease TTL | No |
+| 谓词列表 | worker | 构造时 | 从不 | 求值器 | 进程期 | 否 |
+| 最新裁决 | worker | 首次求值 | 每次求值 | heartbeat、`/introspect` | 到下次求值 | 否 |
+| 原因 | worker | 否定裁决时 | 每次求值 | 运维 | 到下次求值 | 否 |
+| 已发布的 readiness | Registry | heartbeat | heartbeat | discovery | lease TTL | 否 |
 
-## 8. Lifecycle
+## 8. 生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Starting
-    Starting --> Ready : all predicates pass
-    Ready --> NotReady : any predicate fails
-    NotReady --> Ready : all pass again
-    Ready --> Draining : asked to stop taking work
+    Starting --> Ready : 全部谓词通过
+    Ready --> NotReady : 任一谓词失败
+    NotReady --> Ready : 全部重新通过
+    Ready --> Draining : 被要求停止接活
     NotReady --> Draining
     Draining --> [*]
 ```
 
-`Draining` is distinct from `NotReady`: draining is intentional and finishes
-existing work; not-ready is a fault.
+`Draining` 与 `NotReady` 不同：draining 是有意的且会完成已有工作，not-ready 是故障。
 
-## 9. Main flow
+## 9. 主流程
 
 ```mermaid
 sequenceDiagram
-    participant E as Evaluator thread
-    participant P as Predicates
-    participant H as Heartbeat
-    participant D as Discovery
+    participant E as 求值线程
+    participant P as 谓词
+    participant H as heartbeat
+    participant D as discovery
 
-    loop evaluation interval
-        E->>P: check() with a deadline
-        P-->>E: verdict + reason
+    loop 求值周期
+        E->>P: 带 deadline 的 check()
+        P-->>E: 裁决 + 原因
     end
-    H->>H: attach latest verdict
-    D->>D: filter members by readiness
+    H->>H: 附加最新裁决
+    D->>D: 按 readiness 过滤成员
 ```
 
-The diagram cannot show: the evaluator runs on its own thread, so a stalled
-worker still produces a verdict; a predicate exceeding its deadline counts as
-not ready; and the heartbeat publishes the *last* verdict rather than triggering
-a fresh evaluation.
+图中无法表达：求值器跑在自己的线程上，因此卡住的 worker 仍能产出裁决；超出 deadline 的
+谓词记为未就绪；heartbeat 发布的是**上一次**裁决而非触发一次新的求值。
 
-## 10. Concurrency and distributed semantics
+## 10. 并发与分布式语义
 
-**Evaluation happens off the path being measured.** A readiness check on the
-same event loop it is measuring cannot detect that the loop is stuck — the
-canonical failure of internal watchdogs. The evaluator runs on a dedicated
-thread; the transport that serves `/health` is native and does not need the GIL
-([07-transport](07-transport.md)).
+**求值发生在被测量路径之外。** 一个跑在它所测量的事件循环上的 readiness 检查，无法发现
+该循环已经卡死 —— 这是内部 watchdog 的经典失效方式。求值器跑在专用线程上；服务
+`/health` 的 transport 是原生的，不需要 GIL（[07-transport](07-transport.md)）。
 
-**Every predicate has a deadline.** A hanging predicate is a not-ready verdict,
-never a hanging evaluator.
+**每个谓词都有 deadline。** 挂住的谓词产生未就绪裁决，绝不产生挂住的求值器。
 
-**Predicates are independent** and evaluated every interval regardless of earlier
-failures, because the reasons together are the diagnosis. Short-circuiting saves
-microseconds and loses the operator's information.
+**谓词彼此独立**，且无论先前是否失败每周期都全部求值，因为所有原因合起来才是诊断。短路
+省下微秒，丢掉运维人员需要的信息。
 
-**Verdicts are published, not polled.** Discovery reads what the heartbeat
-carried. A ready-filtered lookup is as fresh as the last heartbeat.
+**裁决是被发布的，不是被轮询的。** discovery 读取 heartbeat 携带的内容。ready 过滤的
+lookup 的新鲜度等于上次 heartbeat。
 
-## 11. Correctness invariants
+## 11. 正确性不变量
 
-- Readiness is separate from liveness; a member may be live and not ready.
-- A predicate that times out yields not ready.
-- A negative verdict always carries at least one reason.
-- Evaluation never blocks the worker's own work.
-- Evaluation is never on the path it measures.
-- A worker that has never evaluated is not ready.
+- Readiness 与存活性分离；成员可以存活但未就绪。
+- 超时的谓词产生未就绪。
+- 否定裁决必定携带至少一条原因。
+- 求值绝不阻塞 worker 自身的工作。
+- 求值绝不发生在它所测量的路径上。
+- 从未求值过的 worker 是未就绪的。
 
-The last one matters at startup: default-ready means work is dispatched to a
-worker that has not finished loading.
+最后一条在启动时很重要：默认就绪意味着工作会被派给一个还没加载完的 worker。
 
-## 12. Failure handling
+## 12. 故障处理
 
-| Failure | Detected by | Response |
+| 故障 | 检测方 | 响应 |
 |---|---|---|
-| Predicate raises | Evaluator | Not ready, exception as reason |
-| Predicate hangs | Deadline | Not ready, timeout as reason |
-| Evaluator thread dies | Heartbeat sees a stale verdict | Verdict ages out; treated as not ready |
-| Worker never becomes ready | Application | tinyray reports; escalation is L3's |
-| All members unready | Discovery | Ready-filtered lookup returns empty; the caller decides |
+| 谓词抛出 | 求值器 | 未就绪，以异常为原因 |
+| 谓词挂住 | deadline | 未就绪，以超时为原因 |
+| 求值线程死亡 | heartbeat 看到裁决陈旧 | 裁决过龄，视为未就绪 |
+| worker 始终不就绪 | 应用 | tinyray 上报；升级处理属于 L3 |
+| 全部成员未就绪 | discovery | ready 过滤的 lookup 返回空，由调用方决定 |
 
-tinyray never restarts a worker for being unready. It reports; L3 or L1 acts.
+tinyray 绝不因为未就绪而重启 worker。它上报，由 L3 或 L1 动作。
 
-## 13. Configuration
+## 13. 配置
 
 | Field | Type | Default | Validation | Reader | Effect |
 |---|---|---|---|---|---|
-| `interval` | seconds | 1.0 | > 0 | Evaluator | Evaluation rate |
-| `predicate_timeout` | seconds | 1.0 | > 0 | Evaluator | Per-predicate deadline |
-| `verdict_max_age` | seconds | 3 x interval | > interval | Heartbeat | Stale verdict counts as not ready |
-| `initial` | `not_ready` | `not_ready` | Fixed | Evaluator | Not configurable, by design |
+| `interval` | 秒 | 1.0 | > 0 | 求值器 | 求值频率 |
+| `predicate_timeout` | 秒 | 1.0 | > 0 | 求值器 | 每谓词 deadline |
+| `verdict_max_age` | 秒 | 3 × interval | > interval | heartbeat | 陈旧裁决视为未就绪 |
+| `initial` | `not_ready` | `not_ready` | 固定 | 求值器 | 有意不可配置 |
 
-## 14. Observability
+## 14. 可观测性
 
 | Metric | Producer | Meaning |
 |---|---|---|
-| `readiness_current` | Worker | 1 when ready |
-| `readiness_transitions_total` | Worker | Flapping detector |
-| `readiness_failures_by_reason` | Worker | Which predicate, labelled |
-| `readiness_evaluation_seconds` | Worker | Predicate cost |
-| `readiness_stale_total` | Heartbeat | Evaluator not keeping up |
+| `readiness_current` | worker | 就绪时为 1 |
+| `readiness_transitions_total` | worker | 抖动检测 |
+| `readiness_failures_by_reason` | worker | 哪个谓词，带标签 |
+| `readiness_evaluation_seconds` | worker | 谓词开销 |
+| `readiness_stale_total` | heartbeat | 求值器跟不上 |
 
-`readiness_failures_by_reason` is the field an operator reads first, which is
-why a negative verdict without a reason is an invariant violation.
+`readiness_failures_by_reason` 是运维第一个看的字段，这就是“否定裁决无原因”属于不变量
+违反的原因。
 
-## 15. Testing
+## 15. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| Composition requires every predicate | `tests/test_readiness.py` | `test_all_must_pass` | Unit |
-| A hanging predicate yields not ready | `tests/test_readiness.py` | `test_hanging_predicate_times_out` | Unit |
-| A raising predicate yields not ready | `tests/test_readiness.py` | `test_raising_predicate` | Unit |
-| Every negative verdict has a reason | `tests/test_readiness.py` | `test_reasons_always_present` | Unit |
-| Initial state is not ready | `tests/test_readiness.py` | `test_starts_not_ready` | Unit |
-| A stale verdict counts as not ready | `tests/test_readiness.py` | `test_stale_verdict_is_not_ready` | Unit |
-| A stalled worker still reports | `tests/test_readiness.py` | `test_evaluator_survives_blocked_worker` | Integration |
-| Unready members are excluded from lookup | `tests/test_discovery.py` | `test_ready_filter` | Integration |
+| 组合要求全部谓词通过 | `tests/test_readiness.py` | `test_all_must_pass` | Unit |
+| 挂住的谓词产生未就绪 | `tests/test_readiness.py` | `test_hanging_predicate_times_out` | Unit |
+| 抛异常的谓词产生未就绪 | `tests/test_readiness.py` | `test_raising_predicate` | Unit |
+| 每个否定裁决都有原因 | `tests/test_readiness.py` | `test_reasons_always_present` | Unit |
+| 初始状态是未就绪 | `tests/test_readiness.py` | `test_starts_not_ready` | Unit |
+| 陈旧裁决视为未就绪 | `tests/test_readiness.py` | `test_stale_verdict_is_not_ready` | Unit |
+| 卡住的 worker 仍能上报 | `tests/test_readiness.py` | `test_evaluator_survives_blocked_worker` | Integration |
+| 未就绪成员被 lookup 排除 | `tests/test_discovery.py` | `test_ready_filter` | Integration |
 
-`test_evaluator_survives_blocked_worker` is the load-bearing one: it must block
-the worker's main thread and assert a verdict is still produced.
+`test_evaluator_survives_blocked_worker` 是关键的一条：它必须阻塞 worker 的主线程，并断言
+裁决仍然产出。
 
-## 16. Limitations and trade-offs
+## 16. 限制与取舍
 
-- **Readiness is as fresh as the last heartbeat.** Up to one interval stale in
-  the worker and one lease interval stale in discovery.
-- **Predicates cost CPU on the worker.** An expensive one runs every interval;
-  tinyray measures the cost but does not budget it.
-- **No hysteresis by default.** A flapping predicate produces a flapping member.
-  `readiness_transitions_total` exists to make that visible; damping is the
-  application's.
-- **tinyray supplies no domain predicate.** Model version, KV cache and spool
-  depth are L3's, deliberately — and they are the ones that matter most.
+- **Readiness 的新鲜度等于上次 heartbeat。** 在 worker 内最多陈旧一个周期，在 discovery
+  中最多陈旧一个 lease 周期。
+- **谓词消耗 worker 的 CPU。** 昂贵的谓词每周期都跑；tinyray 测量其开销但不为其设预算。
+- **默认没有滞回。** 抖动的谓词产生抖动的成员。`readiness_transitions_total` 用来让它
+  可见；抑制属于应用。
+- **tinyray 不提供任何领域谓词。** model version、KV cache 和 spool 深度属于 L3 —— 这是
+  有意的，而它们恰恰是最重要的那些。
 
-## 17. Source mapping
+## 17. 源码映射
 
-Proposed: `python/tinyray/readiness.py`.
+计划：`python/tinyray/readiness.py`。
 
-Related: [02-membership](02-membership.md) publishes the verdict;
-[05-discovery](05-discovery.md) filters on it;
-[06-admission](06-admission.md) is the immediate consumer.
+相关：[02-membership](02-membership.md) 发布裁决；[05-discovery](05-discovery.md) 按其
+过滤；[06-admission](06-admission.md) 是直接消费方。

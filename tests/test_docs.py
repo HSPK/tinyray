@@ -105,54 +105,54 @@ class TestStructure:
 # --------------------------------------------------------------------------
 
 MODULE_SECTIONS = [
-    "Scope",
-    "Responsibilities",
-    "Non-responsibilities",
-    "Position in the system",
-    "Dependencies",
-    "Public contract",
-    "State ownership",
-    "Lifecycle",
-    "Main flow",
-    "Concurrency and distributed semantics",
-    "Correctness invariants",
-    "Failure handling",
-    "Configuration",
-    "Observability",
-    "Testing",
-    "Limitations and trade-offs",
-    "Source mapping",
+    "范围",
+    "职责",
+    "非职责",
+    "系统位置",
+    "依赖",
+    "公共契约",
+    "状态所有权",
+    "生命周期",
+    "主流程",
+    "并发与分布式语义",
+    "正确性不变量",
+    "故障处理",
+    "配置",
+    "可观测性",
+    "测试",
+    "限制与取舍",
+    "源码映射",
 ]
 
 ARCHITECTURE_SECTIONS = [
-    "Problem",
-    "Goals",
-    "Non-goals",
-    "Design",
-    "Normal flow",
-    "State and ownership",
-    "Correctness invariants",
-    "Failure and recovery",
-    "Observability",
-    "Trade-offs",
-    "Implementation and testing",
+    "问题",
+    "目标",
+    "非目标",
+    "设计",
+    "正常流程",
+    "状态与所有权",
+    "正确性不变量",
+    "故障与恢复",
+    "可观测性",
+    "取舍",
+    "实现与测试",
 ]
 
 PROTOCOL_SECTIONS = [
-    "Purpose",
-    "Participants",
-    "Preconditions",
-    "Data model",
-    "Normal sequence",
-    "State transitions",
-    "Ordering constraints",
-    "Timeouts",
-    "Retry and idempotence",
+    "目的",
+    "参与者",
+    "前置条件",
+    "数据模型",
+    "正常顺序",
+    "状态转换",
+    "顺序约束",
+    "Timeout",
+    "Retry 与幂等性",
     "Backpressure",
-    "Failure semantics",
-    "Correctness invariants",
-    "Compatibility",
-    "Testing",
+    "故障语义",
+    "正确性不变量",
+    "兼容性",
+    "测试",
 ]
 
 MODULES = sorted((DOCS / "03-modules").glob("*.md"))
@@ -197,11 +197,11 @@ class TestTemplates:
     @pytest.mark.parametrize("page", MODULES, ids=rel)
     def test_non_responsibilities_name_an_owner(self, page: Path):
         text = read(page)
-        start = text.index("## 3. Non-responsibilities")
+        start = text.index("## 3. 非职责")
         body = text[start : text.index("## 4.", start)]
-        if "None" in body and "|" not in body:
+        if "无" in body and "|" not in body:
             return
-        assert "| Owner |" in body or "Owner" in body, (
+        assert "归属" in body, (
             f"{rel(page)} lists non-responsibilities without naming who does own them; "
             "that is how boundaries erode"
         )
@@ -216,9 +216,7 @@ class TestHonesty:
     def test_every_page_is_marked_as_a_proposal(self):
         exempt = {"00-conventions.md"} | {rel(p) for p in PROTOCOLS}
         unmarked = [
-            rel(p)
-            for p in PAGES
-            if rel(p) not in exempt and "Proposal; not the current implementation" not in read(p)
+            rel(p) for p in PAGES if rel(p) not in exempt and "提案；当前未实现" not in read(p)
         ]
         assert not unmarked, (
             f"pages that do not say they are unimplemented: {unmarked}; a design "
@@ -226,17 +224,17 @@ class TestHonesty:
         )
 
     def test_the_index_says_it_is_a_proposal(self):
-        assert "Proposal" in read(DOCS / "README.md")
+        assert "提案" in read(DOCS / "README.md")
 
     def test_measured_numbers_are_labelled(self):
         """Every quantity is measured, derived or to-be-measured."""
         text = corpus()
-        for kind in ("**Measured**", "**Derived**", "**To be measured**", "to be measured"):
-            assert kind in text, f"no quantity is labelled {kind}; conventions section 9"
+        for kind in ("**实测**", "**推导**", "**待测**"):
+            assert kind in text, f"没有任何数量被标注为 {kind}；见规范第 9 节"
 
     def test_untested_claims_are_recorded(self):
         status = read(DOCS / "08-project" / "01-status.md")
-        for claim in ("NCCL", "SGLang", "Megatron", "Multi-node", "10,000 worker scale"):
+        for claim in ("NCCL", "SGLang", "Megatron", "多机", "一万 worker 规模"):
             assert claim in status, (
                 f"{claim!r} is discussed in the design but not listed among the "
                 "things never run against the real thing"
@@ -244,8 +242,8 @@ class TestHonesty:
 
     def test_removals_are_enumerated(self):
         status = read(DOCS / "08-project" / "01-status.md")
-        assert "To be removed" in status
-        for removed in ("Placement", "launcher", "roster push"):
+        assert "待删除的部分" in status
+        for removed in ("placement", "launcher", "roster 推送"):
             assert removed in status, f"{removed!r} is not listed as removed"
 
     @pytest.mark.parametrize("page", PAGES, ids=rel)
@@ -280,7 +278,7 @@ class TestDerivedNumbersAreRecomputed:
         steady = 10_000 / 10
         assert steady == 1_000
         assert round(4295 / steady, 1) == 4.3
-        assert "4.3x" in read(DOCS / "01-overview" / "01-problem.md")
+        assert "4.3 倍" in read(DOCS / "01-overview" / "01-problem.md")
 
     def test_consensus_write_reduction(self):
         # 10,000 GPUs, 128 per cell, 10 s lease
@@ -288,7 +286,7 @@ class TestDerivedNumbersAreRecomputed:
         assert cells == 79
         assert round(cells / 10, 1) == 7.9
         topology = read(DOCS / "02-architecture" / "02-topology.md")
-        assert "7.8/s" in topology or "7.9" in topology or "~78" in topology
+        assert "7.8/s" in topology or "7.9" in topology or "78" in topology
 
     def test_cell_blast_radius(self):
         assert round(128 / 5000 * 100, 2) == 2.56
@@ -300,7 +298,7 @@ class TestDerivedNumbersAreRecomputed:
 
     def test_removal_totals(self):
         status = read(DOCS / "08-project" / "01-status.md")
-        section = status[status.index("## 3. To be removed") : status.index("## 4.")]
+        section = status[status.index("## 3. 待删除的部分") : status.index("## 4.")]
         removed = [int(n) for n in re.findall(r"\|\s*(\d{3,4})\s*(?:Rust|Python)\s*\|", section)]
         assert len(removed) >= 6, f"the removal table lost rows: {removed}"
         assert sum(removed) == 3100, (
@@ -324,10 +322,10 @@ class TestBoundaryIsStated:
 
     def test_refusals_name_an_owner(self):
         text = read(DOCS / "01-overview" / "02-positioning.md")
-        start = text.index("## 5. What tinyray refuses")
+        start = text.index("## 5. tinyray 拒绝什么")
         body = text[start : text.index("## 6.", start)]
-        assert "| Owner |" in body, "the refusal table must name who does own each item"
-        for refused in ("allocation", "tensor", "Consensus storage"):
+        assert "归属" in body, "拒绝表必须指明每一项由谁负责"
+        for refused in ("分配", "tensor", "共识存储"):
             assert refused in body, f"{refused!r} is not listed among the refusals"
 
     def test_no_resource_arguments_in_the_reference(self):
@@ -337,7 +335,7 @@ class TestBoundaryIsStated:
         the point. What must not appear is one of them as an argument.
         """
         api = read(DOCS / "07-reference" / "01-api.md")
-        start = api.index("## 11. Removed")
+        start = api.index("## 11. 从旧 API 中移除的部分")
         current, removed = api[:start], api[start:]
         for banned in ("num_gpus", "gpus_per_worker", "cpus_per_worker", "num_cpus"):
             used_as_parameter = re.search(rf"\b{banned}\s*[=:]", current)
@@ -351,6 +349,4 @@ class TestBoundaryIsStated:
         text = read(DOCS / "01-overview" / "03-principles.md")
         for n in range(1, 8):
             assert f"### P{n} " in text, f"principle P{n} is missing"
-        assert text.count("**Origin.**") >= 6, (
-            "principles must record the failure that produced them"
-        )
+        assert text.count("**由来。**") >= 6, "原则必须记录产生它的那次故障"

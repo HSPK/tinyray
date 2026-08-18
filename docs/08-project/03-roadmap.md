@@ -1,105 +1,97 @@
-# Roadmap
+# 路线图
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> Ordered by what each phase unblocks. Every phase is independently useful, and
-> none requires the next to be worth doing.
+> 按每个阶段解锁什么排序。每个阶段独立有价值，都不需要下一个阶段才值得做。
 
-## Phase 0 — Baseline and harness
+## 阶段 0 —— 基线与压测框架
 
-**Why first.** Every number in this proposal is derived or extrapolated. The
-harness that fixes that is also the cheapest thing to build, because a simulated
-worker is just a worker without an application.
+**为何排在最前。** 本提案中每个数字都是推导或外推。而修正这一点的框架恰恰是最便宜的一个，
+因为一个模拟 worker 就是一个没有应用的 worker。
 
-- Fake cluster harness, threaded and async modes
-- Chaos harness with a recorded injection timeline
-- Establish the "flat in worker count" assertions:
-  consensus writes, lookup bytes, summary bytes, metric cardinality
-- Collect real distributions: control latency, churn rate, failure rate
+- fake cluster 框架，线程与异步模式
+- 带注入时间线记录的 chaos 框架
+- 建立“与 worker 数无关”的断言：
+  共识写入、lookup 字节、summary 字节、指标基数
+- 采集真实分布：控制延迟、抖动率、故障率
 
-**Exit criterion.** 100,000 simulated workers in steady state, with the four
-flat metrics asserted rather than plotted.
+**出口条件。** 100,000 个模拟 worker 稳态运行，且那四条指标是被**断言**而不是被绘图。
 
-## Phase 1 — Identity and fencing
+## 阶段 1 —— Identity 与 fencing
 
-- `Slot`, `Incarnation`, fencing tokens
-- Enforcement in the transport, not at call sites
-- Supersession reporting and the callback
-- Chaos: restart while the old process is alive and still writing
+- `Slot`、`Incarnation`、fencing token
+- 在 transport 中强制，而不在调用点
+- 取代上报与回调
+- chaos：旧进程仍存活且仍在写入时重启
 
-**Exit criterion.** Split brain is fenced with both processes running.
+**出口条件。** 两个进程都在运行的情况下脑裂被 fence 住。
 
-## Phase 2 — Hierarchical membership
+## 阶段 2 —— 分层 Membership
 
-- Cell tier with worker leases terminating there
-- Fixed-size cell summary
-- Cell lease against consensus
-- Readiness composition and publication
-- Scoped discovery with version-based change detection
+- Cell 层，worker lease 终止于此
+- 固定大小的 Cell summary
+- Cell 对共识持有 lease
+- Readiness 组合与发布
+- 带版本变更检测的作用域 discovery
 
-**Exit criterion.** At 10,000 simulated workers, consensus write rate is flat and
-lookup size tracks scope rather than cluster size.
+**出口条件。** 10,000 个模拟 worker 下，共识写入速率保持不变，lookup 大小跟随作用域而非
+集群规模。
 
-## Phase 3 — Reconciliation
+## 阶段 3 —— Reconciliation
 
-- Consensus adapter over etcd
-- Leadership with fencing tokens
-- Desired/observed convergence loop
-- Membership epochs for operations needing a fixed set
-- Chaos: leader failover, old leader returning alive
+- 基于 etcd 的共识适配层
+- 带 fencing token 的 leadership
+- desired/observed 收敛循环
+- 为需要固定集合的操作提供 membership epoch
+- chaos：leader 切换、旧 leader 存活返回
 
-**Exit criterion.** A leader can be killed repeatedly with cells continuing to
-run and no stale write accepted.
+**出口条件。** 可以反复杀掉 leader，Cell 持续运行，且没有过期写入被接受。
 
-## Phase 4 — Removal
+## 阶段 4 —— 删除
 
-Only after the replacement is proven, because deleting first leaves a period
-where neither works.
+只在替代品被验证之后进行，因为先删会留下一段两边都不可用的时期。
 
-- Placement, resource table, gang placement
-- Actor launcher and prewarm pool
-- Driver-side head and supervision loop
-- `link()` roster push
-- Worker-group abstraction
-- Collective registry
+- placement、资源表、gang placement
+- actor launcher 与预热池
+- driver 侧 head 与监督循环
+- `link()` roster 推送
+- worker group 抽象
+- collective registry
 
-**Derived**: roughly 3,100 lines removed.
+**推导**：删除约 3,100 行。
 
-**Exit criterion.** No public API accepts a resource quantity, asserted
-structurally.
+**出口条件。** 没有公共 API 接受资源数量，由结构性测试断言。
 
-## Phase 5 — Production hardening
+## 阶段 5 —— 生产加固
 
-- Authentication, or a documented network-isolation requirement
-- Push-based watch
-- Log persistence beyond the ring buffer
-- Wire format versioning
+- 认证，或一份明确的网络隔离要求
+- 推送式 watch
+- 环形缓冲之外的日志持久化
+- wire format 版本化
 
-## Phase 6 — Real hardware
+## 阶段 6 —— 真实硬件
 
-Everything simulation cannot cover:
+模拟无法覆盖的一切：
 
-- Multi-node, end to end
-- Real GPU device assignment reporting
-- A real framework: SGLang, vLLM or Megatron, unmodified
-- NCCL behaviour under a cell rebuild
+- 端到端多机
+- 真实 GPU 设备分配上报
+- 一个真实框架：SGLang、vLLM 或 Megatron，未经修改
+- Cell 重建下的 NCCL 行为
 
-**Exit criterion.** A real job runs under this control plane with one line added
-to its worker script.
+**出口条件。** 一个真实作业在本控制面下运行，其 worker 脚本只加了一行。
 
-## Not planned
+## 不在计划内
 
-| Item | Why |
+| 事项 | 原因 |
 |---|---|
-| Data plane | L0's |
-| Resource allocation | L1's |
-| Task, sample or version semantics | L3's |
-| A distributed object store | Out of scope, permanently |
-| Elastic reshaping of a collective | The framework's |
-| Cross-cluster federation | No use case |
+| 数据面 | 属于 L0 |
+| 资源分配 | 属于 L1 |
+| task、sample 或 version 语义 | 属于 L3 |
+| 分布式对象存储 | 永久超出范围 |
+| collective 的弹性重塑 | 属于框架 |
+| 跨集群联邦 | 没有用例 |
 
-## Sequencing note
+## 关于排序的说明
 
-Phase 0 before Phase 1 is the load-bearing choice. Building the mechanisms first
-and measuring afterwards is how the previous design reached 0.2.1 before
-discovering that its central operation was quadratic.
+阶段 0 排在阶段 1 之前是承重的选择。先造机制、后做测量，正是此前的设计一直做到 0.2.1
+才发现其核心操作是二次复杂度的原因。

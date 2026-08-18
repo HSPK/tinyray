@@ -1,75 +1,73 @@
 # Identity
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> A name identifies a slot; an incarnation identifies the process currently
-> filling it. Every cross-process write carries one, and receivers reject the
-> stale.
+> 名字标识一个 Slot，Incarnation 标识当前占据它的进程。每次跨进程写入都携带 Incarnation，
+> 接收端拒绝过期的。
 
-## 1. Scope
+## 1. 范围
 
-Logical naming, incarnation generation, and fencing enforcement. Proposed source:
-`python/tinyray/identity.py` and the fencing check inside the transport.
+逻辑命名、Incarnation 生成，以及 fencing 的强制执行。计划源码：
+`python/tinyray/identity.py`，以及 transport 内的 fencing 校验。
 
-## 2. Responsibilities
+## 2. 职责
 
-- Define a stable logical name for a role in the cluster.
-- Issue an incarnation each time a process fills that role.
-- Attach the incarnation to every outbound write.
-- Reject an inbound write carrying a superseded incarnation.
-- Report supersession to the process that has been replaced.
+- 为集群中的一个角色定义稳定的逻辑名。
+- 每次有进程占据该角色时颁发一个 Incarnation。
+- 把 Incarnation 附加到每次对外写入上。
+- 拒绝携带已被取代 Incarnation 的入站写入。
+- 向被取代的进程报告这一事实。
 
-## 3. Non-responsibilities
+## 3. 非职责
 
-| Not done here | Owner |
+| 不在此处做 | 归属 |
 |---|---|
-| Deciding how many slots exist | Application (L3) |
-| Restarting a process | [08-supervision](08-supervision.md) or L1 |
-| Storing which incarnation is current | [02-membership](02-membership.md) |
-| Leader election | [03-reconciliation](03-reconciliation.md), over consensus |
-| What to do about being superseded | Application, via callback |
+| 决定有多少个 Slot | 应用（L3） |
+| 重启进程 | [08-supervision](08-supervision.md) 或 L1 |
+| 存储当前 Incarnation 是哪个 | [02-membership](02-membership.md) |
+| leader 选举 | [03-reconciliation](03-reconciliation.md)，基于共识 |
+| 被取代后该做什么 | 应用，经回调 |
 
-## 4. Position in the system
+## 4. 系统位置
 
-Every other module depends on this one. Membership records incarnations,
-discovery returns them, transport enforces them, reconciliation fences with
-them.
+其他每个模块都依赖它。membership 记录 Incarnation，discovery 返回它，transport 强制它，
+reconciliation 用它做 fencing。
 
-## 5. Dependencies
+## 5. 依赖
 
-- A monotonic local clock for the worker-level incarnation.
-- A consensus counter for cell-level and leader-level incarnations
-  ([02-architecture/03-state-model.md](../02-architecture/03-state-model.md)).
+- 一个单调的本地时钟，用于 worker 级 Incarnation。
+- 一个共识计数器，用于 Cell 级和 leader 级 Incarnation
+  （[02-architecture/03-state-model.md](../02-architecture/03-state-model.md)）。
 
-## 6. Public contract
+## 6. 公共契约
 
 | Interface | Input | Output | Side effect | Blocking | Failure |
 |---|---|---|---|---|---|
-| `Slot(kind, **coords)` | Role and coordinates | Slot | None | No | `ValueError` on malformed coordinates |
-| `Slot.incarnate()` | — | Incarnation | None | No | None |
-| `Incarnation.token()` | — | Comparable token | None | No | None |
-| `fence(inbound, current)` | Two tokens | `Accept` / `Stale` / `Unknown` | None | No | None |
-| `on_superseded(callback)` | Callable | — | Registers a hook | No | None |
+| `Slot(kind, **coords)` | 角色与坐标 | Slot | 无 | 否 | 坐标非法时 `ValueError` |
+| `Slot.incarnate()` | —— | Incarnation | 无 | 否 | 无 |
+| `Incarnation.token()` | —— | 可比较 token | 无 | 否 | 无 |
+| `fence(inbound, current)` | 两个 token | `Accept` / `Stale` / `Unknown` | 无 | 否 | 无 |
+| `on_superseded(callback)` | 可调用对象 | —— | 注册钩子 | 否 | 无 |
 
 ```python
 slot = tinyray.Slot("collector", cell="c07", index=3)
 me = slot.incarnate()
-str(slot)   # "collector/c07/3"        stable across restarts
-me.token()  # "collector/c07/3@1739... " unique to this process
+str(slot)   # "collector/c07/3"        跨重启稳定
+me.token()  # "collector/c07/3@1739..." 本进程唯一
 ```
 
-## 7. State ownership
+## 7. 状态所有权
 
 | State | Owner | Created | Updated by | Read by | Lifetime | Persisted |
 |---|---|---|---|---|---|---|
-| Slot name | Application | At construction | Never | Everyone | Experiment | No |
-| Incarnation | The process filling the slot | At `incarnate()` | Never | Membership, transport | Process | No |
-| Current incarnation per slot | Registry | At registration | Later registration | Fencing | Until lease expiry | No |
-| Cell/leader incarnation counter | Consensus | At first election | Each takeover | Fencing | Experiment | Yes |
+| Slot 名 | 应用 | 构造时 | 从不 | 所有人 | 实验期 | 否 |
+| Incarnation | 占据该 Slot 的进程 | `incarnate()` 时 | 从不 | membership、transport | 进程期 | 否 |
+| 每个 Slot 的当前 Incarnation | Registry | 注册时 | 后续注册 | fencing | 直到 lease 过期 | 否 |
+| Cell/leader Incarnation 计数器 | 共识 | 首次选举 | 每次接管 | fencing | 实验期 | 是 |
 
-An incarnation is immutable. A process that needs a new one is a new process.
+Incarnation 不可变。需要新 Incarnation 的进程就是一个新进程。
 
-## 8. Lifecycle
+## 8. 生命周期
 
 ```mermaid
 stateDiagram-v2
@@ -82,139 +80,125 @@ stateDiagram-v2
     Expired --> [*]
 ```
 
-- **Current** — the registry holds this incarnation for the slot.
-- **Superseded** — a later incarnation took the slot. Writes are rejected.
-- **Expired** — the lease lapsed. Writes are rejected until re-registration.
+- **Current** —— Registry 为该 Slot 持有此 Incarnation。
+- **Superseded** —— 更晚的 Incarnation 拿走了该 Slot，写入被拒绝。
+- **Expired** —— lease 失效，写入被拒绝直到重新注册。
 
-The distinction matters: superseded means *someone else has it*, expired means
-*nobody has it*. The first must not re-register blindly; the second must.
+区别很重要：superseded 意味着**别人拿走了**，expired 意味着**没人拿着**。前者绝不能盲目
+重新注册，后者必须重新注册。
 
-## 9. Main flow
+## 9. 主流程
 
 ```mermaid
 sequenceDiagram
-    participant A as Process A (old)
+    participant A as 进程 A（旧）
     participant R as Registry
-    participant B as Process B (new)
-    participant P as Peer
+    participant B as 进程 B（新）
+    participant P as peer
 
     A->>R: register(slot, inc=1)
-    P->>A: call fenced with inc=1
-    Note over A: A hangs but is not dead
+    P->>A: 以 inc=1 fencing 的调用
+    Note over A: A 挂住但未死
     B->>R: register(slot, inc=2)
-    R-->>B: accepted, replaced inc=1
+    R-->>B: 接受，替换 inc=1
     A->>R: heartbeat(inc=1)
     R-->>A: superseded
-    Note over A: A stops asserting and reports
+    Note over A: A 停止声明并报告
     P->>R: lookup(slot)
     R-->>P: B, inc=2
-    P->>B: call fenced with inc=2
+    P->>B: 以 inc=2 fencing 的调用
 ```
 
-The diagram cannot show: A's in-flight call to a third party is rejected on
-arrival because it carries inc=1; and the registry never asked whether A was
-alive — it only recorded that B arrived later.
+图中无法表达：A 发往第三方的在途调用因携带 inc=1 而在到达时被拒；Registry 从未询问过 A
+是否存活 —— 它只记录了 B 来得更晚。
 
-## 10. Concurrency and distributed semantics
+## 10. 并发与分布式语义
 
-**Incarnation construction.** Worker-level incarnations are built from a
-monotonic local source and need only be **ordered within one slot**, never
-globally unique. Two different slots may hold equal tokens; nothing compares
-across slots.
+**Incarnation 构造。** worker 级 Incarnation 由单调本地来源构造，只需**在单个 Slot 内
+有序**，绝不需要全局唯一。两个不同 Slot 的 token 可以相等，因为没有任何地方跨 Slot 比较。
 
-Cell-level and leader-level incarnations come from a consensus counter, because
-those must survive a total loss of the soft store.
+Cell 级和 leader 级 Incarnation 来自共识计数器，因为它们必须在软存储全量丢失后仍然存活。
 
-**Comparison.** Tokens are compared for equality, not ordering, on the receive
-path. Ordering is used only by the registry when deciding which registration
-wins, and there "the later arrival wins" is by arrival, not by token value —
-which keeps the design free of clock assumptions.
+**比较。** 接收路径上 token 只比较相等性，不比较大小。大小只在 Registry 判定哪次注册
+胜出时使用，而那里用的是**到达顺序**而非 token 数值 —— 这使设计不依赖任何时钟假设。
 
-**Fencing is applied by the transport**, not by each caller. Fifteen hand-written
-checks is fifteen chances to write the one that always passes.
+**fencing 由 transport 施加**，不由各调用点施加。十五份手写校验就是十五次写出“永远通过”
+那份的机会。
 
-## 11. Correctness invariants
+## 11. 正确性不变量
 
-- A slot name never encodes placement — no node, no device, no address.
-- An incarnation is never reused by a different process.
-- A write carrying a superseded incarnation is rejected, at every tier.
-- A superseded process never re-registers automatically; it reports instead.
-- An expired process re-registers rather than exiting.
-- Fencing is enforced by the receiver, never assumed by the sender.
+- Slot 名从不编码位置 —— 不含节点、设备、地址。
+- Incarnation 绝不被另一个进程复用。
+- 携带已取代 Incarnation 的写入在每一层都被拒绝。
+- 被取代的进程绝不自动重新注册，而是报告。
+- 过期的进程重新注册，而不是退出。
+- fencing 由接收端强制，绝不由发送端假定。
 
-## 12. Failure handling
+## 12. 故障处理
 
-| Failure | Detected by | Response |
+| 故障 | 检测方 | 响应 |
 |---|---|---|
-| Slow process resumes after replacement | Heartbeat returns superseded | Stops asserting; invokes `on_superseded` |
-| Registry never saw the registration | Heartbeat returns unknown | Re-registers |
-| Two processes register the same slot | Registry | Later wins; earlier learns on next heartbeat |
-| Registry lost all state | Heartbeat returns unknown | Everyone re-registers within one interval |
-| Stale call arrives at a peer | Transport fencing | Rejected with a fencing error |
+| 慢进程在被替换后恢复 | heartbeat 返回 superseded | 停止声明；触发 `on_superseded` |
+| Registry 从未见过该注册 | heartbeat 返回 unknown | 重新注册 |
+| 两个进程注册同一 Slot | Registry | 后者胜出；前者在下次 heartbeat 得知 |
+| Registry 丢失全部状态 | heartbeat 返回 unknown | 所有人在一个间隔内重新注册 |
+| 过期调用到达 peer | transport fencing | 以 fencing 错误拒绝 |
 
-**What a superseded process does** is the application's decision. tinyray
-defaults to logging at critical severity and invoking the callback; it does not
-terminate the process, because a library that calls `os._exit` inside a training
-job is worse than the problem it solves.
+**被取代的进程该做什么**由应用决定。tinyray 默认以 critical 级别记录日志并触发回调，
+不终止进程 —— 一个在训练作业里调用 `os._exit` 的库，比它要解决的问题更糟。
 
-The default is safe because supersession already stops the *addressing*: peers
-look up the new incarnation and the old one's writes are fenced out. The
-callback exists for applications that also want the process gone.
+这个默认值是安全的，因为取代本身已经停止了**寻址**：peer 会查到新的 Incarnation，旧进程
+的写入被 fence 出去。回调留给同时希望旧进程消失的应用。
 
-## 13. Configuration
+## 13. 配置
 
 | Field | Type | Default | Validation | Reader | Effect |
 |---|---|---|---|---|---|
-| `on_superseded` | callable or None | None | Callable | Membership heartbeat | Invoked once on supersession |
-| `fence_mode` | `strict` / `warn` | `strict` | Enum | Transport | `warn` logs instead of rejecting; for migration only |
+| `on_superseded` | callable 或 None | None | 可调用 | membership heartbeat | 取代发生时触发一次 |
+| `fence_mode` | `strict` / `warn` | `strict` | 枚举 | transport | `warn` 只记录不拒绝；仅用于迁移 |
 
-`fence_mode=warn` exists so an existing system can adopt fencing incrementally
-and observe what would have been rejected. It is not a production setting.
+`fence_mode=warn` 的存在是为了让已有系统能渐进接入 fencing 并观察哪些会被拒绝。它不是
+生产设置。
 
-## 14. Observability
+## 14. 可观测性
 
 | Metric | Producer | Meaning |
 |---|---|---|
-| `identity_incarnations_total` | Worker | Restarts of this slot |
-| `fencing_rejections_total` | Receiver | Stale writers refused |
-| `identity_superseded_total` | Worker | Times this process was replaced |
-| `identity_reregistrations_total` | Worker | Recoveries from an unknown lease |
+| `identity_incarnations_total` | worker | 该 Slot 的重启次数 |
+| `fencing_rejections_total` | 接收端 | 被拒的过期写入者 |
+| `identity_superseded_total` | worker | 本进程被替换的次数 |
+| `identity_reregistrations_total` | worker | 从 unknown lease 恢复的次数 |
 
-A non-zero `fencing_rejections_total` in steady state means processes are being
-replaced while still running — expected during restarts, worth investigating
-otherwise.
+稳态下 `fencing_rejections_total` 非零，意味着有进程在仍然运行时被替换 —— 重启期间属于
+预期，其余时候值得调查。
 
-## 15. Testing
+## 15. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| Later registration supersedes earlier | `tests/test_identity.py` | `test_later_registration_wins` | Unit |
-| Superseded heartbeat is reported, not raised | `tests/test_identity.py` | `test_superseded_is_reported` | Unit |
-| Superseded process does not re-register | `tests/test_identity.py` | `test_superseded_does_not_reregister` | Unit |
-| Unknown lease triggers re-registration | `tests/test_identity.py` | `test_unknown_lease_reregisters` | Unit |
-| Stale call is rejected by a peer | `tests/test_identity.py` | `test_peer_rejects_stale_incarnation` | Integration |
-| Fencing needs no caller cooperation | `tests/test_suite_quality.py` | `test_fencing_is_in_the_transport` | Structural |
-| Split brain during restart | `tests/test_chaos.py` | `test_restart_while_old_process_lives` | Chaos |
+| 后注册取代先注册 | `tests/test_identity.py` | `test_later_registration_wins` | Unit |
+| superseded 被上报而非抛出 | `tests/test_identity.py` | `test_superseded_is_reported` | Unit |
+| 被取代的进程不重新注册 | `tests/test_identity.py` | `test_superseded_does_not_reregister` | Unit |
+| unknown lease 触发重新注册 | `tests/test_identity.py` | `test_unknown_lease_reregisters` | Unit |
+| peer 拒绝过期调用 | `tests/test_identity.py` | `test_peer_rejects_stale_incarnation` | Integration |
+| fencing 不需要调用方配合 | `tests/test_suite_quality.py` | `test_fencing_is_in_the_transport` | Structural |
+| 重启期间的脑裂 | `tests/test_chaos.py` | `test_restart_while_old_process_lives` | Chaos |
 
-The chaos case is the one that matters, and it must run with the old process
-**still alive** — a test that kills the old process first proves nothing about
-fencing.
+chaos 那条是关键，而且必须在旧进程**仍然存活**的条件下运行 —— 先杀掉旧进程的测试证明不了
+任何关于 fencing 的事。
 
-## 16. Limitations and trade-offs
+## 16. 限制与取舍
 
-- **Fencing does not stop a superseded process from doing local damage.** It
-  stops it being addressed and stops its writes landing. A process still holding
-  a GPU or a communicator rank is L1's and the application's problem.
-- **Worker incarnations rely on a monotonic local clock.** A clock stepping
-  backwards across a restart could produce a token that compares equal to its
-  predecessor's. Mitigated by including the process id, and by the registry
-  deciding by arrival order rather than token value.
-- **`fence_mode=warn` is unsafe** and exists only for migration.
+- **fencing 阻止不了被取代的进程在本地造成破坏。** 它阻止的是该进程被寻址、其写入落地。
+  仍占着 GPU 或 communicator rank 的进程是 L1 和应用的问题。
+- **worker Incarnation 依赖单调本地时钟。** 跨重启回拨的时钟可能产生与前身相等的 token。
+  缓解手段是把 pid 纳入构造，以及 Registry 按到达顺序而非 token 数值判定。
+- **`fence_mode=warn` 不安全**，只用于迁移。
 
-## 17. Source mapping
+## 17. 源码映射
 
-Proposed: `python/tinyray/identity.py`; fencing enforcement in
-`crates/tinyray-runtime/src/actor.rs` and the client path.
+计划：`python/tinyray/identity.py`；fencing 强制位于
+`crates/tinyray-runtime/src/actor.rs` 及客户端路径。
 
-Related: [02-membership](02-membership.md) records the current incarnation;
-[04-protocols/03-control-rpc.md](../04-protocols/03-control-rpc.md) carries it.
+相关：[02-membership](02-membership.md) 记录当前 Incarnation；
+[04-protocols/03-control-rpc.md](../04-protocols/03-control-rpc.md) 携带它。

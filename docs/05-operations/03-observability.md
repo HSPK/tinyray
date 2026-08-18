@@ -1,62 +1,59 @@
-# Observability
+# 可观测性
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> One question dominates distributed ML debugging: which worker is stuck, and on
-> what. Everything here exists to answer it.
+> 分布式 ML 排障中占主导地位的只有一个问题：哪个 worker 卡住了，卡在什么上。这里的一切都
+> 是为了回答它。
 
-## 1. Problem
+## 1. 问题
 
-At ten thousand workers, aggregate metrics hide the failure. Mean latency is
-healthy while one cell is dead, and a job that has stopped making progress looks
-identical to one that is merely slow.
+一万个 worker 的规模下，聚合指标会掩盖故障。一个 Cell 已经死了而平均延迟依然健康；一个
+已经不再前进的作业，和一个只是慢的作业看起来一模一样。
 
-## 2. Goals
+## 2. 目标
 
-- Answer "which worker is stuck, and on what" in one command.
-- Report a worker's own belief, not a controller's guess.
-- Keep metric cardinality independent of worker count at the global tier.
+- 用一条命令回答“哪个 worker 卡住了，卡在什么上”。
+- 上报 worker 自己的判断，而不是控制器的猜测。
+- 让 global 层的指标基数与 worker 数无关。
 
-## 3. Non-goals
+## 3. 非目标
 
-- Storing metrics. tinyray exposes; a TSDB stores.
-- Aggregating another layer's metrics.
-- Log storage. Output goes to object storage asynchronously, not through any
-  controller.
+- 存储指标。tinyray 暴露，TSDB 存储。
+- 聚合其他层的指标。
+- 日志存储。输出异步进入对象存储，不经过任何控制器。
 
-## 4. Design
+## 4. 设计
 
-### 4.1 Endpoints
+### 4.1 Endpoint
 
-| Path | Content | Format |
+| 路径 | 内容 | 格式 |
 |---|---|---|
-| `/health` | Alive, identity, draining | JSON |
-| `/introspect` | Queues, readiness reasons, inflight method and duration, admission depth, incarnation | JSON |
-| `/metrics` | Counters and gauges | Prometheus |
+| `/health` | 存活、身份、是否 draining | JSON |
+| `/introspect` | 队列、readiness 原因、inflight 方法与时长、Admission 深度、Incarnation | JSON |
+| `/metrics` | 计数器与量表 | Prometheus |
 
-`/health` and `/introspect` are plain JSON so `curl` works with no tinyray
-client. They are served by the native transport, so a worker whose Python is
-blocked still answers — which is exactly when the answer is needed.
+`/health` 和 `/introspect` 是纯 JSON，因此不需要 tinyray 客户端，`curl` 就能用。它们由
+原生 transport 服务，所以一个 Python 已经卡住的 worker 仍然会应答 —— 而那正是最需要答案的
+时刻。
 
-### 4.2 Hierarchical reduction
+### 4.2 分层归约
 
-| Tier | Cardinality | Reports |
+| 层 | 基数 | 上报 |
 |---|---|---|
-| Worker | Per worker, scraped locally | Readiness, queues, inflight, admission |
-| Cell | Per cell | Ready capacity, evictions, churn, control latency |
-| Global | Per cluster | Live cells, unavailable capacity, leader changes, consensus writes |
+| worker | 每 worker，本地抓取 | Readiness、队列、inflight、Admission |
+| Cell | 每 Cell | ready 容量、驱逐数、抖动、控制延迟 |
+| global | 每集群 | 存活 Cell、不可用容量、leader 变更、共识写入速率 |
 
-Per-worker series never reach the global tier. Ten thousand workers times a
-dozen series is a cardinality problem in the monitoring system, which then fails
-at the same time as the cluster.
+per-worker 时间序列绝不上到 global 层。一万个 worker 乘十几条序列，在监控系统里就是基数
+问题 —— 然后它会和集群同时挂掉。
 
-### 4.3 The diagnostic command
+### 4.3 诊断命令
 
 ```
-tinyray status <cell-or-endpoint>...
+tinyray status <cell-或-endpoint>...
 ```
 
-One line per worker, then anything that looks wrong:
+每个 worker 一行，然后列出所有看起来不对的：
 
 ```
 ENDPOINT              READY  INFLIGHT        SECS  QUEUED  DEPTH  INCARNATION
@@ -64,89 +61,82 @@ ENDPOINT              READY  INFLIGHT        SECS  QUEUED  DEPTH  INCARNATION
 10.0.3.8:41234        no     -                0.0       0      0  @1739..b2
 
 Problems:
-  - 10.0.3.8 not ready: model_version_in_window failed
-  - 10.0.4.1 waiting for seq 7 from caller 3f2a with 4 buffered (a call was lost)
-  - 10.0.4.2 refused 340 calls for backpressure; slower than its callers
-  - 10.0.5.9 in train_step for 94.2s against a median of 12.1s: likely straggler
+  - 10.0.3.8 未就绪：model_version_in_window 失败
+  - 10.0.4.1 正在等待调用方 3f2a 的 seq 7，其后已缓冲 4 个（有一次调用丢失）
+  - 10.0.4.2 因 backpressure 拒绝了 340 次调用；它比它的调用方慢
+  - 10.0.5.9 已在 train_step 中 94.2s，中位数为 12.1s：疑似掉队者
 ```
 
-Exit status 0 when clean, 1 when a problem was found. Straggler detection needs
-at least three running workers to have a median worth comparing against.
+无问题时退出码 0，发现问题时 1。掉队者检测至少需要三个运行中的 worker，才有一个值得比较的
+中位数。
 
-### 4.4 Metric groups
+### 4.4 指标分组
 
-| Group | Key series |
+| 组 | 关键序列 |
 |---|---|
-| Membership | `membership_live`, `membership_evictions_total`, `membership_version` |
-| Identity | `fencing_rejections_total`, `identity_superseded_total` |
-| Readiness | `readiness_current`, `readiness_failures_by_reason`, `readiness_transitions_total` |
-| Discovery | `discovery_response_bytes`, `discovery_served_from_stale_total` |
-| Admission | `admission_depth`, `admission_rejections_total`, `admission_pressured_seconds` |
-| Transport | `control_bytes_sent`, `control_retries_total`, `queue_waiting_for` |
-| Reconciliation | `reconcile_iterations_total`, `leader_changes_total`, `epoch_current` |
-| Consensus | `consensus_writes_total` |
+| Membership | `membership_live`、`membership_evictions_total`、`membership_version` |
+| Identity | `fencing_rejections_total`、`identity_superseded_total` |
+| Readiness | `readiness_current`、`readiness_failures_by_reason`、`readiness_transitions_total` |
+| Discovery | `discovery_response_bytes`、`discovery_served_from_stale_total` |
+| Admission | `admission_depth`、`admission_rejections_total`、`admission_pressured_seconds` |
+| Transport | `control_bytes_sent`、`control_retries_total`、`queue_waiting_for` |
+| Reconciliation | `reconcile_iterations_total`、`leader_changes_total`、`epoch_current` |
+| 共识 | `consensus_writes_total` |
 
-### 4.5 The four that matter most
+### 4.5 最重要的四条
 
-| Series | Why |
+| 序列 | 原因 |
 |---|---|
-| `control_bytes_*` growing with workload | A payload has entered the control plane |
-| `consensus_writes_total` growing with worker count | The state split has been violated |
-| `discovery_response_bytes` growing with cluster size | Scoping has been bypassed |
-| `queue_waiting_for` non-empty | A caller is permanently stalled |
+| `control_bytes_*` 随工作负载增长 | 有 payload 进入了控制面 |
+| `consensus_writes_total` 随 worker 数增长 | 状态拆分被违反了 |
+| `discovery_response_bytes` 随集群规模增长 | 作用域机制被绕过了 |
+| `queue_waiting_for` 非空 | 有调用方被永久卡住 |
 
-Each is a design invariant expressed as a metric, so a regression is visible in
-production and not only in tests.
+每一条都是一个用指标表达的设计不变量，因此回退在生产中可见，而不只在测试中可见。
 
-## 5. Normal flow
+## 5. 正常流程
 
-Scrape workers locally, reduce at the cell, expose cluster-level series at
-global. Diagnosis goes the other way: global says which cell, the cell says
-which worker, the worker says which method.
+在本地抓取 worker，在 Cell 归约，在 global 暴露集群级序列。诊断方向相反：global 说是哪个
+Cell，Cell 说是哪个 worker，worker 说是哪个方法。
 
-## 6. State and ownership
+## 6. 状态与所有权
 
-All observability state is soft and process-local. Nothing is persisted by
-tinyray.
+全部可观测性状态都是软状态且进程本地。tinyray 不持久化任何东西。
 
-## 7. Correctness invariants
+## 7. 正确性不变量
 
-- `/health` and `/introspect` answer while the worker's Python is blocked.
-- A worker reports its own belief; no tier fabricates a verdict for a tier below.
-- Global-tier cardinality is independent of worker count.
-- A negative readiness verdict always carries a reason.
-- Logs never pass through a controller.
+- worker 的 Python 阻塞时，`/health` 和 `/introspect` 仍然应答。
+- worker 上报自己的判断；没有哪一层替下层编造裁决。
+- global 层基数与 worker 数无关。
+- 否定的 readiness 裁决必定携带原因。
+- 日志绝不经过控制器。
 
-## 8. Failure and recovery
+## 8. 故障与恢复
 
-| Failure | Effect |
+| 故障 | 影响 |
 |---|---|
-| Scrape fails | Series go stale; the worker is unaffected |
-| TSDB down | No history; the cluster is unaffected |
-| `/introspect` unreachable | Reported as `UNREACHABLE`, distinct from unhealthy |
+| 抓取失败 | 序列变陈旧；worker 不受影响 |
+| TSDB 宕机 | 没有历史；集群不受影响 |
+| `/introspect` 不可达 | 上报为 `UNREACHABLE`，与不健康区分 |
 
-## 9. Observability of the observability
+## 9. 可观测性自身的可观测性
 
-`tinyray status` reports which endpoints did not answer, rather than omitting
-them. A missing row is worse than an error row.
+`tinyray status` 会列出哪些 endpoint 没有应答，而不是把它们省略。缺失的一行比一行报错更糟。
 
-## 10. Trade-offs
+## 10. 取舍
 
-- **No storage.** A deployment without a TSDB keeps only what `tinyray status`
-  shows now.
-- **No cluster-wide discovery in the CLI.** `status` takes endpoints or a cell.
-  Getting them is a lookup.
-- **Straggler detection needs three workers** and is a heuristic.
-- **Log persistence is missing.** Output is a 200-line ring buffer per process,
-  and when a process dies the ring is what remains. On the
-  [roadmap](../08-project/03-roadmap.md).
+- **不存储。** 没有 TSDB 的部署只保留 `tinyray status` 当下显示的内容。
+- **CLI 内没有集群级发现。** `status` 接受 endpoint 或一个 Cell。获取它们需要一次 lookup。
+- **掉队者检测需要三个 worker**，且是启发式的。
+- **缺少日志持久化。** 每进程 200 行环形缓冲，进程死后剩下的就是它。在
+  [roadmap](../08-project/03-roadmap.md) 上。
 
-## 11. Implementation and testing
+## 11. 实现与测试
 
-| Behaviour | Test |
+| Behavior | Test file |
 |---|---|
-| `/introspect` answers while Python is blocked | `tests/test_observability.py` |
-| Global cardinality does not track worker count | `tests/test_fake_cluster.py` |
-| `status` exits non-zero on a problem | `tests/test_observability.py` |
-| A stalled queue appears in `status` | `tests/test_transport.py` |
-| Every negative verdict has a reason | `tests/test_readiness.py` |
+| Python 阻塞时 `/introspect` 仍应答 | `tests/test_observability.py` |
+| global 基数不随 worker 数变化 | `tests/test_fake_cluster.py` |
+| 有问题时 `status` 退出码非零 | `tests/test_observability.py` |
+| 停滞的队列出现在 `status` 中 | `tests/test_transport.py` |
+| 每个否定裁决都有原因 | `tests/test_readiness.py` |

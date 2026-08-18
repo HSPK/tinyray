@@ -1,170 +1,152 @@
-# The problem
+# 问题
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> A control plane at ten thousand workers fails from quadratic relationships and
-> hand-written liveness, not from slow code. The previous tinyray design had
-> both, and neither can be patched.
+> 万卡控制面的崩溃来自二次复杂度关系和手写存活性判断，不是来自代码慢。此前的
+> tinyray 设计两样都有，而且都不是能修补的。
 
-## 1. Scope
+## 1. 范围
 
-This document records why the previous tinyray design cannot reach the target
-scale, using measurements from this repository. It is the input to
-[02-positioning.md](02-positioning.md).
+本文用本仓库的实测数据记录此前的 tinyray 设计为何无法达到目标规模，是
+[02-positioning.md](02-positioning.md) 的输入。
 
-Every number below is labelled **measured**, **derived** or **to be measured**,
-per [00-conventions.md §9](../00-conventions.md#9-numbers).
+以下每个数字都按 [00-conventions.md §9](../00-conventions.md#9-数字) 标注为
+**实测**、**推导** 或 **待测**。
 
-## 2. What the previous design assumed
+## 2. 此前设计的三条假设
 
-Three assumptions, all made when the target was 32 actors on one machine:
+三条假设都是在“单机 32 个 actor”这个目标下做出的：
 
-| Assumption | Consequence |
+| 假设 | 后果 |
 |---|---|
-| tinyray starts the processes | A launcher, a placement engine and a resource table |
-| tinyray assigns the GPUs | `num_gpus` on every API, a device ledger, gang placement |
-| The driver is at the centre | Every message relayed; `link()` pushes the whole roster |
+| tinyray 拉起进程 | 需要 launcher、placement 引擎和资源表 |
+| tinyray 分配 GPU | 每个 API 带 `num_gpus`，需要设备账本和 gang placement |
+| driver 在中心 | 所有消息中转；`link()` 推送完整 roster |
 
-At the original scale all three were reasonable. At ten thousand they are all
-false: the job is started by Slurm, Kubernetes or `torchrun`, the GPUs were
-allocated before tinyray was imported, and a single driver cannot be on the path
-of a loop that runs across the cluster.
+在原定规模下这三条都合理。到万卡全部不成立：作业由 Slurm、Kubernetes 或 `torchrun`
+拉起，GPU 在 tinyray 被 import 之前就已分配，而单个 driver 不可能处在一个跨集群运行的
+循环的路径上。
 
-## 3. The roster push is quadratic
+## 3. Roster 推送是二次的
 
-`link()` sent every member the endpoints of every member.
+`link()` 把每个成员的 endpoint 发给每个成员。
 
-**Measured**, `tinyray.serde.serialize` on a two-group roster of `N` entries
-(32-hex actor id, `host:port`, integer rank):
+**实测**，用 `tinyray.serde.serialize` 对含 `N` 条记录的双 group roster
+（32 位十六进制 actor id、`host:port`、整型 rank）测量：
 
-| N | Roster per push | Total pushed |
+| N | 每次推送的 roster | 总推送量 |
 |---:|---:|---:|
 | 128 | 4.2 KB | 0.001 GB |
 | 1,024 | 34.0 KB | 0.035 GB |
 | 8,192 | 277.7 KB | **2.275 GB** |
 
-The push is O(N) calls carrying O(N) bytes each, from one process. At 8,192
-workers a single introduction moves 2.3 GB out of the driver; at 10,000 it is
-**derived** as 3.4 GB.
+推送是 O(N) 次调用，每次携带 O(N) 字节，全部从一个进程发出。8,192 个 worker 时一次
+介绍就从 driver 搬走 2.3 GB；10,000 时**推导**为 3.4 GB。
 
-Nothing about this is fixable by making the driver faster. The roster itself is
-the wrong shape: a worker is being told about 9,999 peers to reach the four it
-needs.
+把 driver 写得更快解决不了任何问题。roster 本身的形状就是错的：告诉一个 worker
+9,999 个 peer，只为了让它找到需要的那四个。
 
-## 4. Fan-out from one process is linear and serial
+## 4. 单进程扇出是线性且串行的
 
-**Measured**, 16 real worker processes on one machine, warm connections:
+**实测**，单机 16 个真实 worker 进程，连接已预热：
 
-| Operation | 16 workers | Per worker |
+| 操作 | 16 worker | 每 worker |
 |---|---:|---:|
 | `link()` | 3.7 ms | 233 µs |
-| `run()` fan-out | 3.5 ms | 221 µs |
+| `run()` 扇出 | 3.5 ms | 221 µs |
 
-**Derived** at 10,000 workers: 2.3 s for an introduction, 2.2 s for every
-broadcast. For a control operation that is survivable once and fatal per
-iteration.
+**推导**到 10,000 个 worker：一次介绍 2.3 s，每次广播 2.2 s。作为一次性控制操作勉强能
+接受，作为每轮迭代的操作是致命的。
 
-## 5. Liveness cannot come from a supervisor that did not start anything
+## 5. 没拉起过任何东西的 supervisor 无法判断存活
 
-The previous design detected death by supervising child processes. When the
-launcher is Slurm or Kubernetes, tinyray has no children, so this mechanism does
-not merely scale badly — it does not exist.
+此前的设计通过监督子进程来检测死亡。当 launcher 是 Slurm 或 Kubernetes 时，tinyray
+没有子进程，所以这套机制不是扩展性差 —— 它根本不存在。
 
-The replacement must be a lease: the worker asserts its own liveness, and
-absence is the signal.
+替代方案只能是 lease：worker 自己声明存活，缺席即信号。
 
-**Measured**, single registry replica, a single sequential client:
+**实测**，单 registry 副本，单个串行客户端：
 
-| Operation | Throughput |
+| 操作 | 吞吐 |
 |---|---:|
 | `register` | 4,168 ops/s |
 | `heartbeat` | 4,295 ops/s |
-| `lookup` (8 ranks) | 1,933 ops/s |
+| `lookup`（8 个 rank） | 1,933 ops/s |
 
-**Derived**: 10,000 workers at a 10 s heartbeat is 1,000 ops/s, so one replica
-holds 4.3x headroom. The measurement is a lower bound because the client was
-sequential; the server was not saturated.
+**推导**：10,000 个 worker 按 10 s heartbeat 是 1,000 ops/s，单副本有 4.3 倍余量。
+由于客户端是串行的，服务端并未饱和，这个数字是下界。
 
-## 6. Leases must not go to a consensus store
+## 6. Lease 不能放进共识存储
 
-The natural instinct is to put every worker's lease in etcd. Public data says
-otherwise:
+直觉是把每个 worker 的 lease 放进 etcd。公开数据不支持这个做法：
 
-| Fact | Source |
+| 事实 | 来源 |
 |---|---|
-| Kubernetes officially supports up to 5,000 nodes | [Considerations for large clusters](https://kubernetes.io/docs/setup/best-practices/cluster-large/) |
-| Node leases refresh every 10 s and are a documented source of etcd pressure | same |
-| Every lease renewal commits through Raft, bounded by the slowest member's disk | [etcd performance](https://etcd.io/docs/v3.4/op-guide/performance/) |
-| Standard mitigation is a longer interval or a separate etcd | same |
+| Kubernetes 官方支持上限 5,000 节点 | [大集群指南](https://kubernetes.io/docs/setup/best-practices/cluster-large/) |
+| 节点 lease 每 10 s 续约，是 etcd 压力的已知来源 | 同上 |
+| 每次 lease 续约都走 Raft 提交，受最慢成员磁盘限制 | [etcd 性能](https://etcd.io/docs/v3.4/op-guide/performance/) |
+| 标准缓解手段是拉长间隔或拆分 etcd | 同上 |
 
-Ten thousand worker leases is twice the entire node budget of a supported
-Kubernetes cluster, on top of whatever that cluster is already doing. Leases
-must therefore be **hierarchical**: workers lease against their cell, cells
-lease against consensus. Consensus then sees O(cells), not O(workers). See
-[02-architecture/02-topology.md](../02-architecture/02-topology.md).
+一万个 worker lease 是一个受支持 Kubernetes 集群全部节点预算的两倍，而且要叠加在该
+集群本身的负载之上。因此 lease 必须**分层**：worker 对自己的 Cell 持有 lease，Cell 对
+共识存储持有 lease。共识存储看到的是 O(cells) 而不是 O(workers)。见
+[02-architecture/02-topology.md](../02-architecture/02-topology.md)。
 
-## 7. Failure is continuous at this scale
+## 7. 这个规模下故障是连续的
 
-**To be measured** on the target cluster, but the public data is unambiguous:
+目标集群上的数据**待测**，但公开数据已经足够明确：
 
-| System | Scale | Reliability |
+| 系统 | 规模 | 可靠性 |
 |---|---:|---|
-| Llama 3 405B | 16,384 H100 | 419 unplanned interruptions in 54 days — **derived** 3.09 h mean interval; 78% hardware |
-| Meta research clusters | 16,384 GPU | Predicted MTTF **1.8 hours** |
-| MegaScale | 12,288 GPU | Over 100 automatic repairs in one production run |
+| Llama 3 405B | 16,384 H100 | 54 天内 419 次非计划中断 —— **推导**平均间隔 3.09 小时；78% 为硬件原因 |
+| Meta 研究集群 | 16,384 GPU | 预测 MTTF **1.8 小时** |
+| MegaScale | 12,288 GPU | 单次生产训练中自动修复超过 100 次 |
 
-Sources: [Llama 3](https://arxiv.org/abs/2407.21783),
-[Reliability in large-scale ML clusters](https://arxiv.org/abs/2410.21680),
-[MegaScale](https://arxiv.org/abs/2402.15627).
+来源：[Llama 3](https://arxiv.org/abs/2407.21783)、
+[大规模 ML 集群可靠性](https://arxiv.org/abs/2410.21680)、
+[MegaScale](https://arxiv.org/abs/2402.15627)。
 
-A control plane whose recovery unit is "the job" will spend most of its life
-recovering. The unit must be smaller than the job, and the design must assume a
-failure is in progress at all times.
+恢复单元是“整个作业”的控制面，会把大部分生命耗在恢复上。恢复单元必须小于作业，且设计
+必须假设任何时刻都有故障正在发生。
 
-## 8. Global operations degrade superlinearly in success probability
+## 8. 全局操作的成功率随规模超线性恶化
 
-**Derived**, for a control operation repeated `n` times where each attempt's
-final success probability after retries is `p`:
+**推导**，某控制操作重复 `n` 次，每次在 retry 之后的最终成功率为 `p`：
 
-| p | n = 5,000,000 all succeed |
+| p | n = 5,000,000 全部成功 |
 |---:|---:|
 | 99.999% | 1.9e-22 |
 | 99.9999% | 0.67% |
 | 99.99999% | 60.7% |
 | 99.999999% | 95.1% |
 
-Any design that requires every member to complete an operation, repeated per
-iteration, needs a per-operation reliability that no distributed system
-achieves. The conclusion is not "retry harder"; it is that **no global operation
-may require all members**.
+任何要求全体成员完成、且每轮迭代重复的设计，都需要没有任何分布式系统能达到的单次可靠性。
+结论不是“多重试几次”，而是**任何全局操作都不得要求全体成员**。
 
-## 9. What follows
+## 9. 由此得出的替换
 
-| Broken assumption | Replacement |
+| 失效假设 | 替代方案 |
 |---|---|
-| Full roster push | Scoped lookup, bounded by the request — [03-modules/05-discovery.md](../03-modules/05-discovery.md) |
-| Driver fan-out | Hierarchy; the global tier addresses cells — [02-architecture/02-topology.md](../02-architecture/02-topology.md) |
-| Supervision by parenthood | Leases — [03-modules/02-membership.md](../03-modules/02-membership.md) |
-| Leases in consensus | Hierarchical leases — [02-architecture/03-state-model.md](../02-architecture/03-state-model.md) |
-| Job-sized failure unit | Cell-sized — [05-operations/02-failure-model.md](../05-operations/02-failure-model.md) |
-| All-members operations | Quorum of healthy membership — [03-modules/03-reconciliation.md](../03-modules/03-reconciliation.md) |
-| tinyray allocates and launches | It does neither — [02-positioning.md](02-positioning.md) |
+| 全量 roster 推送 | 作用域 lookup，大小由请求决定 —— [03-modules/05-discovery.md](../03-modules/05-discovery.md) |
+| driver 扇出 | 分层；global 层只寻址 Cell —— [02-architecture/02-topology.md](../02-architecture/02-topology.md) |
+| 用父子关系判断存活 | Lease —— [03-modules/02-membership.md](../03-modules/02-membership.md) |
+| lease 放进共识 | 分层 lease —— [02-architecture/03-state-model.md](../02-architecture/03-state-model.md) |
+| 作业级故障单元 | Cell 级 —— [05-operations/02-failure-model.md](../05-operations/02-failure-model.md) |
+| 全体成员参与的操作 | 健康 membership 的定额 —— [03-modules/03-reconciliation.md](../03-modules/03-reconciliation.md) |
+| tinyray 分配并拉起 | 两者都不做 —— [02-positioning.md](02-positioning.md) |
 
-## 10. Limitations of this analysis
+## 10. 本分析的局限
 
-- The fan-out and registry throughput figures are single-machine, loopback, and
-  one client. Real networks add latency and real clusters add concurrency; the
-  first makes these numbers optimistic, the second makes them pessimistic.
-- No figure here was taken on the target cluster. The list of what must be
-  measured before the design is frozen is in
-  [06-testing/02-fake-cluster.md](../06-testing/02-fake-cluster.md).
-- The reliability data is from pre-training runs. RL adds inference engines and
-  sandboxes, so the failure rate should be treated as a floor.
+- 扇出和 registry 吞吐数据都是单机、loopback、单客户端。真实网络增加延迟，真实集群增加
+  并发；前者使这些数字偏乐观，后者使其偏悲观。
+- 本文没有任何数字来自目标集群。冻结设计前必须测量的清单见
+  [06-testing/02-fake-cluster.md](../06-testing/02-fake-cluster.md)。
+- 可靠性数据来自预训练作业。RL 额外引入推理引擎和 sandbox，因此上述故障率应视为下界。
 
-## 11. Source mapping
+## 11. 源码映射
 
-Measurements were produced against the current implementation:
+测量针对当前实现进行：
 
-- `python/tinyray/mesh.py` — the roster push being replaced
-- `python/tinyray/registry.py`, `python/tinyray/cluster.py` — the lease prototype
-- `benchmarks/` — the fan-out harness
+- `python/tinyray/mesh.py` —— 被替换的 roster 推送
+- `python/tinyray/registry.py`、`python/tinyray/cluster.py` —— lease 原型
+- `benchmarks/` —— 扇出压测脚本

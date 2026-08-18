@@ -1,234 +1,214 @@
 # Transport
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> The serving path is native and never needs the GIL, so a worker saturated by
-> its own framework still answers control messages. That property is the reason
-> there is Rust in this project.
+> 服务路径是原生的且从不需要 GIL，因此一个被自身框架压满的 worker 仍能应答控制消息。
+> 这个性质就是本项目里存在 Rust 的原因。
 
-## 1. Scope
+## 1. 范围
 
-Control RPC: framing, connection management, ordering, fencing enforcement and
-retry classification. Source: `crates/tinyray-core/`,
-`crates/tinyray-runtime/`, `crates/tinyray-py/`.
+控制 RPC：framing、连接管理、顺序、fencing 强制和 retry 分类。源码：
+`crates/tinyray-core/`、`crates/tinyray-runtime/`、`crates/tinyray-py/`。
 
-## 2. Responsibilities
+## 2. 职责
 
-- Serve control requests without acquiring the GIL.
-- Frame messages so large arguments are not copied through a serialiser.
-- Enforce fencing on every inbound call.
-- Preserve per-caller ordering.
-- Retry only what is safe to retry.
-- Account for bytes moved, per peer.
+- 在不获取 GIL 的情况下服务控制请求。
+- 对消息 framing，使大参数不经序列化器复制。
+- 对每个入站调用强制 fencing。
+- 保持 per-caller 顺序。
+- 只 retry 可安全 retry 的东西。
+- 按 peer 统计搬运的字节数。
 
-## 3. Non-responsibilities
+## 3. 非职责
 
-| Not done here | Owner |
+| 不在此处做 | 归属 |
 |---|---|
-| Bulk data transfer | L0 — NCCL, UCX, NIXL, storage |
-| What a message means | Application (L3) |
-| Deciding whom to call | [05-discovery](05-discovery.md) |
-| Deciding whether to accept | [06-admission](06-admission.md) |
-| Encryption and authentication | Not provided — see §16 |
+| 大数据传输 | L0 —— NCCL、UCX、NIXL、存储 |
+| 消息的含义 | 应用（L3） |
+| 决定调用谁 | [05-discovery](05-discovery.md) |
+| 决定是否接受 | [06-admission](06-admission.md) |
+| 加密与认证 | 不提供 —— 见 §16 |
 
-## 4. Position in the system
+## 4. 系统位置
 
-Beneath every module. Membership, discovery, reconciliation and admission all
-speak through it.
+在所有模块之下。membership、discovery、reconciliation 和 Admission 都经它通信。
 
-## 5. Dependencies
+## 5. 依赖
 
-- `hyper` for HTTP/1.1, `tokio` for the runtime, `pyo3` for the boundary.
-- [01-identity](01-identity.md) for the tokens it enforces.
+- `hyper` 提供 HTTP/1.1，`tokio` 提供运行时，`pyo3` 提供边界。
+- [01-identity](01-identity.md) 提供它所强制的 token。
 
-## 6. Public contract
+## 6. 公共契约
 
 | Interface | Input | Output | Side effect | Blocking | Failure |
 |---|---|---|---|---|---|
-| `serve(target, bind, background)` | Object, address | `Server` | Binds a port | Optional | `ServeError` |
-| `handle.method.remote(*args)` | Arguments | Reference | Enqueues remotely | **No** | `Backpressure`, `Fenced`, `Unreachable` |
-| `get(reference, timeout)` | Reference | Value | Fetches | Yes | Remote exception with traceback |
-| `wait(references, num_returns)` | References | Ready, pending | Status only | Yes | `TimeoutError` |
-| `transport_stats()` | — | Per-peer counters | None | No | None |
+| `serve(target, bind, background)` | 对象、地址 | `Server` | 绑定端口 | 可选 | `ServeError` |
+| `handle.method.remote(*args)` | 参数 | 引用 | 远端入队 | **否** | `Backpressure`、`Fenced`、`Unreachable` |
+| `get(reference, timeout)` | 引用 | 值 | 取回 | 是 | 带 traceback 的远端异常 |
+| `wait(references, num_returns)` | 引用 | ready、pending | 只问状态 | 是 | `TimeoutError` |
+| `transport_stats()` | —— | 按 peer 的计数 | 无 | 否 | 无 |
 
-`.remote()` returns before the call runs. `wait` asks for status and never
-transfers a payload — the distinction that
-[02-architecture/04-planes.md](../02-architecture/04-planes.md) exists to
-protect.
+`.remote()` 在调用运行之前就返回。`wait` 只问状态，从不传输 payload —— 这个区别正是
+[02-architecture/04-planes.md](../02-architecture/04-planes.md) 要保护的。
 
-## 7. State ownership
+## 7. 状态所有权
 
 | State | Owner | Created | Updated by | Read by | Lifetime | Persisted |
 |---|---|---|---|---|---|---|
-| Connection pool | Client | First call to a peer | Use | Client | Process | No |
-| Per-caller sequence | Client | First call | Each call | Server queue | Process | No |
-| Pending queue | Server | On arrival | Admission | Executor | Until dispatched | No |
-| Result store | Server | On completion | Fetch, release, eviction | Consumers | TTL or watermark | No |
-| Byte counters | Client | First call | Each call | Metrics | Process | No |
+| 连接池 | 客户端 | 首次调用某 peer | 使用时 | 客户端 | 进程期 | 否 |
+| per-caller 序号 | 客户端 | 首次调用 | 每次调用 | 服务端队列 | 进程期 | 否 |
+| 待处理队列 | 服务端 | 到达时 | Admission | 执行器 | 到派发为止 | 否 |
+| 结果存储 | 服务端 | 完成时 | fetch、release、驱逐 | 消费方 | TTL 或水位 | 否 |
+| 字节计数 | 客户端 | 首次调用 | 每次调用 | 指标 | 进程期 | 否 |
 
-## 8. Lifecycle
+## 8. 生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Bound
     Bound --> Serving
-    Serving --> Draining : shutdown requested
+    Serving --> Draining : 请求关闭
     Draining --> [*]
-    Serving --> Rebinding : port lost
+    Serving --> Rebinding : 端口丢失
     Rebinding --> Serving
 ```
 
-`Rebinding` matters for a sidecar: losing the control port must not end the
-process that the framework is using for real work.
+`Rebinding` 对 sidecar 很重要：失去控制端口绝不能终结那个框架正在用来干真活的进程。
 
-## 9. Main flow
+## 9. 主流程
 
 ```mermaid
 sequenceDiagram
-    participant C as Caller
-    participant T as tokio (native)
-    participant Q as Ordered queue
-    participant E as Executor (Python)
+    participant C as 调用方
+    participant T as tokio（原生）
+    participant Q as 有序队列
+    participant E as 执行器（Python）
 
-    C->>T: POST framed call, incarnation, seq
-    T->>T: decode, fence, admit
-    T->>Q: enqueue in caller order
-    T-->>C: acknowledged (queued, not done)
-    E->>Q: next task
-    E->>E: run user method
-    E->>T: store result
-    C->>T: fetch or status
-    T-->>C: result or readiness
+    C->>T: POST framed 调用，带 incarnation 与 seq
+    T->>T: 解码、fencing、Admission
+    T->>Q: 按调用方顺序入队
+    T-->>C: 确认（已入队，非完成）
+    E->>Q: 取下一个
+    E->>E: 运行用户方法
+    E->>T: 存储结果
+    C->>T: fetch 或问状态
+    T-->>C: 结果或就绪状态
 ```
 
-The diagram cannot show: everything left of the executor happens without the
-GIL; the acknowledgement means queued, not completed; and a status request
-returns no payload.
+图中无法表达：执行器左侧的一切都不持有 GIL；确认意味着已入队而非已完成；状态请求不返回
+payload。
 
-## 10. Concurrency and distributed semantics
+## 10. 并发与分布式语义
 
-**Three threads per serving process:**
+**每个服务进程三类线程：**
 
-| Thread | Language | Job |
+| 线程 | 语言 | 职责 |
 |---|---|---|
-| tokio pool | Rust | Accept, decode, fence, admit, serve fetches |
-| Executor | Python | Run user methods |
-| Collective | Python | Blocking framework calls only |
+| tokio 池 | Rust | 接受、解码、fencing、Admission、服务 fetch |
+| 执行器 | Python | 运行用户方法 |
+| collective | Python | 只跑阻塞的框架调用 |
 
-The tokio pool never needs the GIL. **Measured**: decoding 10 MB while four
-GIL-bound Python threads run costs 1.04x from a native thread and 49x when
-initiated from Python. Same code; the difference is who holds the GIL when the
-work starts.
+tokio 池从不需要 GIL。**实测**：在四个 GIL 绑定的 Python 线程运行时解码 10 MB，原生线程
+发起为 1.04 倍，Python 发起为 49 倍。代码相同，差别在于工作开始时谁持有 GIL。
 
-This is not an optimisation. A worker that only answered between method calls
-would be unobservable exactly when observation is needed, and a stalled worker
-could not be distinguished from a busy one.
+这不是优化。一个只在方法调用之间才应答的 worker，恰好在最需要观察它的时候不可观察，而且
+卡住的 worker 与繁忙的 worker 无法区分。
 
-**The executor must return to Python periodically.** Python runs signal handlers
-only while the main thread executes bytecode, so an indefinite block in Rust
-makes `SIGTERM` unreachable. **Measured**: shutdown fell from 10.00 s — the
-supervisor's `SIGKILL` — to 0.24 s once the blocking call took a deadline.
+**执行器必须周期性返回 Python。** Python 只在主线程执行字节码时运行 signal handler，因此
+在 Rust 中无限阻塞会使 `SIGTERM` 无法送达。**实测**：把阻塞调用改为带 deadline 之后，
+关闭时间从 10.00 秒（监督者的 `SIGKILL`）降到 0.24 秒。
 
-**Ordering is per caller.** HTTP gives none, and several connections per peer
-deliver concurrent calls out of order. Each call carries a monotonic sequence
-per caller, and the server dispatches in order. Different callers are
-independent, so one slow caller does not block the rest.
+**顺序是 per-caller 的。** HTTP 不提供顺序，而每个 peer 有多条连接，会并发地乱序投递。
+每次调用携带一个 per-caller 单调序号，服务端按序派发。不同调用方彼此独立，因此一个慢的
+调用方不阻塞其余。
 
-**Fencing is enforced here**, not by callers. Every inbound call carries an
-incarnation and is rejected if superseded.
+**fencing 在这里强制**，不由调用方负责。每个入站调用携带 Incarnation，被取代则拒绝。
 
-**Only backpressure is retried.** Linear backoff, bounded. See
-[06-admission](06-admission.md).
+**只有 backpressure 被 retry。** 线性退避，有上界。见 [06-admission](06-admission.md)。
 
-## 11. Correctness invariants
+## 11. 正确性不变量
 
-- The serving path acquires the GIL only to run a user method.
-- No blocking call holds the GIL.
-- Every inbound call is fenced before it is queued.
-- Calls from one caller execute in submission order.
-- A repeated sequence number is acknowledged, never re-executed.
-- A status request transfers no payload.
-- Every operation's byte cost is counted per peer.
-- A framing error poisons the connection rather than attempting resynchronisation.
+- 服务路径只在运行用户方法时获取 GIL。
+- 没有阻塞调用持有 GIL。
+- 每个入站调用在入队之前完成 fencing。
+- 同一调用方的调用按提交顺序执行。
+- 重复的序号被确认，绝不重复执行。
+- 状态请求不传输 payload。
+- 每个操作的字节代价按 peer 统计。
+- framing 错误使连接中毒，不尝试重新同步。
 
-## 12. Failure handling
+## 12. 故障处理
 
-| Failure | Detected by | Response |
+| 故障 | 检测方 | 响应 |
 |---|---|---|
-| Peer unreachable | Connect error | `Unreachable`; caller re-looks-up |
-| Peer superseded | Fencing | `Fenced`; caller re-looks-up |
-| Peer overloaded | 429 | Retried with linear backoff |
-| Framing error | Decoder | Connection closed; no resynchronisation attempted |
-| Message over limit | Decoder | Rejected before allocation |
-| Result evicted | Store | `ObjectLost`, distinct from "never existed" |
-| Executor blocked | Queue depth, readiness | Reported; not interrupted |
-| Control port lost | Server | Rebind and re-register; the process survives |
+| peer 不可达 | 连接错误 | `Unreachable`；调用方重新 lookup |
+| peer 被取代 | fencing | `Fenced`；调用方重新 lookup |
+| peer 过载 | 429 | 线性退避后 retry |
+| framing 错误 | 解码器 | 关闭连接；不尝试重新同步 |
+| 消息超限 | 解码器 | 在分配之前拒绝 |
+| 结果被驱逐 | 存储 | `ObjectLost`，与“从未存在”区分 |
+| 执行器阻塞 | 队列深度、Readiness | 上报；不中断 |
+| 控制端口丢失 | 服务端 | 重新绑定并重新注册；进程存活 |
 
-## 13. Configuration
+## 13. 配置
 
 | Field | Type | Default | Validation | Reader | Effect |
 |---|---|---|---|---|---|
-| `connections_per_peer` | int | 4 | > 0 | Client | Head-of-line mitigation |
-| `request_timeout` | seconds | 300 | > 0 | Client | Per-request deadline |
-| `max_pending_calls` | int | 1000 | > 0 | Server | Admission bound |
-| `max_header_len` | bytes | 1 MiB | > 0 | Decoder | Allocation guard |
-| `max_message_len` | bytes | 8 GiB | > 0 | Decoder | Allocation guard |
-| `backoff` | seconds | 0.025 | > 0 | Client | Linear step |
-| `max_retries` | int | 16 | >= 0 | Client | Backpressure only |
+| `connections_per_peer` | int | 4 | > 0 | 客户端 | 缓解队头阻塞 |
+| `request_timeout` | 秒 | 300 | > 0 | 客户端 | 每请求 deadline |
+| `max_pending_calls` | int | 1000 | > 0 | 服务端 | Admission 界限 |
+| `max_header_len` | 字节 | 1 MiB | > 0 | 解码器 | 分配护栏 |
+| `max_message_len` | 字节 | 8 GiB | > 0 | 解码器 | 分配护栏 |
+| `backoff` | 秒 | 0.025 | > 0 | 客户端 | 线性步长 |
+| `max_retries` | int | 16 | >= 0 | 客户端 | 仅 backpressure |
 
-Four connections per peer because HTTP/1.1 has head-of-line blocking: on one
-connection a large response stalls every small control message behind it.
+每 peer 四条连接，是因为 HTTP/1.1 有队头阻塞：单条连接上一个大响应会把排在它后面的每条
+小控制消息都堵住。
 
-## 14. Observability
+## 14. 可观测性
 
 | Metric | Producer | Meaning |
 |---|---|---|
-| `control_bytes_sent`, `control_bytes_received` | Client, per peer | Enforces the plane split in production |
-| `control_requests_total`, `control_retries_total` | Client | Retry pressure |
-| `control_failures_total` | Client | By class |
-| `fencing_rejections_total` | Server | Stale writers |
-| `queue_depth`, `queue_waiting_for` | Server | Ordering stalls |
-| `executor_inflight_seconds` | Server | Straggler detection |
+| `control_bytes_sent`、`control_bytes_received` | 客户端，按 peer | 在生产中强制面拆分 |
+| `control_requests_total`、`control_retries_total` | 客户端 | retry 压力 |
+| `control_failures_total` | 客户端 | 按类别 |
+| `fencing_rejections_total` | 服务端 | 过期写入者 |
+| `queue_depth`、`queue_waiting_for` | 服务端 | 顺序停滞 |
+| `executor_inflight_seconds` | 服务端 | 掉队者检测 |
 
-`queue_waiting_for` names the caller and sequence a worker is stuck behind. A
-lost call stalls that caller permanently, with no automatic recovery; making it
-visible in one query is the mitigation.
+`queue_waiting_for` 指出一个 worker 卡在哪个调用方的哪个序号后面。丢失的调用会永久卡住
+该调用方且无自动恢复，把它做成一条命令就能看见，就是缓解手段。
 
-## 15. Testing
+## 15. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| Native decode is unaffected by GIL contention | `benchmarks/` | `bench_gil_contention` | Benchmark |
-| Serving continues during a long method | `tests/test_transport.py` | `test_serves_while_busy` | Integration |
-| Shutdown is prompt under load | `tests/test_transport.py` | `test_sigterm_is_reachable` | Integration |
-| Out-of-order arrival is reordered | `tests/test_transport.py` | `test_ordering_restored` | Unit |
-| A repeated sequence is not re-executed | `tests/test_transport.py` | `test_duplicate_seq_absorbed` | Unit |
-| A stale incarnation is rejected | `tests/test_identity.py` | `test_peer_rejects_stale_incarnation` | Integration |
-| A status request moves no payload | `tests/test_driver_byte_budget.py` | `test_status_only_is_cheap` | Integration |
-| Oversized messages are refused before allocation | `tests/test_framing.py` | `test_limits_enforced` | Unit |
+| 原生解码不受 GIL 争用影响 | `benchmarks/` | `bench_gil_contention` | Benchmark |
+| 长方法运行期间仍能服务 | `tests/test_transport.py` | `test_serves_while_busy` | Integration |
+| 高负载下关闭及时 | `tests/test_transport.py` | `test_sigterm_is_reachable` | Integration |
+| 乱序到达被重排 | `tests/test_transport.py` | `test_ordering_restored` | Unit |
+| 重复序号不重复执行 | `tests/test_transport.py` | `test_duplicate_seq_absorbed` | Unit |
+| 过期 Incarnation 被拒绝 | `tests/test_identity.py` | `test_peer_rejects_stale_incarnation` | Integration |
+| 状态请求不搬运 payload | `tests/test_driver_byte_budget.py` | `test_status_only_is_cheap` | Integration |
+| 超大消息在分配前被拒 | `tests/test_framing.py` | `test_limits_enforced` | Unit |
 
-The GIL benchmark is a regression guard on the claim the whole Rust core rests
-on. If it stopped holding, the design would need revisiting.
+GIL benchmark 是整个 Rust 核心所依赖的那个论断的回归护栏。如果它不再成立，设计需要重审。
 
-## 16. Limitations and trade-offs
+## 16. 限制与取舍
 
-- **No TLS and no authentication.** tinyray assumes a trusted network. Do not
-  expose a control port outside a cluster. Authentication is on the
-  [roadmap](../08-project/03-roadmap.md) and is a genuine gap for shared
-  clusters.
-- **The wire format is not versioned** beyond magic bytes. Client and server must
-  be the same release.
-- **A framing error is unrecoverable** by design; a binary framing has no
-  resynchronisation point.
-- **A stalled ordering queue does not self-heal.** It is reported, not repaired.
-- **One Python wheel per version.** The limited API omits the buffer protocol,
-  which is the zero-copy mechanism, so `abi3` is unavailable.
+- **没有 TLS，没有认证。** tinyray 假设可信网络。不要把控制端口暴露到集群之外。认证在
+  [roadmap](../08-project/03-roadmap.md) 上，且对共享集群是真实缺口。
+- **wire format 除魔数外没有版本协商。** 客户端与服务端必须是同一发布版本。
+- **framing 错误按设计不可恢复**；二进制 framing 没有重新同步点。
+- **停滞的顺序队列不会自愈。** 它被上报，而不是被修复。
+- **每个 Python 版本一个 wheel。** limited API 不含 buffer protocol，而那正是零拷贝机制，
+  所以 `abi3` 不可用。
 
-## 17. Source mapping
+## 17. 源码映射
 
-`crates/tinyray-core/` — framing, identifiers, envelopes.
-`crates/tinyray-runtime/` — transport, queue, store, actor loop.
-`crates/tinyray-py/` — the boundary; all `unsafe` confined to `buffers.rs`.
+`crates/tinyray-core/` —— framing、标识符、消息封装。
+`crates/tinyray-runtime/` —— transport、队列、存储、actor 循环。
+`crates/tinyray-py/` —— 边界；全部 `unsafe` 集中在 `buffers.rs`。
 
-Related: [04-protocols/01-wire-format.md](../04-protocols/01-wire-format.md) and
-[04-protocols/03-control-rpc.md](../04-protocols/03-control-rpc.md).
+相关：[04-protocols/01-wire-format.md](../04-protocols/01-wire-format.md) 和
+[04-protocols/03-control-rpc.md](../04-protocols/03-control-rpc.md)。

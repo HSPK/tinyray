@@ -1,131 +1,122 @@
 # tinyray
 
-> Proposal; not the current implementation. tinyray is the generic control-plane
-> fabric for clusters it does not own: identity, membership, reconciliation and
-> discovery. It allocates nothing, launches nothing, and never touches a tensor.
+> 提案；当前未实现。tinyray 是集群的通用控制面结构层：identity、membership、
+> reconciliation 和 discovery。它不分配资源、不拉起进程，也不碰任何 tensor。
 
-| Attribute | Value |
+| 属性 | 值 |
 |---|---|
-| Status | Proposal. Supersedes all prior tinyray design |
-| Target scale | 10,000+ GPU, a single experiment or a shared cluster |
-| Position | L2 in the [layering](02-architecture/01-layering.md) — between the scheduler and the application |
-| Written against | [rl-bridge cell runtime proposal](../../rl-bridge/docs/08-proposals/02-cell-based-high-availability-runtime.md) |
-| Language | English body text; identifiers keep their source spelling |
+| 状态 | 提案。取代此前全部 tinyray 设计 |
+| 目标规模 | 单实验或共享集群总规模达 10,000 GPU |
+| 定位 | [分层](02-architecture/01-layering.md)中的 L2 —— 调度器与应用之间 |
+| 对应输入 | [rl-bridge Cell Runtime 提案](../../rl-bridge/docs/08-proposals/02-cell-based-high-availability-runtime.md) |
+| 语言 | 正文中文；标识符保留源码拼写 |
 
-## Why this document exists
+## 本文档存在的原因
 
-The previous tinyray design was wrong in a way that could not be patched. It
-assumed tinyray starts the processes, assigns the GPUs and sits at the centre of
-every message. All three collapse above a few hundred workers, and the
-measurements are in [01-overview/01-problem.md](01-overview/01-problem.md).
+此前的 tinyray 设计错在无法修补的地方。它假设 tinyray 拉起进程、分配 GPU，并处在
+每一条消息的中间。这三条在几百个 worker 之上全部不成立，实测数据见
+[01-overview/01-problem.md](01-overview/01-problem.md)。
 
-The redesign moves tinyray to the one layer nobody supplies: the mechanics that
-every large control plane re-implements by hand — logical slots with
-generations, leases that expire, desired state that converges, discovery that
-does not grow with the cluster.
+重新设计把 tinyray 移到唯一没人提供的那一层：每个大型控制面都要手写一遍的机制 ——
+带 generation 的逻辑槽位、会过期的 lease、自行收敛的期望状态、不随集群规模增长的
+discovery。
 
-## Reading order
+## 阅读顺序
 
-Directories and files are numbered. The numbers are the reading order, and no
-document depends on a later one.
+目录和文件都带序号，序号即阅读顺序，且没有任何文档依赖排在它后面的文档。
 
-**Start here:** [01-overview](01-overview/) then
-[02-architecture](02-architecture/). That is the proposal proper, and about
-thirty minutes.
+**从这里开始**：[01-overview](01-overview/) 然后 [02-architecture](02-architecture/)。
+这两部分是提案主体，约三十分钟。
 
-**If you are evaluating the boundary**, read
-[01-overview/02-positioning.md](01-overview/02-positioning.md) and
-[02-architecture/01-layering.md](02-architecture/01-layering.md) alone. They
-contain the whole argument about what tinyray owns.
+**如果只是评估边界**，读 [01-overview/02-positioning.md](01-overview/02-positioning.md)
+和 [02-architecture/01-layering.md](02-architecture/01-layering.md) 即可，
+tinyray 该管什么的完整论证都在这两篇里。
 
-**If you are implementing**, [03-modules](03-modules/) is the specification and
-[04-protocols](04-protocols/) is the wire contract.
+**如果要实现**，[03-modules](03-modules/) 是规格，[04-protocols](04-protocols/) 是
+wire 契约。
 
-## Authoritative locations
+## 权威位置
 
-One fact is defined completely in one place. Everything else links to it.
+同一事实只在一个位置完整定义，其余位置使用链接。
 
-| Information | Location |
+| 信息 | 位置 |
 |---|---|
-| Why the design is what it is | [02-architecture](02-architecture/) |
-| A module's responsibility and internal state | [03-modules](03-modules/) |
-| Cross-process message order and schema | [04-protocols](04-protocols/) |
-| Running and debugging | [05-operations](05-operations/) |
-| Test evidence | [06-testing](06-testing/) |
-| Exhaustive lists: API, config, metrics | [07-reference](07-reference/) |
-| What is built, decided, and planned | [08-project](08-project/) |
+| 设计为何如此 | [02-architecture](02-architecture/) |
+| 单个模块的职责与内部状态 | [03-modules](03-modules/) |
+| 跨进程消息顺序与 schema | [04-protocols](04-protocols/) |
+| 运行与排障 | [05-operations](05-operations/) |
+| 测试证据 | [06-testing](06-testing/) |
+| 穷举清单：API、配置、指标 | [07-reference](07-reference/) |
+| 已建成、已决策、计划中 | [08-project](08-project/) |
 
-## Contents
+## 目录
 
-### 00 Conventions
+### 00 规范
 
-- [00-conventions.md](00-conventions.md) — document structure and writing rules
+- [00-conventions.md](00-conventions.md) —— 文档结构与写作规则
 
-### 01 Overview
+### 01 总览
 
-- [01-problem.md](01-overview/01-problem.md) — what broke, with measurements
-- [02-positioning.md](01-overview/02-positioning.md) — tinyray is L2, and why that is the valuable layer
-- [03-principles.md](01-overview/03-principles.md) — seven principles, each traced to a failure
+- [01-problem.md](01-overview/01-problem.md) —— 哪里塌了，附实测数据
+- [02-positioning.md](01-overview/02-positioning.md) —— tinyray 处在 L2，以及为何这层最有价值
+- [03-principles.md](01-overview/03-principles.md) —— 七条原则，每条都能追溯到一次故障
 
-### 02 Architecture
+### 02 架构
 
-- [01-layering.md](02-architecture/01-layering.md) — L0 to L4, and the ownership boundary
-- [02-topology.md](02-architecture/02-topology.md) — worker, cell, global
-- [03-state-model.md](02-architecture/03-state-model.md) — what needs consensus and what does not
-- [04-planes.md](02-architecture/04-planes.md) — control plane, data plane, and the rule between them
+- [01-layering.md](02-architecture/01-layering.md) —— L0 到 L4 与归属边界
+- [02-topology.md](02-architecture/02-topology.md) —— worker、Cell、global 三层
+- [03-state-model.md](02-architecture/03-state-model.md) —— 什么需要共识，什么不需要
+- [04-planes.md](02-architecture/04-planes.md) —— 控制面、数据面，以及两者之间的规则
 
-### 03 Modules
+### 03 模块
 
-- [01-identity.md](03-modules/01-identity.md) — slots, incarnations, fencing
-- [02-membership.md](03-modules/02-membership.md) — hierarchical leases
-- [03-reconciliation.md](03-modules/03-reconciliation.md) — desired and observed state
-- [04-readiness.md](03-modules/04-readiness.md) — composable readiness
-- [05-discovery.md](03-modules/05-discovery.md) — scoped lookup
-- [06-admission.md](03-modules/06-admission.md) — backpressure primitives
-- [07-transport.md](03-modules/07-transport.md) — the Rust core and the GIL boundary
-- [08-supervision.md](03-modules/08-supervision.md) — node-local process supervision
+- [01-identity.md](03-modules/01-identity.md) —— Slot、Incarnation、fencing
+- [02-membership.md](03-modules/02-membership.md) —— 分层 lease
+- [03-reconciliation.md](03-modules/03-reconciliation.md) —— desired 与 observed 状态
+- [04-readiness.md](03-modules/04-readiness.md) —— 可组合 Readiness
+- [05-discovery.md](03-modules/05-discovery.md) —— 作用域 lookup
+- [06-admission.md](03-modules/06-admission.md) —— backpressure 原语
+- [07-transport.md](03-modules/07-transport.md) —— Rust 核心与 GIL 边界
+- [08-supervision.md](03-modules/08-supervision.md) —— 节点内进程监督
 
-### 04 Protocols
+### 04 协议
 
-- [01-wire-format.md](04-protocols/01-wire-format.md) — framing
-- [02-membership-protocol.md](04-protocols/02-membership-protocol.md) — register, heartbeat, expire
-- [03-control-rpc.md](04-protocols/03-control-rpc.md) — calls, results, errors
+- [01-wire-format.md](04-protocols/01-wire-format.md) —— framing
+- [02-membership-protocol.md](04-protocols/02-membership-protocol.md) —— register、heartbeat、过期
+- [03-control-rpc.md](04-protocols/03-control-rpc.md) —— 调用、结果、错误
 
-### 05 Operations
+### 05 运维
 
-- [01-deployment.md](05-operations/01-deployment.md) — deployment shapes
-- [02-failure-model.md](05-operations/02-failure-model.md) — failure and recovery matrix
-- [03-observability.md](05-operations/03-observability.md) — metrics and diagnosis
+- [01-deployment.md](05-operations/01-deployment.md) —— 部署形态
+- [02-failure-model.md](05-operations/02-failure-model.md) —— 故障与恢复矩阵
+- [03-observability.md](05-operations/03-observability.md) —— 指标与诊断
 
-### 06 Testing
+### 06 测试
 
-- [01-standard.md](06-testing/01-standard.md) — the testing standard and its origin
-- [02-fake-cluster.md](06-testing/02-fake-cluster.md) — 10,000 to 100,000 simulated workers
-- [03-chaos.md](06-testing/03-chaos.md) — fault injection matrix
+- [01-standard.md](06-testing/01-standard.md) —— 测试标准及其由来
+- [02-fake-cluster.md](06-testing/02-fake-cluster.md) —— 10,000 到 100,000 个模拟 worker
+- [03-chaos.md](06-testing/03-chaos.md) —— 故障注入矩阵
 
-### 07 Reference
+### 07 参考
 
-- [01-api.md](07-reference/01-api.md) — the Python API
-- [02-configuration.md](07-reference/02-configuration.md) — every knob and default
+- [01-api.md](07-reference/01-api.md) —— Python API
+- [02-configuration.md](07-reference/02-configuration.md) —— 全部配置项与默认值
 
-### 08 Project
+### 08 项目
 
-- [01-status.md](08-project/01-status.md) — what exists, what is proposed
-- [02-decisions.md](08-project/02-decisions.md) — decisions and reversals
-- [03-roadmap.md](08-project/03-roadmap.md) — implementation phases
+- [01-status.md](08-project/01-status.md) —— 已有什么，提案什么
+- [02-decisions.md](08-project/02-decisions.md) —— 决策与反转
+- [03-roadmap.md](08-project/03-roadmap.md) —— 实施阶段
 
-## Summary of the proposal
+## 提案摘要
 
-**tinyray owns**: logical identity with generations and fencing; hierarchical
-lease membership; desired/observed reconciliation; composable readiness; scoped
-discovery; admission and backpressure primitives; the control RPC transport;
-node-local process supervision.
+**tinyray 负责**：带 generation 和 fencing 的逻辑 identity；分层 lease membership；
+desired/observed reconciliation；可组合 Readiness；作用域 discovery；Admission 与
+backpressure 原语；控制 RPC transport；节点内进程监督。
 
-**tinyray does not own**: GPU or CPU allocation; job launching; any tensor;
-consensus storage; and every domain concept — tasks, samples, model versions,
-checkpoints belong to the application.
+**tinyray 不负责**：GPU 与 CPU 分配；拉起作业；任何 tensor；共识存储；以及全部领域概念
+—— task、sample、model version、checkpoint 都属于应用。
 
-**The load-bearing claim**: a control plane at 10,000 workers fails from
-quadratic relationships and hand-written liveness, not from slow code. Removing
-both is a small, generic, testable library — and one that can be validated with
-100,000 fake workers before a single GPU is booked.
+**核心论断**：万卡控制面的崩溃来自二次复杂度关系和手写存活性判断，不是来自代码慢。
+去掉这两者剩下的是一个小而通用、可测试的库 —— 而且可以在预约任何一张 GPU 之前，用
+100,000 个 fake worker 验证完毕。

@@ -1,173 +1,153 @@
-# Testing standard
+# 测试标准
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
-> Tests here verify what was promised, not what was built. The difference is
-> where every serious bug in this project came from.
+> 这里的测试验证**承诺过什么**，而不是**造出了什么**。这个差别正是本项目每一个严重 bug 的
+> 来源。
 
-## 1. Problem
+## 1. 问题
 
-Every bug that reached a release in the previous implementation passed its own
-tests. Not because the tests were absent, but because each verified the
-implementation as written rather than the claim it was meant to satisfy.
+此前实现中每一个流入发布的 bug，都通过了它自己的测试。不是因为没有测试，而是因为每个测试
+验证的是已写成的实现，而不是它本该满足的那条承诺。
 
-## 2. Goals
+## 2. 目标
 
-- Encode each past failure as a check that cannot pass vacuously.
-- Assert cost, not only result.
-- Make design invariants executable.
+- 把每一次过往故障编码成一条不会空洞通过的检查。
+- 断言代价，而不只是结果。
+- 让设计不变量可执行。
 
-## 3. Non-goals
+## 3. 非目标
 
-- Coverage targets. Coverage said the heartbeat line was exercised while the
-  assertion was vacuous.
+- 覆盖率指标。覆盖率说 heartbeat 那行被执行了，而断言本身是空洞的。
 
-## 4. The seven blind spots
+## 4. 七个盲区
 
-Each is a category, each produced a real bug, and each is now a structural test.
+每一条都是一类，每一类都产生过真实 bug，每一类现在都对应一条结构性测试。
 
-### 4.1 Asserting results but not costs
+### 4.1 断言结果但不断言代价
 
-A readiness check fetched the payload to answer a boolean — **measured** 237 ms
-for a 200 MB result against 0.14 ms. Every test passed; the answer was right.
+一次 readiness 检查取回 payload 来回答一个布尔问题 —— **实测** 200 MB 结果 237 ms，
+对比 0.14 ms。所有测试都通过，因为答案是对的。
 
-**Encoded as** a byte budget per operation, plus a meta-test requiring every
-wire-touching operation to have one. Adding the meta-test found three operations
-with none.
+**编码为**每个操作一条字节预算，加一条要求每个接触 wire 的操作**都必须有**预算的元测试。
+加上这条元测试后立刻找出三个没有预算的操作。
 
-### 4.2 Dead code with passing unit tests
+### 4.2 有单测但没人调用的死代码
 
-A same-host fast path had thorough unit tests and no caller. Coverage of a module
-says nothing about whether anything uses it.
+一条同机快路径有充分的单测和零个调用者。模块的覆盖率说明不了是否有东西在用它。
 
-**Encoded as** a meta-test that every module is reachable from a public entry
-point.
+**编码为**一条元测试：每个模块都必须能从某个公共入口到达。
 
-### 4.3 Timing constants only ever run at production values
+### 4.3 时间常量只在生产值上运行
 
-Heartbeats were never sent. Any session over 30 s lost every worker. No test ran
-for 30 s, so every test passed.
+heartbeat 从未被发送。任何超过 30 秒的会话都会丢掉全部 worker。没有测试跑够 30 秒，所以
+全部通过。
 
-**Encoded as** every timing constant being environment-overridable, with tests
-driving the timeout path in seconds, and a meta-test requiring the overridability.
+**编码为**每个时间常量都可由环境变量覆盖，测试在秒级驱动超时路径，并有一条元测试要求
+这种可覆盖性。
 
-### 4.4 Options accepted but ignored
+### 4.4 接受但被忽略的选项
 
-Options that parsed and did nothing.
+能解析、什么也不做的选项。
 
-**Encoded as** a meta-test requiring every public option to appear in a test that
-asserts its effect.
+**编码为**一条元测试：每个公共选项都必须出现在某条断言其效果的测试里。
 
-### 4.5 Collapsed error taxonomies
+### 4.5 被压平的错误分类
 
-`ObjectLost` and `NotFound` were indistinguishable, so a fetch after eviction
-looked like a typo.
+`ObjectLost` 与 `NotFound` 无法区分，于是驱逐后的 fetch 看起来像拼错了名字。
 
-**Encoded as** a test per error kind asserting it is reachable and distinct.
+**编码为**每个错误类别一条测试，断言它可达且可区分。
 
-### 4.6 Only one branch of a lock path tested
+### 4.6 加锁路径只测了一个分支
 
-A double release had no upper bound, so releasing twice *invented* a resource.
-The single-release path was tested; the double was not.
+一次重复释放没有上界，于是释放两次会**凭空造出**一份资源。单次释放路径被测过，重复释放
+没有。
 
-**Encoded as** idempotence tests on every release path.
+**编码为**每条释放路径的幂等性测试。
 
-### 4.7 High-availability tested with one replica
+### 4.7 高可用只用一个副本测试
 
-A registry was given a fixed identity to save a round trip. Clients route by
-identity, so two replicas shared one and calls were submitted to one and fetched
-from the other. **Every single-replica test passed.**
+为省一次往返，Registry 被赋予固定 identity。客户端按 identity 路由，因此两个副本共享一个
+identity，调用提交给其中一个、结果却去另一个取。**全部单副本测试都通过了。**
 
-**Encoded as** every availability test running with at least two replicas and
-killing one. A single-replica test proves nothing about availability.
+**编码为**每条可用性测试都至少两个副本并杀掉一个。单副本的高可用测试是贴错标签的正确性
+测试。
 
-### 4.8 The meta-cause
+### 4.8 元原因
 
-> Tests verified what was built, not what was promised.
+> 测试验证的是造出了什么，不是承诺过什么。
 
-`tests/test_suite_quality.py` is the structural response: it asserts properties
-of the test suite itself.
+`tests/test_suite_quality.py` 是结构性回应：它断言测试套件自身的性质。
 
-## 5. What a test looks like here
+## 5. 这里的测试长什么样
 
-**Assert the cost.** Bytes moved, calls made, consensus writes. A functional
-assertion alone would have caught none of §4.1.
+**断言代价。** 搬运的字节、发出的调用、共识写入数。只有功能断言的话，§4.1 一个都抓不住。
 
-**Assert across the range.** A budget checked at one payload size will be
-violated at another. Scale-sensitive assertions are parameterised over cluster
-size up to 8,192.
+**跨取值范围断言。** 只在一个 payload 大小上检查过的预算，会在另一个大小上被违反。对规模
+敏感的断言在直到 8,192 的集群规模上参数化。
 
-**Drive the real path.** A test constructing a registry object directly proves
-less than one starting processes and killing them.
+**驱动真实路径。** 直接构造一个 Registry 对象的测试，证明力低于启动真实进程再杀掉它们。
 
-**Make the failure mode reachable.** A path that only runs after 30 s gets a knob
-turned down.
+**让故障模式可达。** 只在 30 秒后才走的路径，给它一个可以调小的旋钮。
 
-**Kill things.** Availability claims are tested by killing, not by describing.
+**动手杀。** 可用性论断靠杀进程来验证，不靠描述。
 
-## 6. Levels
+## 6. 层级
 
-| Level | Scope | Runtime |
+| 层级 | 范围 | 耗时 |
 |---|---|---|
-| Unit | One module, no processes | Milliseconds |
-| Integration | Real processes, one machine | Seconds |
-| Structural | Properties of the codebase and its tests | Milliseconds |
-| Chaos | Real processes, injected faults | Seconds to minutes |
-| Scale | Simulated workers, 10k to 100k | Minutes |
+| Unit | 单模块，无进程 | 毫秒 |
+| Integration | 真实进程，单机 | 秒 |
+| Structural | 代码库与其测试的性质 | 毫秒 |
+| Chaos | 真实进程，注入故障 | 秒到分钟 |
+| Scale | 模拟 worker，1 万到 10 万 | 分钟 |
 
-Scale and chaos are the two that would have caught the failures in §4.7 and
-§4.3.
+Scale 和 Chaos 正是能抓住 §4.7 和 §4.3 那两类故障的层级。
 
-## 7. Mutation testing
+## 7. 变异测试
 
-Targeted source mutations, each a plausible mistake — an inverted comparison, a
-dropped clamp, an off-by-one — with the suite required to fail for every one.
+对源码施加定向变异，每个都是一个合理的错误 —— 反转的比较、丢掉的 clamp、差一错误 —— 并
+要求套件对每一个都失败。
 
-Its first run found the only vacuous assertion in the suite: a heartbeat test
-asserting `dead_nodes() == []`, which is true when the node is healthy **and**
-when it has already been reaped. Coverage said the line was exercised; the mutant
-said the assertion could not fail.
+它第一次运行就找出了套件中唯一一条空洞断言：一条断言 `dead_nodes() == []` 的 heartbeat
+测试 —— 而这在节点健康时**和**节点已被回收时都成立。覆盖率说那行被执行了，变异体说那条
+断言不可能失败。
 
-The mutation harness itself had a bug — copying files preserved modification
-times, so the build reused stale binaries and mutants appeared caught when the
-test had run against unmutated code. **The tool that verifies the tests needed
-verifying too.**
+变异工具自身也有 bug —— 复制文件时保留了修改时间，导致构建复用了陈旧二进制，变异体看起来
+被抓住了，而测试其实跑的是未变异的代码。**验证测试的工具本身也需要被验证。**
 
-## 8. Invariants as tests
+## 8. 不变量即测试
 
-Each principle from
-[01-overview/03-principles.md](../01-overview/03-principles.md) maps to a check:
+[01-overview/03-principles.md](../01-overview/03-principles.md) 中的每条原则都对应一条
+检查：
 
-| Principle | Test |
+| 原则 | Test |
 |---|---|
-| P1 control plane carries no bulk data | `tests/test_driver_byte_budget.py` |
-| P2 no resource is claimed | `tests/test_suite_quality.py::test_no_resource_arguments` |
-| P3 launcher's interface is used | `tests/test_membership.py::test_rank_from_launcher` |
-| P4 every write is fenced | `tests/test_suite_quality.py::test_fencing_is_in_the_transport` |
-| P5 no operation needs all members | `tests/test_reconcile.py::test_epoch_membership_is_frozen` |
-| P6 failures are bounded, never hangs | `tests/test_suite_quality.py::test_every_wait_has_a_deadline` |
-| P7 soft state where possible | `tests/test_fake_cluster.py::test_consensus_writes_are_flat` |
+| P1 控制面不搬运大数据 | `tests/test_driver_byte_budget.py` |
+| P2 不占用任何资源 | `tests/test_suite_quality.py::test_no_resource_arguments` |
+| P3 使用 launcher 的接口 | `tests/test_membership.py::test_rank_from_launcher` |
+| P4 每次写入都 fencing | `tests/test_suite_quality.py::test_fencing_is_in_the_transport` |
+| P5 没有操作需要全体成员 | `tests/test_reconcile.py::test_epoch_membership_is_frozen` |
+| P6 故障有界，绝不挂起 | `tests/test_suite_quality.py::test_every_wait_has_a_deadline` |
+| P7 能用软状态就用软状态 | `tests/test_fake_cluster.py::test_consensus_writes_are_flat` |
 
-A principle with no test is a preference.
+没有测试的原则只是一种偏好。
 
-## 9. What must not be claimed
+## 9. 不许声称的东西
 
-Untested claims are recorded as untested, in
-[08-project/01-status.md](../08-project/01-status.md). The previous
-implementation shipped with NCCL support that had never run on a GPU; it was
-listed as such, and that honesty is a requirement rather than a courtesy.
+未测试的论断被如实记录在
+[08-project/01-status.md](../08-project/01-status.md) 中。此前的实现带着从未在 GPU 上跑过
+的 NCCL 支持发布；它被如实列出，而这种诚实是要求，不是客气。
 
-## 10. Trade-offs
+## 10. 取舍
 
-- **The scale suite is slow** and gates a merge only nightly.
-- **Chaos tests are timing-sensitive** and will occasionally be flaky. A flaky
-  chaos test is worth more than no chaos test, but it must be quarantined rather
-  than deleted.
-- **Structural tests constrain refactoring.** That is their purpose, and they
-  will occasionally be wrong.
+- **Scale 套件很慢**，只在每夜构建中作为合并门禁。
+- **Chaos 测试对时序敏感**，偶尔会不稳定。不稳定的 chaos 测试仍比没有 chaos 测试有价值，
+  但必须隔离而不是删除。
+- **结构性测试约束重构。** 这正是它们的目的，而它们偶尔会是错的。
 
-## 11. Implementation
+## 11. 实现
 
-`tests/test_suite_quality.py` for structural checks,
-`tests/test_driver_byte_budget.py` for cost, `tests/test_chaos.py` for injection,
-`tests/test_fake_cluster.py` for scale, `scripts/mutate.py` for mutation.
+结构性检查在 `tests/test_suite_quality.py`，代价检查在
+`tests/test_driver_byte_budget.py`，故障注入在 `tests/test_chaos.py`，规模在
+`tests/test_fake_cluster.py`，变异在 `scripts/mutate.py`。

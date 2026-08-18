@@ -1,236 +1,218 @@
 # Membership
 
-> Proposal; not the current implementation.
+> 提案；当前未实现。
 
+> worker 向自己的 Cell 声明存活，Cell 向共识声明存活。缺席是唯一的死亡信号，因为没有
+> 任何东西在监督一个它没有拉起的进程。
 
+## 1. 范围
 
-> Workers assert their own liveness against their cell; cells assert theirs
-> against consensus. Absence is the only death signal, because nothing supervises
-> a process it did not start.
+注册、lease 续约、过期，以及向上聚合。计划源码：`python/tinyray/membership.py` 和
+Registry 服务。
 
-## 1. Scope
+## 2. 职责
 
-Registration, lease renewal, expiry, and upward aggregation. Proposed source:
-`python/tinyray/membership.py` and the registry service.
+- 接受一个 worker 对某 Slot 和 Incarnation 的注册。
+- 在 worker 持续声明期间保持其有效。
+- worker 停止声明时将其移除。
+- 把 worker 存活性聚合成每 Cell 一份固定大小的 summary。
+- 无需达成一致即可复制，且在无副本应答时仍能服务读取。
 
-## 2. Responsibilities
+## 3. 非职责
 
-- Accept a worker's registration for a slot and incarnation.
-- Keep it alive while the worker asserts it.
-- Remove it when the worker stops.
-- Aggregate worker liveness into one fixed-size summary per cell.
-- Replicate without agreement, and serve reads when no replica answers.
-
-## 3. Non-responsibilities
-
-| Not done here | Owner |
+| 不在此处做 | 归属 |
 |---|---|
-| Starting or restarting a worker | L1, or [08-supervision](08-supervision.md) |
-| Deciding what a lease expiry means for work | Application (L3) |
-| Choosing the slot layout | Application (L3) |
-| Leadership | [03-reconciliation](03-reconciliation.md), over consensus |
-| Whether a live worker is *useful* | [04-readiness](04-readiness.md) |
+| 拉起或重启 worker | L1，或 [08-supervision](08-supervision.md) |
+| 决定 lease 过期对工作意味着什么 | 应用（L3） |
+| 选择 Slot 布局 | 应用（L3） |
+| leadership | [03-reconciliation](03-reconciliation.md)，基于共识 |
+| 一个存活的 worker 是否**可用** | [04-readiness](04-readiness.md) |
 
-The last row is a boundary worth stating: membership answers "is this process
-present", readiness answers "should it be given work". Conflating them produced
-a health check that returned `ok` whenever the event loop could still reply.
+最后一行的边界值得写明：membership 回答“这个进程在不在”，Readiness 回答“该不该给它派活”。
+把两者混同的结果是：只要事件循环还能应答就返回 `ok` 的健康检查。
 
-## 4. Position in the system
+## 4. 系统位置
 
-The bottom of the control plane. Discovery reads it, reconciliation compares
-against it, admission is reported through it.
+控制面的底层。discovery 读它，reconciliation 与它比较，Admission 经它上报。
 
-## 5. Dependencies
+## 5. 依赖
 
-- [01-identity](01-identity.md) for slots and incarnations.
-- [07-transport](07-transport.md) for the RPC.
-- A consensus store, for cell-level leases only.
+- [01-identity](01-identity.md) 提供 Slot 与 Incarnation。
+- [07-transport](07-transport.md) 提供 RPC。
+- 一个共识存储，仅用于 Cell 级 lease。
 
-## 6. Public contract
+## 6. 公共契约
 
 | Interface | Input | Output | Side effect | Blocking | Failure |
 |---|---|---|---|---|---|
-| `join(target, slot, parent=None)` | Served object, slot, cell address | `Membership` | Serves a control port; registers; starts heartbeat | **No** | `RegistryUnavailable` after the startup window |
-| `Membership.leave()` | — | — | Deregisters | Brief | Never raises |
-| `Membership.state` | — | `Current` / `Superseded` / `Expired` | None | No | None |
-| `Registry.register(...)` | Slot, incarnation, endpoint, meta | Lease | Records | No | None |
-| `Registry.heartbeat(lease, incarnation)` | Lease, incarnation | `known`, `superseded` | Refreshes | No | None |
-| `Registry.lookup(group, scope)` | Group and scope | Members | Sweeps expired | No | None |
-| `Registry.summary()` | — | Fixed-size summary | None | No | None |
+| `join(target, slot, parent=None)` | 被服务对象、Slot、Cell 地址 | `Membership` | 开控制端口；注册；启动 heartbeat | **否** | 超出启动窗口后 `RegistryUnavailable` |
+| `Membership.leave()` | —— | —— | 注销 | 短暂 | 从不抛出 |
+| `Membership.state` | —— | `Current` / `Superseded` / `Expired` | 无 | 否 | 无 |
+| `Registry.register(...)` | Slot、Incarnation、endpoint、meta | Lease | 记录 | 否 | 无 |
+| `Registry.heartbeat(lease, incarnation)` | lease、Incarnation | `known`、`superseded` | 续约 | 否 | 无 |
+| `Registry.lookup(group, scope)` | group 与作用域 | 成员 | 清理过期项 | 否 | 无 |
+| `Registry.summary()` | —— | 固定大小 summary | 无 | 否 | 无 |
 
-`join` does not block. The control port runs on its own thread, because
-`__main__` belongs to the framework
-([01-overview/03-principles.md](../01-overview/03-principles.md) P3).
+`join` 不阻塞。控制端口跑在自己的线程上，因为 `__main__` 属于框架
+（[01-overview/03-principles.md](../01-overview/03-principles.md) P3）。
 
-## 7. State ownership
+## 7. 状态所有权
 
 | State | Owner | Created | Updated by | Read by | Lifetime | Persisted |
 |---|---|---|---|---|---|---|
-| Registration | Worker | `join()` | Worker heartbeat | Peers, cell | Lease TTL | No |
-| Lease deadline | Registry | Registration | Heartbeat | Sweeper | Until expiry | No |
-| Membership version | Registry | First registration | Membership change only | Watchers | Registry process | No |
-| Cell summary | Cell | Cell start | Cell interval | Global | Cell lease TTL | No |
+| 注册记录 | worker | `join()` | worker heartbeat | peer、Cell | lease TTL | 否 |
+| lease 截止时间 | Registry | 注册时 | heartbeat | 清理器 | 直到过期 | 否 |
+| membership 版本号 | Registry | 首次注册 | 仅 membership 变更 | watcher | Registry 进程期 | 否 |
+| Cell summary | Cell | Cell 启动 | Cell 周期 | global | cell lease TTL | 否 |
 
-**Membership version moves only when membership does.** A heartbeat must not
-bump it, or every watcher re-fetches once per heartbeat per worker — a quadratic
-that hides inside a linear-looking design.
+**membership 版本号只在 membership 变更时前进。** heartbeat 绝不能推进它，否则每个
+watcher 都会按每 worker 每 heartbeat 的频率重新拉取 —— 一个藏在看似线性的设计里的二次
+复杂度。
 
-## 8. Lifecycle
+## 8. 生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Registering
     Registering --> Live
     Live --> Live : heartbeat
-    Live --> Expired : TTL elapsed
-    Live --> Superseded : newer incarnation
+    Live --> Expired : TTL 到期
+    Live --> Superseded : 出现更新的 Incarnation
     Live --> Left : leave()
-    Expired --> Registering : re-register
+    Expired --> Registering : 重新注册
     Superseded --> [*]
     Left --> [*]
 ```
 
-## 9. Main flow
+## 9. 主流程
 
 ```mermaid
 sequenceDiagram
-    participant W as Worker
-    participant R as Cell registry
-    participant S as Sweeper
-    participant G as Global
+    participant W as worker
+    participant R as Cell Registry
+    participant S as 清理器
+    participant G as global
 
     W->>R: register(slot, incarnation, endpoint)
-    R-->>W: lease, heartbeat interval
-    loop every interval
+    R-->>W: lease、heartbeat 间隔
+    loop 每个间隔
         W->>R: heartbeat(lease, incarnation)
         R-->>W: known / superseded
     end
-    S->>R: evict registrations past TTL
-    loop cell interval
-        R->>G: summary (fixed size) + renew cell lease
+    S->>R: 清除超过 TTL 的注册
+    loop Cell 间隔
+        R->>G: summary（固定大小）+ 续约 cell lease
     end
 ```
 
-The diagram cannot show: heartbeats never reach Global; the summary is the same
-size whether the cell holds ten workers or ten thousand; and the registry never
-probes the worker — it only observes absence.
+图中无法表达：heartbeat 永不到达 global；无论该 Cell 有十个还是一万个 worker，summary
+大小相同；Registry 从不探测 worker，只观察缺席。
 
-## 10. Concurrency and distributed semantics
+## 10. 并发与分布式语义
 
-**Writes go to every replica.** A registration succeeds if any replica accepted
-it. A replica that was down catches up on the next heartbeat, which is why
-replicas need no agreement
-([02-architecture/03-state-model.md](../02-architecture/03-state-model.md)).
+**写入发往每个副本。** 任一副本接受即注册成功。曾宕机的副本在下次 heartbeat 补齐，这正是
+副本无需达成一致的原因
+（[02-architecture/03-state-model.md](../02-architecture/03-state-model.md)）。
 
-**Reads take any replica**, preferring the last that answered, and fall back to
-cache when none does.
+**读取取任一副本**，优先上次应答过的，无人应答时回落到缓存。
 
-**Heartbeat interval is one third of the TTL**, so two consecutive losses do not
-evict a healthy worker.
+**heartbeat 间隔是 TTL 的三分之一**，因此连续丢两次也不会驱逐一个健康的 worker。
 
-**Eviction is by sweep**, so a worker can outlive its TTL by up to one sweep
-interval. Bounded and reported, not hidden.
+**驱逐通过扫描完成**，所以 worker 可能比其 TTL 多存活最多一个扫描间隔。这是有界且被上报
+的，不是被隐藏的。
 
-**Re-registration is not automatic on supersession.** A superseded worker that
-re-registers would fight its successor forever, alternately resurrecting a dead
-address. Unknown means re-register; superseded means stop.
+**被取代时不自动重新注册。** 一个被取代的 worker 若重新注册，会与其后继无休止地争夺，
+交替发布一个已死的地址。unknown 意味着重新注册，superseded 意味着停止。
 
-## 11. Correctness invariants
+## 11. 正确性不变量
 
-- Liveness is asserted by the owner; nothing infers it from process parenthood.
-- Worker heartbeats terminate at the cell.
-- The cell summary size is independent of worker count.
-- Membership version changes only on membership change.
-- A registration for a slot replaces the previous one; a slot never has two live
-  entries.
-- A registry replica that loses all state converges within one lease period.
-- A lookup served from cache reports that it was.
-- Consensus sees O(cells) leases, never O(workers).
+- 存活性由 owner 声明；没有任何东西从父子进程关系推断它。
+- worker heartbeat 终止于 Cell。
+- Cell summary 大小与 worker 数无关。
+- membership 版本号只在 membership 变更时改变。
+- 对一个 Slot 的注册替换先前那条；一个 Slot 绝不同时有两条存活记录。
+- 丢光全部状态的 Registry 副本在一个 lease 周期内收敛。
+- 由缓存服务的 lookup 必须上报这一事实。
+- 共识看到 O(cells) 个 lease，绝不是 O(workers)。
 
-## 12. Failure handling
+## 12. 故障处理
 
-| Failure | Detected by | Bound | Response |
+| 故障 | 检测方 | 时限 | 响应 |
 |---|---|---|---|
-| Worker dies | Lease expiry | TTL + sweep | Removed from lookups |
-| Worker hangs but process lives | Lease expiry | TTL + sweep | Removed; readiness would have caught it sooner |
-| Worker partitioned | Lease expiry | TTL + sweep | Removed; it re-registers on reconnect |
-| One replica down | Client failover | One request | Reads and writes continue |
-| All replicas down | Client | One request | Reads from cache; membership changes invisible |
-| Registry restarted empty | Heartbeat returns unknown | One interval | Everyone re-registers |
-| Cell loses its lease | Global | Cell TTL | Cell accepts no new work; running work continues |
+| worker 死亡 | lease 过期 | TTL + 扫描 | 从 lookup 移除 |
+| worker 挂住但进程还在 | lease 过期 | TTL + 扫描 | 移除；Readiness 本应更早发现 |
+| worker 被分区 | lease 过期 | TTL + 扫描 | 移除；重连后重新注册 |
+| 单副本宕机 | 客户端失败转移 | 一次请求 | 读写继续 |
+| 全部副本宕机 | 客户端 | 一次请求 | 读走缓存；membership 变更不可见 |
+| Registry 空重启 | heartbeat 返回 unknown | 一个间隔 | 所有人重新注册 |
+| Cell 失去 lease | global | Cell TTL | Cell 不接受新工作；运行中工作继续 |
 
-**The heartbeat thread swallows everything.** A sidecar losing contact with the
-registry must never be why a training job stops. The worst honest outcome is
-peers addressing a stale endpoint, which fencing makes safe.
+**heartbeat 线程吞掉一切异常。** 一个与 Registry 失联的 sidecar 绝不能成为训练作业停止的
+原因。最坏的诚实结果是 peer 寻址到一个陈旧 endpoint，而 fencing 使其安全。
 
-## 13. Configuration
+## 13. 配置
 
 | Field | Type | Default | Validation | Reader | Effect |
 |---|---|---|---|---|---|
-| `lease_ttl` | seconds | 30 | > 3 x heartbeat | Registry | Time to eviction |
-| `heartbeat_interval` | seconds | `ttl / 3` | > 0 | Worker | Assertion rate |
-| `sweep_interval` | seconds | 5 | > 0 | Registry | Eviction granularity |
-| `cache_ttl` | seconds | 5 | >= 0 | Client | Lookup freshness |
-| `startup_window` | seconds | 300 | > 0 | Worker | How long to wait for a registry that has not started |
-| `registry` | addresses | env `TINYRAY_REGISTRY` | Non-empty | Client | Replica list |
+| `lease_ttl` | 秒 | 30 | > 3 × heartbeat | Registry | 到驱逐的时间 |
+| `heartbeat_interval` | 秒 | `ttl / 3` | > 0 | worker | 声明频率 |
+| `sweep_interval` | 秒 | 5 | > 0 | Registry | 驱逐粒度 |
+| `cache_ttl` | 秒 | 5 | >= 0 | 客户端 | lookup 新鲜度 |
+| `startup_window` | 秒 | 300 | > 0 | worker | 等待尚未启动的 Registry 多久 |
+| `registry` | 地址 | 环境变量 `TINYRAY_REGISTRY` | 非空 | 客户端 | 副本列表 |
 
-`startup_window` exists because Slurm starts ranks in whatever order it likes; a
-worker that gave up because it was early would make startup a race.
+`startup_window` 存在是因为 Slurm 以任意顺序拉起 rank；一个因为启动太早而放弃的 worker
+会把启动变成竞态。
 
-Every timing constant is overridable from the environment, so a test can reach
-the deadline in seconds. A constant that only ever runs at its production value
-is a constant nobody tests.
+每个时间常量都可由环境变量覆盖，使测试能在秒级触达 deadline。**只在生产值上运行过的
+常量，是一个没人测过的常量。**
 
-## 14. Observability
+## 14. 可观测性
 
 | Metric | Producer | Meaning |
 |---|---|---|
-| `membership_registrations_total` | Registry | Joins, including re-registrations |
-| `membership_evictions_total` | Registry | Leases expired |
-| `membership_live` | Registry | Current members |
-| `membership_version` | Registry | Changes only on churn |
-| `heartbeat_failures_total` | Worker | Registry unreachable from a worker |
-| `registry_served_from_stale` | Client | Reads from cache |
-| `cell_summary_bytes` | Cell | Must not track worker count |
+| `membership_registrations_total` | Registry | 加入次数，含重新注册 |
+| `membership_evictions_total` | Registry | lease 过期数 |
+| `membership_live` | Registry | 当前成员数 |
+| `membership_version` | Registry | 只在抖动时变化 |
+| `heartbeat_failures_total` | worker | 从 worker 侧看 Registry 不可达 |
+| `registry_served_from_stale` | 客户端 | 由缓存服务的读取 |
+| `cell_summary_bytes` | Cell | 不得随 worker 数变化 |
 
-## 15. Testing
+## 15. 测试
 
-| Behaviour | Test file | Test case | Level |
+| Behavior | Test file | Test case | Level |
 |---|---|---|---|
-| A silent worker is evicted | `tests/test_membership.py` | `test_silent_worker_is_evicted` | Unit |
-| A heartbeating worker survives | `tests/test_membership.py` | `test_heartbeat_keeps_alive` | Unit |
-| Version does not move on heartbeat | `tests/test_membership.py` | `test_version_moves_only_on_change` | Unit |
-| Restart replaces, not duplicates | `tests/test_membership.py` | `test_restart_replaces_entry` | Unit |
-| Unknown lease re-registers | `tests/test_membership.py` | `test_unknown_lease_reregisters` | Unit |
-| Summary size independent of members | `tests/test_membership.py` | `test_summary_size_is_bounded` | Unit |
-| Workers self-register with no launcher | `tests/test_membership.py` | `test_join_without_launcher` | Integration |
-| Losing one replica is survivable | `tests/test_chaos.py` | `test_replica_failover` | Chaos |
-| Losing every replica does not stop work | `tests/test_chaos.py` | `test_total_registry_loss` | Chaos |
-| A death is noticed with nothing supervising | `tests/test_chaos.py` | `test_expiry_without_supervisor` | Chaos |
+| 沉默的 worker 被驱逐 | `tests/test_membership.py` | `test_silent_worker_is_evicted` | Unit |
+| 持续 heartbeat 的 worker 存活 | `tests/test_membership.py` | `test_heartbeat_keeps_alive` | Unit |
+| heartbeat 不推进版本号 | `tests/test_membership.py` | `test_version_moves_only_on_change` | Unit |
+| 重启是替换而非重复 | `tests/test_membership.py` | `test_restart_replaces_entry` | Unit |
+| unknown lease 触发重新注册 | `tests/test_membership.py` | `test_unknown_lease_reregisters` | Unit |
+| summary 大小与成员数无关 | `tests/test_membership.py` | `test_summary_size_is_bounded` | Unit |
+| 无 launcher 时 worker 自注册 | `tests/test_membership.py` | `test_join_without_launcher` | Integration |
+| 失去一个副本可存活 | `tests/test_chaos.py` | `test_replica_failover` | Chaos |
+| 失去全部副本不停止工作 | `tests/test_chaos.py` | `test_total_registry_loss` | Chaos |
+| 无监督者时仍能发现死亡 | `tests/test_chaos.py` | `test_expiry_without_supervisor` | Chaos |
 
-The replica tests must run with **at least two replicas, and must kill one**. A
-single-replica test proves nothing about availability — the previous prototype
-passed every single-replica test while two replicas were permanently broken by a
-shared identity ([08-project/02-decisions.md](../08-project/02-decisions.md)).
+副本相关测试必须**至少两个副本，并且杀掉其中一个**。单副本测试证明不了任何关于可用性的
+事 —— 此前的原型通过了全部单副本测试，而两个副本因共享 identity 而永久损坏
+（[08-project/02-decisions.md](../08-project/02-decisions.md)）。
 
-## 16. Limitations and trade-offs
+## 16. 限制与取舍
 
-- **Detection is not instant.** Up to `lease_ttl + sweep_interval`. Shortening
-  the TTL evicts healthy workers during a garbage-collection pause; the tradeoff
-  is a deployment decision.
-- **Stale reads are possible** for up to `cache_ttl`, and unbounded when every
-  replica is down. Fencing makes them safe, not free.
-- **The registry does not verify anything.** A worker that registers an endpoint
-  it cannot serve stays listed until its lease expires. Readiness is the answer,
-  not membership.
-- **No notification on change.** Watchers poll with a version. A push-based watch
-  is on the [roadmap](../08-project/03-roadmap.md).
+- **检测不是即时的。** 最多 `lease_ttl + sweep_interval`。缩短 TTL 会在 GC 停顿期间驱逐
+  健康 worker；这个折中是部署决定。
+- **陈旧读是可能的**，最多 `cache_ttl`，全部副本宕机时无上界。fencing 使其安全但不免费。
+- **Registry 不验证任何东西。** 一个注册了自己无法服务的 endpoint 的 worker，会一直挂在
+  名单上直到 lease 过期。答案是 Readiness，不是 membership。
+- **变更无通知。** watcher 带版本号轮询。基于推送的 watch 在
+  [roadmap](../08-project/03-roadmap.md) 上。
 
-## 17. Source mapping
+## 17. 源码映射
 
-Proposed: `python/tinyray/membership.py`, `python/tinyray/registry.py`.
+计划：`python/tinyray/membership.py`、`python/tinyray/registry.py`。
 
-Related: [01-identity](01-identity.md) for what is registered,
-[05-discovery](05-discovery.md) for reading it,
+相关：[01-identity](01-identity.md) 说明注册了什么，[05-discovery](05-discovery.md)
+说明如何读取，
 [04-protocols/02-membership-protocol.md](../04-protocols/02-membership-protocol.md)
-for the wire contract.
+是 wire 契约。
