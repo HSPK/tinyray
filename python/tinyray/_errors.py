@@ -29,6 +29,10 @@ class Stale(TinyrayError):
     """Out of touch with the registry, so the roster cannot be trusted."""
 
 
+class SeatTaken(TinyrayError):
+    """Asked for a seat exclusively and somebody live already holds it."""
+
+
 class NotFound(LookupError):
     """Nobody matched. Failure is explicit; there is no None."""
 

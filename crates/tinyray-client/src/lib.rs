@@ -35,7 +35,7 @@ fn pick_from(c: &CachedPool, filter: &serde_json::Value, require_ready: bool) ->
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (endpoint, pool, id, incarnation, policy, slot=None, size=None, url=None, methods=None))]
+    #[pyo3(signature = (endpoint, pool, id, incarnation, policy, slot=None, size=None, url=None, methods=None, exclusive=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: String,
@@ -47,6 +47,7 @@ impl Client {
         size: Option<u64>,
         url: Option<String>,
         methods: Option<Vec<String>>,
+        exclusive: bool,
     ) -> PyResult<Self> {
         let shared = Arc::new(Shared {
             endpoint,
@@ -61,6 +62,7 @@ impl Client {
             state: Mutex::new(serde_json::Value::Object(Default::default())),
             ready: AtomicBool::new(false),
             leaving: AtomicBool::new(false),
+            exclusive,
             watch: Mutex::new(Vec::new()),
             cache: RwLock::new(HashMap::new()),
             accepted: AtomicBool::new(true),

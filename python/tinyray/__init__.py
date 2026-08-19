@@ -21,6 +21,7 @@ from ._errors import (
     NotFound,
     PolicyError,
     RemoteError,
+    SeatTaken,
     Stale,
     TinyrayError,
     Unreachable,
@@ -37,6 +38,7 @@ __all__ = [
     "AsyncHandle",
     "Epoch",
     "Stale",
+    "SeatTaken",
     "NotFound",
     "PolicyError",
     "TinyrayError",
@@ -124,8 +126,15 @@ class Handle:
             )
         return BoundMethod(self, name, DEFAULT_TIMEOUT)
 
+    @property
+    def label(self) -> str:
+        """Short form for humans. `identity` stays exact -- it is the fencing
+        token -- but a random 63-bit id is unreadable in a log line."""
+        seat = self.slot if self.slot is not None else f"{self.id & 0xFFFF:04x}"
+        return f"{self.pool}/{seat}#{self.incarnation & 0xFFF:03x}"
+
     def __repr__(self) -> str:
-        return f"<Handle {self.identity} {self.url}>"
+        return f"<Handle {self.label} {self.url}>"
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -340,7 +349,7 @@ class Member:
 
     def __repr__(self) -> str:
         seat = self.slot if self.slot is not None else "-"
-        return f"<Member {self.pool}/{seat}#{self.incarnation}>"
+        return f"<Member {self.pool}/{seat}#{self.incarnation & 0xFFF:03x}>"
 
 
 _client: _Client | None = None
@@ -354,6 +363,7 @@ def join(
     size: int | None = None,
     url: str | None = None,
     serves: Any = None,
+    exclusive: bool = False,
 ) -> Member:
     """Report in. One line per process."""
     global _client
@@ -401,9 +411,17 @@ def join(
         size=size,
         url=url,
         methods=methods,
+        exclusive=exclusive,
     )
     c.watch([pool])
     c.start()
+    if exclusive and not c.accepted:
+        # Seats are last-writer-wins by default, because a restarting rank has
+        # to reclaim its seat while the dead one's lease is still running.
+        # exclusive= asks for the opposite, which is what an election wants.
+        if server is not None:
+            server.close()
+        raise SeatTaken(f"seat {slot} of {pool!r} is already held")
     _client = c
     member = Member(c, pool, slot, incarnation, server)
     # A process that exits normally should say goodbye, so the seat frees up

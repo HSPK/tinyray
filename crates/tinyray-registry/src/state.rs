@@ -107,8 +107,12 @@ impl Registry {
 
         let stored = p.members.get(&b.id).map(|r| r.member.incarnation);
         let watermark = p.high.get(&b.id).copied().unwrap_or(0);
-        let superseded =
-            b.incarnation < watermark || stored.is_some_and(|cur| cur > b.incarnation);
+        // Asking exclusively means "only if nobody holds it": the lease has
+        // not lapsed, so somebody does.
+        let occupied = b.exclusive && stored.is_some_and(|cur| cur != b.incarnation);
+        let superseded = occupied
+            || b.incarnation < watermark
+            || stored.is_some_and(|cur| cur > b.incarnation);
 
         let accepted = !superseded;
         if superseded {

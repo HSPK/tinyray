@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state: serde_json::json!({"shard": i % 8}),
                     ready: true,
                     leaving: false,
+                    exclusive: false,
                     methods: vec![],
                     watch: watch.clone(),
                     seen: seen.clone(),

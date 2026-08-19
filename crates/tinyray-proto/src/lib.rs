@@ -62,6 +62,11 @@ pub struct Beat {
     pub ready: bool,
     #[serde(default)]
     pub leaving: bool,
+    /// Take the seat only if it is free. Restarting members want the opposite
+    /// -- a rank must reclaim its seat even while the dead one's lease runs --
+    /// so this is opt-in.
+    #[serde(default)]
+    pub exclusive: bool,
     #[serde(default)]
     pub methods: Vec<String>,
     /// Pools this process wants to hear about.

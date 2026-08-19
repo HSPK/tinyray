@@ -67,10 +67,12 @@ tinyray 知道「engine/17 说自己没准备好」，但不知道 model version
 | | `all` | 要全部能用的 |
 | | `epoch` | 把名单冻住 |
 | Handle | `url` | 逃生口：流式、大包、长任务自己发 |
+| | `label` | 短身份，给日志看（`identity` 是精确的 fencing 令牌） |
 | | `timeout` | 改这一次调用的超时 |
 | Epoch | `members` | 冻住的那份名单 |
 | | `valid` | 这份名单还作不作数 |
 | 异常 | `Unreachable` / `Fenced` / `RemoteError` | 见 §5 |
+| | `Stale` / `SeatTaken` / `NotFound` | 断线开轮 / 座位被占 / 找不到人 |
 
 ```python
 import tinyray
@@ -305,8 +307,10 @@ HTTP 上走的只有那条元数据。
 
 `stateful` 就是原来漏掉的那一族：**认座位，但不用叫停全场。**
 
-**「只能有一个」几乎白送** —— 固定名字 + 租约 + 认任期，先到先得，
-租约过期换人。不用第五个预设。
+**「只能有一个」不用第五个预设**，但要注意默认语义是**后来者居上**：
+一个重启的 rank 必须能抢回自己的座位，哪怕死掉那个的租约还没过期。
+选主要的恰好相反，所以它得显式要 `exclusive=True` —— 座位有人就拒绝，
+等租约过期再来。
 
 ### 两条不能破的规矩
 
