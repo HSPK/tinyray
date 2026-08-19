@@ -1,0 +1,161 @@
+"""M1 acceptance: report in, find each other, survive the registry dying."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import textwrap
+import time
+
+import pytest
+
+import tinyray
+
+DRIVER = textwrap.dedent(
+    """
+    import json, os, sys, time
+    import tinyray
+    pool_name, policy, count, hold_s = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+    me = tinyray.join(pool_name, policy)
+    me.ready(worker=os.getpid())
+    print("READY", flush=True)
+    sys.stdin.readline()
+    peers = tinyray.pool(pool_name).all()
+    print(json.dumps({"seen": len(peers), "beats": me.stats()}), flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+def _spawn(n: int, pool_name: str, policy: str = "churn") -> list[subprocess.Popen]:
+    procs = []
+    for _ in range(n):
+        p = subprocess.Popen(
+            [sys.executable, "-c", DRIVER, pool_name, policy, "1", "0"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        procs.append(p)
+    for p in procs:
+        assert p.stdout.readline().strip() == "READY"
+    return procs
+
+
+def _shutdown(procs):
+    for p in procs:
+        try:
+            p.stdin.write("\n\n")
+            p.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+    for p in procs:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def test_join_then_find_each_other(registry):
+    me = tinyray.join("env", "churn")
+    me.ready(role="driver")
+    procs = _spawn(3, "env")
+    try:
+        peers = tinyray.pool("env").wait(count=4, timeout=10)
+        assert len(peers) == 4
+        assert all(h.ready for h in peers)
+        assert {h.incarnation for h in peers}, "every member carries a tenure"
+    finally:
+        _shutdown(procs)
+        me.leave()
+
+
+def test_leaving_is_immediate_not_after_ttl(registry):
+    me = tinyray.join("env", "churn")
+    me.ready()
+    procs = _spawn(2, "env")
+    tinyray.pool("env").wait(count=3, timeout=10)
+    t0 = time.monotonic()
+    _shutdown(procs)
+    # A departing member sends one last beat, so the seat frees up well
+    # before the 2s lease would have expired.
+    tinyray.pool("env").wait(count=1, timeout=10)
+
+    deadline = time.monotonic() + 5
+    while len(tinyray.pool("env").all()) > 1 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    elapsed = time.monotonic() - t0
+    assert len(tinyray.pool("env").all()) == 1
+    assert elapsed < registry.ttl_ms / 1000, f"took {elapsed:.2f}s, lease is {registry.ttl_ms}ms"
+    me.leave()
+
+
+def test_dead_member_expires_without_a_supervisor(registry):
+    me = tinyray.join("env", "churn")
+    me.ready()
+    procs = _spawn(2, "env")
+    tinyray.pool("env").wait(count=3, timeout=10)
+    for p in procs:  # SIGKILL: no farewell beat, only the lease can reap it
+        p.kill()
+        p.wait(timeout=5)
+
+    deadline = time.monotonic() + registry.ttl_ms / 1000 * 3 + 2
+    while len(tinyray.pool("env").all()) > 1 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(tinyray.pool("env").all()) == 1
+    me.leave()
+
+
+def test_filter_by_state(registry):
+    me = tinyray.join("engine", "serving")
+    me.ready(model_version=17)
+    tinyray.pool("engine").wait(count=1, timeout=10)
+
+    assert len(tinyray.pool("engine").all(model_version=17)) == 1
+    assert tinyray.pool("engine").all(model_version=18) == []
+    with pytest.raises(tinyray.NotFound):
+        tinyray.pool("engine").pick(model_version=18)
+
+    me.ready(model_version=18)
+    deadline = time.monotonic() + 5
+    while not tinyray.pool("engine").all(model_version=18) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(tinyray.pool("engine").all(model_version=18)) == 1
+    me.leave()
+
+
+def test_unready_members_are_not_picked(registry):
+    me = tinyray.join("engine", "serving")
+    # Registered but never declared ready: present, but not eligible.
+    deadline = time.monotonic() + 5
+    while tinyray.pool("engine")._c.pool_info("engine") is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    with pytest.raises(tinyray.NotFound):
+        tinyray.pool("engine").pick()
+    me.ready()
+    assert len(tinyray.pool("engine").wait(count=1, timeout=5)) == 1
+    me.leave()
+
+
+def test_missing_seat_raises_instead_of_substituting(registry):
+    me = tinyray.join("dispatcher", "stateful", slot=0)
+    me.ready()
+    tinyray.pool("dispatcher").wait(count=1, timeout=10)
+    assert tinyray.pool("dispatcher").slot(0).slot == 0
+    with pytest.raises(tinyray.NotFound):
+        tinyray.pool("dispatcher").slot(3)
+    me.leave()
+
+
+def test_slotted_policy_requires_a_seat(registry):
+    with pytest.raises(tinyray.PolicyError):
+        tinyray.join("trainer", "collective")
+
+
+def test_lookup_before_join_is_explicit():
+    import importlib
+
+    mod = importlib.reload(tinyray)
+    with pytest.raises(RuntimeError):
+        mod.pool("anything")

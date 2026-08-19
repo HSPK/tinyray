@@ -1,0 +1,14 @@
+[package]
+name = "tinyray-registry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tinyray-proto = { path = "../tinyray-proto" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
