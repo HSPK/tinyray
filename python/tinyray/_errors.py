@@ -25,6 +25,10 @@ class RemoteError(TinyrayError):
         self.type, self.message, self.traceback = type_name, message, traceback
 
 
+class Stale(TinyrayError):
+    """Out of touch with the registry, so the roster cannot be trusted."""
+
+
 class NotFound(LookupError):
     """Nobody matched. Failure is explicit; there is no None."""
 

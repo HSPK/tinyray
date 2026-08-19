@@ -17,7 +17,7 @@ print(engine.url)
 
 ## 现状
 
-**M1 + M2 已实现。** 报到、租约、本地缓存、找人，以及调用层：
+**M1 + M2 + M3 已实现**，约 1,200 行。报到、租约、本地缓存、找人，以及调用层：
 
 ```python
 class Collector:
@@ -39,7 +39,20 @@ curl -X POST http://host:port/call/assign -d '{"task":"t"}'
 curl http://host:port/_methods
 ```
 
-**M3（编组与 `epoch`）还没写。**
+**M3 也已实现** —— 座位、任期与冻结名单：
+
+```python
+me = tinyray.join("trainer", "collective", slot=RANK, size=WORLD_SIZE)
+me.ready()
+
+ep = tinyray.pool("trainer").epoch()   # 等人齐，然后冻住
+build_process_group(ep.members)        # 每个 rank 拿到的必然一样
+
+def watchdog():                        # 训练循环里查是没用的：卡住的 rank 到不了
+    while ep.valid:                    # 那一行。后台线程可以，因为 NCCL 阻塞时
+        time.sleep(0.5)                # 会放开 GIL。
+    pg._abort()
+```
 
 ## 文档
 

@@ -47,6 +47,10 @@ pub struct Shared {
     pub beats_ok: AtomicU64,
     pub beats_failed: AtomicU64,
     pub interval_ms: AtomicU64,
+    /// Monotonic ms of the last successful beat. Freezing a round on a stale
+    /// roster is unsafe, so epoch() needs to know when we are flying blind.
+    pub last_ok_ms: AtomicU64,
+    pub started: std::time::Instant,
     /// Rung when something we publish changes. Without it, subscribing to a
     /// pool or declaring readiness costs a full heartbeat interval of silence,
     /// which is long enough for short-lived peers to come and go unseen.
@@ -54,6 +58,16 @@ pub struct Shared {
 }
 
 impl Shared {
+    pub fn mark_ok(&self) {
+        self.last_ok_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last successful beat.
+    pub fn silence_ms(&self) -> u64 {
+        let now = self.started.elapsed().as_millis() as u64;
+        now.saturating_sub(self.last_ok_ms.load(Ordering::Relaxed))
+    }
+
     fn compose(&self) -> Beat {
         let cache = self.cache.read().unwrap();
         let watch = self.watch.lock().unwrap().clone();
@@ -152,6 +166,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                     let alive = shared.apply(&ack);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
+                    shared.mark_ok();
                     next = (next + i) % shared.endpoints.len();
                     if !alive {
                         // Superseded. Beating on would only be waiting for the
@@ -186,6 +201,7 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.apply(&ack);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
+                s.mark_ok();
                 return true;
             }
         }

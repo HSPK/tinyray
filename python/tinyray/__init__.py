@@ -16,7 +16,15 @@ import time
 from typing import Any
 
 from ._rpc import DEFAULT_TIMEOUT, AsyncHandleMixin, BoundMethod
-from ._errors import Fenced, NotFound, PolicyError, RemoteError, TinyrayError, Unreachable
+from ._errors import (
+    Fenced,
+    NotFound,
+    PolicyError,
+    RemoteError,
+    Stale,
+    TinyrayError,
+    Unreachable,
+)
 from ._serve import MethodServer
 from ._tinyray import Client as _Client
 
@@ -27,6 +35,8 @@ __all__ = [
     "Pool",
     "Handle",
     "AsyncHandle",
+    "Epoch",
+    "Stale",
     "NotFound",
     "PolicyError",
     "TinyrayError",
@@ -133,6 +143,50 @@ class AsyncHandle(AsyncHandleMixin, Handle):
     """A Handle whose methods return awaitables."""
 
 
+class Epoch:
+    """A frozen roster.
+
+    `all()` is live: two ranks calling it 50ms apart can get different lists,
+    build different process groups, and deadlock. A round needs everyone
+    holding the *same* list, which is what freezing gives.
+    """
+
+    __slots__ = ("pool", "members", "roster", "_c")
+
+    def __init__(self, pool_name: str, client: _Client, members: list[Handle], roster: int):
+        self.pool = pool_name
+        self.members = members
+        self.roster = roster
+        self._c = client
+
+    @property
+    def valid(self) -> bool:
+        """False once the occupants change. Checking this in a training loop is
+        useless -- a stuck rank never reaches the check. Use a watchdog thread;
+        NCCL releases the GIL while it blocks, so one can still run."""
+        info = self._c.pool_info(self.pool)
+        # Losing the registry does not invalidate a group that is still
+        # running; it only costs fast detection. Killing the round here would
+        # contradict "the registry can die without stopping training".
+        return info is None or info[1] == self.roster
+
+    def __len__(self) -> int:
+        return len(self.members)
+
+    def __iter__(self):
+        return iter(self.members)
+
+    def slot(self, k: int) -> Handle:
+        for h in self.members:
+            if h.slot == k:
+                return h
+        raise NotFound(f"seat {k} is not in this round of {self.pool!r}")
+
+    def __repr__(self) -> str:
+        state = "valid" if self.valid else "broken"
+        return f"<Epoch {self.pool} members={len(self.members)} roster={self.roster} {state}>"
+
+
 class Pool:
     """One group. Lookups read the local cache: no network, so no timeouts."""
 
@@ -181,6 +235,41 @@ class Pool:
                     f"{self._name!r} matching {filt}, saw {len(found)}"
                 )
             time.sleep(0.05)
+
+    def epoch(self, min: int | None = None, timeout: float = 60.0) -> Epoch:
+        """Wait for the round to be complete, then freeze it.
+
+        Every rank that freezes the same fingerprint saw the same occupants,
+        because the fingerprint is computed by the registry from seats and
+        tenures alone.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            info = self._c.pool_info(self._name)
+            # A stale roster is not safe to build a collective on: ranks could
+            # disagree. Refuse rather than freeze something we cannot trust.
+            if self._c.silence_ms > self._lease_ms():
+                raise Stale(
+                    f"cannot open a round of {self._name!r}: no contact with the "
+                    f"registry for {self._c.silence_ms}ms"
+                )
+            target = min if min is not None else (info[2] if info else None)
+            if target is None:
+                raise PolicyError(
+                    f"{self._name!r} declares no size; pass min= or join with size="
+                )
+            members = self._members({}, require_ready=True)
+            if len(members) >= target:
+                return Epoch(self._name, self._c, members, info[1])
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"waited {timeout}s to open a round of {self._name!r}: "
+                    f"{len(members)} of {target} present"
+                )
+            time.sleep(0.02)
+
+    def _lease_ms(self) -> int:
+        return max(int(self._c.stats().get("interval_ms", 1000)) * 4, 1000)
 
     def __len__(self) -> int:
         return len(self.all())

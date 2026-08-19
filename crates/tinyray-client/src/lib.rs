@@ -66,6 +66,8 @@ impl Client {
             beats_ok: AtomicU64::new(0),
             beats_failed: AtomicU64::new(0),
             interval_ms: AtomicU64::new(1000),
+            last_ok_ms: AtomicU64::new(0),
+            started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
         });
         Ok(Self { shared, rt: None })
@@ -142,6 +144,13 @@ impl Client {
         }
     }
 
+    /// Milliseconds since the last successful beat; the registry is
+    /// unreachable when this exceeds the lease.
+    #[getter]
+    fn silence_ms(&self) -> u64 {
+        self.shared.silence_ms()
+    }
+
     #[getter]
     fn accepted(&self) -> bool {
         self.shared.accepted.load(Ordering::Relaxed)
@@ -152,6 +161,7 @@ impl Client {
             ("beats_ok".into(), self.shared.beats_ok.load(Ordering::Relaxed)),
             ("beats_failed".into(), self.shared.beats_failed.load(Ordering::Relaxed)),
             ("interval_ms".into(), self.shared.interval_ms.load(Ordering::Relaxed)),
+            ("silence_ms".into(), self.shared.silence_ms()),
         ])
     }
 }
