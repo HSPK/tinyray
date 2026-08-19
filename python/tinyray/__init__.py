@@ -15,7 +15,8 @@ import socket
 import time
 from typing import Any
 
-from ._rpc import DEFAULT_TIMEOUT, AsyncHandleMixin, BoundMethod
+from . import _rpc
+from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
 from ._errors import (
     Fenced,
     NotFound,
@@ -26,7 +27,7 @@ from ._errors import (
     TinyrayError,
     Unreachable,
 )
-from ._serve import MethodServer
+from ._serve import MethodServer as _MethodServer
 from ._tinyray import Client as _Client
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "Pool",
     "Handle",
     "AsyncHandle",
+    "AsyncPool",
     "Epoch",
     "Stale",
     "SeatTaken",
@@ -124,7 +126,7 @@ class Handle:
             raise AttributeError(
                 f"{self.identity} serves {sorted(self._methods) or 'no methods'}, not {name!r}"
             )
-        return BoundMethod(self, name, DEFAULT_TIMEOUT)
+        return _rpc.BoundMethod(self, name, _rpc.DEFAULT_TIMEOUT)
 
     @property
     def label(self) -> str:
@@ -147,7 +149,7 @@ class Handle:
         return hash((self.pool, self.id, self.incarnation))
 
 
-class AsyncHandle(AsyncHandleMixin, Handle):
+class AsyncHandle(_AsyncHandleMixin, Handle):
     """A Handle whose methods return awaitables."""
 
 
@@ -296,7 +298,7 @@ class Member:
         pool_name: str,
         slot: int | None,
         incarnation: int,
-        server: MethodServer | None = None,
+        server: _MethodServer | None = None,
     ):
         self._c = client
         self._server = server
@@ -407,7 +409,7 @@ def join(
     methods: list[str] = []
     if serves is not None:
         seat = slot if slot is not None else ident
-        server = MethodServer(serves, f"{pool}/{seat}#{incarnation}")
+        server = _MethodServer(serves, f"{pool}/{seat}#{incarnation}")
         methods = server.methods
         url = url or server.url(_advertise())
 
@@ -455,12 +457,14 @@ class AsyncPool(Pool):
 
 
 def pool(name: str) -> Pool:
+    """Look up a group. Subscribing is implicit and takes effect immediately."""
     if _client is None:
         raise RuntimeError("call tinyray.join(...) before looking anyone up")
     return Pool(name, _client)
 
 
 def apool(name: str) -> AsyncPool:
+    """Same as `pool`, but its handles hand back awaitables."""
     if _client is None:
         raise RuntimeError("call tinyray.join(...) before looking anyone up")
     return AsyncPool(name, _client)

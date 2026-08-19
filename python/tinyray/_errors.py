@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 class TinyrayError(Exception):
-    pass
+    """Base for everything tinyray raises, so one except clause catches it."""
 
 
 class Unreachable(TinyrayError):
@@ -38,4 +38,4 @@ class NotFound(LookupError):
 
 
 class PolicyError(ValueError):
-    pass
+    """The policy, seat or size asked for does not make sense together."""
