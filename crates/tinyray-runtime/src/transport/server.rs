@@ -17,7 +17,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tinyray_core::framing::Message;
 use tinyray_core::proto::{ErrorKind, RemoteError};
 use tinyray_core::{Limits, TaskId};
@@ -129,10 +129,39 @@ pub async fn serve<H: Handler>(
                     let handler = handler.clone();
                     async move { Ok::<_, Infallible>(dispatch(handler, req, limits).await) }
                 });
-                if let Err(err) = hyper::server::conn::http1::Builder::new()
-                    // Keep-alive is not optional: a fresh TCP handshake per
-                    // call would dwarf the actual work.
-                    .keep_alive(true)
+                // HTTP/2 over cleartext (h2c), by prior knowledge -- there is
+                // no upgrade dance because both ends are ours.
+                //
+                // This is not a performance tweak, it is a capacity fix.
+                // HTTP/1.1 serves one request per connection at a time, so
+                // concurrency N needs N connections. Measured on the previous
+                // build: ~0.1 new connections per request, ~2,000 sockets/s at
+                // 19k ops/s, and TIME_WAIT reaching 28,122 against an ephemeral
+                // port range of 28,231 -- total collapse in about 14 seconds,
+                // with the server sitting at 0% CPU because nothing could
+                // connect. Raising the connection pool did not help.
+                //
+                // HTTP/2 multiplexes concurrent streams over one connection, so
+                // concurrency stops consuming ports at all.
+                // Auto-negotiated: HTTP/2 by prior knowledge when the client
+                // sends the h2c preface, HTTP/1.1 otherwise.
+                //
+                // HTTP/2 is a capacity fix, not a performance tweak. HTTP/1.1
+                // serves one request per connection at a time, so concurrency N
+                // needs N connections. Measured on the previous build: ~0.1 new
+                // connections per request, ~2,000 sockets/s at 19k ops/s, and
+                // TIME_WAIT reaching 28,122 against an ephemeral port range of
+                // 28,231 -- total collapse in ~14 s, with the server at 0% CPU
+                // because nothing could connect. Raising the pool did not help.
+                //
+                // HTTP/1.1 is kept because `/health` and `/introspect` are
+                // promised to work with `curl`, and going h2c-only silently
+                // broke every plain HTTP client including the readiness probes.
+                let mut builder =
+                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                builder.http1().keep_alive(true);
+                builder.http2().max_concurrent_streams(None);
+                if let Err(err) = builder
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                 {

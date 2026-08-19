@@ -19,8 +19,8 @@ tinyray-core = { path = "crates/tinyray-core" }
 tinyray-runtime = { path = "crates/tinyray-runtime" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "process", "signal"] }
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1", "http2", "server-auto"] }
 http-body-util = "0.1"
 parking_lot = "0.12"
 tracing = "0.1"

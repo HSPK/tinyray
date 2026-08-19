@@ -134,8 +134,17 @@ impl TransportClient {
         connector.set_nodelay(true);
         connector.set_keepalive(Some(Duration::from_secs(60)));
 
+        // h2c by prior knowledge. One connection carries every concurrent
+        // request, so `connections_per_peer` no longer bounds concurrency --
+        // it is now only how many spare connections are kept for failover.
         let inner =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                // HTTP/2 keep-alive needs an explicit timer; without it hyper
+                // panics with "You must supply a timer" on the first request.
+                .timer(hyper_util::rt::TokioTimer::new())
+                .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+                .http2_keep_alive_while_idle(true)
                 .pool_max_idle_per_host(config.connections_per_peer)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .build(connector);
