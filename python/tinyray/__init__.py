@@ -325,6 +325,16 @@ class Member:
         """False once a later incarnation has taken this seat."""
         return self._c.accepted
 
+    @property
+    def silence_ms(self) -> int:
+        """Milliseconds since the last beat the registry answered.
+
+        Everything keeps working while this climbs -- lookups read the local
+        cache and calls were always peer to peer -- but fast failure detection
+        is gone until it drops again.
+        """
+        return self._c.silence_ms
+
     def stats(self) -> dict[str, int]:
         return self._c.stats()
 
