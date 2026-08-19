@@ -14,7 +14,11 @@ use tinyray_proto::Member;
 #[pyclass]
 pub struct Client {
     shared: Arc<Shared>,
-    rt: Option<tokio::runtime::Runtime>,
+    // Interior mutability, so every method can take &self. A &mut self method
+    // holds pyo3's borrow for its whole duration, and leave() blocks on a
+    // network round trip -- long enough for a watchdog thread reading
+    // ep.valid to hit "Already mutably borrowed" on every clean shutdown.
+    rt: Mutex<Option<tokio::runtime::Runtime>>,
 }
 
 fn pick_from(c: &CachedPool, filter: &serde_json::Value, require_ready: bool) -> Vec<Member> {
@@ -31,10 +35,10 @@ fn pick_from(c: &CachedPool, filter: &serde_json::Value, require_ready: bool) ->
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (endpoints, pool, id, incarnation, policy, slot=None, size=None, url=None, methods=None))]
+    #[pyo3(signature = (endpoint, pool, id, incarnation, policy, slot=None, size=None, url=None, methods=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        endpoints: Vec<String>,
+        endpoint: String,
         pool: String,
         id: u64,
         incarnation: u64,
@@ -44,11 +48,8 @@ impl Client {
         url: Option<String>,
         methods: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        if endpoints.is_empty() {
-            return Err(PyRuntimeError::new_err("no registry endpoints configured"));
-        }
         let shared = Arc::new(Shared {
-            endpoints,
+            endpoint,
             pool,
             id,
             slot,
@@ -70,17 +71,17 @@ impl Client {
             started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
         });
-        Ok(Self { shared, rt: None })
+        Ok(Self { shared, rt: Mutex::new(None) })
     }
 
     /// Blocks for one beat so the caller is registered on return, then hands
     /// the loop to the tokio threads.
-    fn start(&mut self, py: Python<'_>) -> PyResult<bool> {
+    fn start(&self, py: Python<'_>) -> PyResult<bool> {
         let rt = spawn(self.shared.clone());
         let s = self.shared.clone();
         // Release the GIL: this is a network round trip.
         let ok = py.allow_threads(|| beat_once(&rt, &s));
-        self.rt = Some(rt);
+        *self.rt.lock().unwrap() = Some(rt);
         Ok(ok)
     }
 
@@ -133,13 +134,12 @@ impl Client {
         cache.get(pool).map(|c| (c.version, c.roster, c.size, c.methods.clone()))
     }
 
-    fn leave(&mut self, py: Python<'_>) {
+    fn leave(&self, py: Python<'_>) {
         self.shared.leaving.store(true, Ordering::Relaxed);
-        if let Some(rt) = &self.rt {
+        let rt = self.rt.lock().unwrap().take();
+        if let Some(rt) = rt {
             let s = self.shared.clone();
-            py.allow_threads(|| beat_once(rt, &s));
-        }
-        if let Some(rt) = self.rt.take() {
+            py.allow_threads(|| beat_once(&rt, &s));
             rt.shutdown_background();
         }
     }
@@ -166,8 +166,19 @@ impl Client {
     }
 }
 
+/// Run the registry in this process. Shipping it inside the extension module
+/// means `pip install tinyray` gives you the server too, with no second
+/// artifact to build, version or distribute.
+#[pyfunction]
+#[pyo3(signature = (listen, ttl_ms))]
+fn serve_registry(py: Python<'_>, listen: &str, ttl_ms: u64) -> PyResult<()> {
+    py.allow_threads(|| tinyray_registry::run(listen, ttl_ms, |addr| println!("{addr}")))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn _tinyray(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
+    m.add_function(wrap_pyfunction!(serve_registry, m)?)?;
     Ok(())
 }

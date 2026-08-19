@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 tinyray-proto = { path = "../tinyray-proto" }
+tinyray-registry = { path = "../tinyray-registry" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

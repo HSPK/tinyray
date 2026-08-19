@@ -29,7 +29,7 @@ pub struct CachedPool {
 
 /// Everything the beat loop needs, without touching Python.
 pub struct Shared {
-    pub endpoints: Vec<String>,
+    pub endpoint: String,
     pub pool: String,
     pub id: u64,
     pub slot: Option<u64>,
@@ -146,11 +146,15 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
 
     rt.spawn(async move {
         // `.timer()` is required or hyper panics with "You must supply a timer".
+        // h2c with prior knowledge. HTTP/1.1 cannot multiplex, so every
+        // concurrent call needs its own socket -- the churn that drained the
+        // ephemeral port range and drove throughput to zero. The registry
+        // negotiates either, so asking for h2 costs nothing.
         let http: HttpClient = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
+            .http2_only(true)
             .pool_idle_timeout(Duration::from_secs(60))
             .build_http();
-        let mut next = 0usize;
         loop {
             if shared.leaving.load(Ordering::Relaxed) && shared.beats_ok.load(Ordering::Relaxed) > 0
             {
@@ -158,27 +162,24 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 return;
             }
             let beat = shared.compose();
-            let mut ok = false;
-            // Try replicas in order; any one of them holds the whole roster.
-            for i in 0..shared.endpoints.len() {
-                let ep = &shared.endpoints[(next + i) % shared.endpoints.len()];
-                if let Some(ack) = post(&http, ep, &beat).await {
+            match post(&http, &shared.endpoint, &beat).await {
+                Some(ack) => {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                     let alive = shared.apply(&ack);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     shared.mark_ok();
-                    next = (next + i) % shared.endpoints.len();
                     if !alive {
                         // Superseded. Beating on would only be waiting for the
                         // replacement to die so we could take the seat back.
                         return;
                     }
-                    ok = true;
-                    break;
                 }
-            }
-            if !ok {
-                shared.beats_failed.fetch_add(1, Ordering::Relaxed);
+                // Losing the registry is survivable: lookups keep working from
+                // cache, and the roster regrows within one interval when it
+                // comes back. Nothing here needs to escalate.
+                None => {
+                    shared.beats_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
             let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
             // Wake early if the process has something new to say.
@@ -194,17 +195,20 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
     let s = shared.clone();
     rt.block_on(async move {
         let http: HttpClient =
-            Client::builder(TokioExecutor::new()).timer(TokioTimer::new()).build_http();
+            Client::builder(TokioExecutor::new())
+                .timer(TokioTimer::new())
+                .http2_only(true)
+                .build_http();
         let beat = s.compose();
-        for ep in &s.endpoints {
-            if let Some(ack) = post(&http, ep, &beat).await {
+        match post(&http, &s.endpoint, &beat).await {
+            Some(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.apply(&ack);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
                 s.mark_ok();
-                return true;
+                true
             }
+            None => false,
         }
-        false
     })
 }

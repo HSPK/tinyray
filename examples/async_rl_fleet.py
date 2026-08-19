@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-REGISTRY = ROOT / "target" / "release" / "tinyray-registry"
+REGISTRY = Path(sys.executable).parent / "tinyray"
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +239,7 @@ def main() -> int:
         return 0
 
     if not REGISTRY.exists():
-        print(f"build the registry first: cargo build --release ({REGISTRY} missing)")
+        print(f"install first: maturin develop --release ({REGISTRY} missing)")
         return 1
 
     port = free_port()

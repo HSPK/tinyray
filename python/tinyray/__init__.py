@@ -53,14 +53,13 @@ _RANK_VARS = ("TINYRAY_SLOT", "RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK")
 _SIZE_VARS = ("TINYRAY_SIZE", "WORLD_SIZE", "SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE")
 
 
-def _endpoints() -> list[str]:
-    raw = os.environ.get("TINYRAY_REGISTRY", "127.0.0.1:8760")
-    out = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part:
-            out.append(part if "://" in part else f"http://{part}")
-    return out
+def _endpoint() -> str:
+    """One registry. Losing it is survivable -- lookups keep working from cache
+    and the roster regrows within one interval -- so replicas buy little and
+    cost a lot: the delta cursor is per-registry, so failing over silently
+    freezes the cache."""
+    raw = os.environ.get("TINYRAY_REGISTRY", "127.0.0.1:8760").strip()
+    return raw if "://" in raw else f"http://{raw}"
 
 
 def _advertise() -> str:
@@ -393,7 +392,7 @@ def join(
         url = url or server.url(_advertise())
 
     c = _Client(
-        endpoints=_endpoints(),
+        endpoint=_endpoint(),
         pool=pool,
         id=ident,
         incarnation=incarnation,

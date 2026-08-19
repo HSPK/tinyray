@@ -3,6 +3,18 @@ name = "tinyray-registry"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "tinyray_registry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tinyray"
+path = "src/main.rs"
+
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+
 [dependencies]
 tinyray-proto = { path = "../tinyray-proto" }
 serde.workspace = true

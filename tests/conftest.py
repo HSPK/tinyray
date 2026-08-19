@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import subprocess
 import time
 import urllib.error
@@ -11,7 +12,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "target" / "release" / "tinyray-registry"
+# The console script installed by the wheel, not a cargo artifact: the server
+# ships in the same package as the client.
+BIN = Path(sys.executable).parent / "tinyray"
 
 
 def free_port() -> int:
@@ -33,7 +36,7 @@ class RegistryProc:
         return f"127.0.0.1:{self.port}"
 
     def start(self) -> None:
-        assert BIN.exists(), f"{BIN} missing; run: cargo build --release"
+        assert BIN.exists(), f"{BIN} missing; run: maturin develop --release"
         self.proc = subprocess.Popen(
             [str(BIN), "--listen", self.endpoint, "--ttl-ms", str(self.ttl_ms)],
             stdout=subprocess.DEVNULL,
@@ -58,6 +61,22 @@ class RegistryProc:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
             self.proc = None
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_membership():
+    """One process is one member, so a test that fails before leave() would
+    make every later test fail with "already joined". Reset it centrally
+    rather than relying on each test to clean up after itself."""
+    yield
+    import tinyray
+
+    if tinyray._client is not None:
+        try:
+            tinyray._client.leave()
+        except Exception:
+            pass
+        tinyray._client = None
 
 
 @pytest.fixture

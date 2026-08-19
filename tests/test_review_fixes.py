@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 import subprocess
+import threading
 import sys
 import textwrap
 import time
@@ -155,3 +156,45 @@ def test_async_calls_reuse_one_connection(registry):
         proc.stdin.flush()
         proc.wait(timeout=5)
         me.leave()
+
+
+def test_a_watchdog_thread_survives_shutdown(registry):
+    """The documented way to use ep.valid is a background thread, so the
+    library must not blow up in that thread when the member leaves.
+
+    leave() used to hold pyo3's mutable borrow for the whole of a network
+    round trip, and anything touching the client in that window raised
+    "Already mutably borrowed". The window is sub-millisecond, so this polls
+    flat out from several threads across several cycles: with the bug present
+    that catches it every time, with it fixed, never.
+    """
+    errors: list[str] = []
+    for _ in range(6):
+        me = tinyray.join("trainer", "collective", slot=0, size=1)
+        me.ready()
+        ep = tinyray.pool("trainer").epoch(timeout=10)
+        stop = threading.Event()
+
+        def watchdog() -> None:
+            while not stop.is_set():
+                try:
+                    ep.valid
+                except BaseException as exc:  # noqa: BLE001 - any failure counts
+                    errors.append(repr(exc))
+                    return
+
+        threads = [threading.Thread(target=watchdog, daemon=True) for _ in range(4)]
+        for t in threads:
+            t.start()
+        try:
+            time.sleep(0.02)
+            me.leave()  # a blocking round trip, with watchdogs hammering away
+            time.sleep(0.02)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=5)
+            me.leave()
+        if errors:
+            break
+    assert not errors, f"watchdog died during shutdown: {errors[0]}"
