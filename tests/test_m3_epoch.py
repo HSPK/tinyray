@@ -189,3 +189,52 @@ def test_opening_a_round_is_refused_while_out_of_touch(registry):
         registry.start()
         peers.stop()
         me.leave()
+
+
+def test_min_can_open_divergent_rounds_while_members_are_arriving(registry):
+    """A sharp edge worth pinning down rather than hiding.
+
+    epoch(min=) returns as soon as enough seats are filled, so callers racing
+    a still-arriving group can freeze different lists. Two different lists is
+    a deadlock, not a smaller group -- which is why the first round has to be
+    strict and min= belongs to rebuilds.
+    """
+    world = 3
+    me = tinyray.join("trainer", "collective", slot=0, size=world)
+    me.ready()
+    early = tinyray.pool("trainer").epoch(min=1, timeout=10)
+    assert len(early) == 1, "min=1 opened before anyone else arrived, as documented"
+
+    peers = Ranks(world - 1, world)
+    try:
+        full = tinyray.pool("trainer").epoch(timeout=20)
+        assert len(full) == world
+        # The two rounds disagree, which is exactly the hazard.
+        assert full.roster != early.roster
+        assert not early.valid
+    finally:
+        peers.stop()
+        me.leave()
+
+
+def test_a_rebuild_after_a_loss_is_what_min_is_for(registry):
+    world = 3
+    me = tinyray.join("trainer", "collective", slot=0, size=world)
+    me.ready()
+    peers = Ranks(world - 1, world)
+    try:
+        first = tinyray.pool("trainer").epoch(timeout=20)  # strict: everyone
+        assert len(first) == world
+
+        peers.kill(0)
+        deadline = time.monotonic() + registry.ttl_ms / 1000 * 3 + 3
+        while first.valid and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not first.valid
+
+        rebuilt = tinyray.pool("trainer").epoch(min=world - 1, timeout=20)
+        assert len(rebuilt) == world - 1
+        assert rebuilt.valid
+    finally:
+        peers.stop()
+        me.leave()

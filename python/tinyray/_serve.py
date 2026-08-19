@@ -103,6 +103,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         # Fencing lives here, not at the call site: a check fifteen call sites
         # must remember is one fourteen of them forget.
+        #
+        # Two ways to be stale. The caller may hold an address a later tenure
+        # now answers on -- that is the identity check. Or the seat may have
+        # moved on while this process kept running and listening, in which case
+        # nothing about the request looks wrong and only we know we are a ghost.
+        if not self.server.still_ours():
+            return self._send(409, {"error": "superseded", "identity": self.server.identity})
         target = self.headers.get("x-tinyray-target")
         if target and target != self.server.identity:
             return self._send(409, {"error": "fenced", "identity": self.server.identity})
@@ -152,6 +159,7 @@ class MethodServer:
     """One small server per process, started only when serves= is given."""
 
     def __init__(self, obj: Any, identity: str, host: str = "0.0.0.0"):
+        self.still_ours: Callable[[], bool] = lambda: True
         self.dispatch = scan(obj)
         try:
             loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
@@ -162,6 +170,7 @@ class MethodServer:
         self._srv = ThreadingHTTPServer((host, 0), _Handler)
         self._srv.dispatch = self.dispatch
         self._srv.identity = identity
+        self._srv.still_ours = lambda: self.still_ours()
         self._srv.loop = loop
         self._srv.daemon_threads = True
         self.port = self._srv.server_address[1]

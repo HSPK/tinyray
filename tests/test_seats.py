@@ -102,3 +102,63 @@ def test_the_short_label_stays_readable(registry):
     # identity stays exact: it is the fencing token, not a display string.
     assert h.identity == f"engine/3#{h.incarnation}"
     me.leave()
+
+
+SURVIVOR = textwrap.dedent(
+    """
+    import sys, time, tinyray
+    class W:
+        def whoami(self) -> str:
+            return sys.argv[1]
+    me = tinyray.join("ghost", "stateful", slot=0, serves=W())
+    me.ready(gen=sys.argv[1])
+    print(f"HELD {tinyray.pool('ghost').slot(0).url}", flush=True)
+    # Deliberately keeps running and listening after being replaced.
+    sys.stdin.readline()
+    """
+)
+
+
+def test_a_superseded_process_stops_answering(registry):
+    """The registry refuses a ghost's heartbeat, but nothing stops the ghost
+    itself: it keeps running with its port open, and a caller holding the old
+    handle would get a cheerful reply from the wrong process. The identity
+    header cannot catch this -- the ghost's identity is exactly what the stale
+    handle asks for -- so the process has to notice it lost the seat.
+    """
+    first = subprocess.Popen(
+        [sys.executable, "-c", SURVIVOR, "gen-1"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert first.stdout.readline().startswith("HELD")
+
+    me = tinyray.join("watch", "churn")
+    me.ready()
+    stale = tinyray.pool("ghost").wait(count=1, timeout=10)[0]
+    assert stale.whoami() == "gen-1"
+
+    second = subprocess.Popen(
+        [sys.executable, "-c", SURVIVOR, "gen-2"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert second.stdout.readline().startswith("HELD")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            live = tinyray.pool("ghost").all()
+            if live and live[0].incarnation != stale.incarnation:
+                break
+            time.sleep(0.05)
+        assert tinyray.pool("ghost").slot(0).whoami() == "gen-2"
+
+        # The old process is still alive and listening on that address.
+        with pytest.raises(tinyray.Fenced):
+            stale.whoami()
+    finally:
+        _release(second)
+        _release(first)
+        me.leave()

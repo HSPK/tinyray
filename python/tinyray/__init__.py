@@ -413,6 +413,12 @@ def join(
         methods=methods,
         exclusive=exclusive,
     )
+    if server is not None:
+        # A superseded process keeps running and keeps its port open, so the
+        # only thing that knows it is a ghost is the registry's answer to its
+        # own heartbeat. Wire that in, or a caller holding a stale handle gets
+        # a cheerful reply from the wrong process.
+        server.still_ours = lambda: c.accepted
     c.watch([pool])
     c.start()
     if exclusive and not c.accepted:
