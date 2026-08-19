@@ -46,12 +46,16 @@ def run_candidate(argv: list[str]) -> None:
         # accepted goes false the moment a later tenure takes the seat.
         if me.accepted:
             print(f"[{name}] elected after {time.monotonic() - started:.1f}s", flush=True)
-        while me.accepted:
+        # A leader that is never challenged holds the seat forever, so the
+        # example needs its own end. A real controller would run until stopped.
+        term = time.monotonic() + 12
+        while me.accepted and time.monotonic() < term:
             if die_after and time.monotonic() - started > die_after:
                 print(f"[{name}] dying while leader", flush=True)
                 os._exit(0)  # no farewell: only the lease can notice
             time.sleep(0.05)
-        print(f"[{name}] lost the seat", flush=True)
+        print(f"[{name}] {'lost the seat' if not me.accepted else 'stepping down'}",
+              flush=True)
         me.leave()
         return
 

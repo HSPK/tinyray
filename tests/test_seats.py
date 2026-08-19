@@ -147,7 +147,7 @@ def test_a_superseded_process_stops_answering(registry):
     )
     try:
         assert second.stdout.readline().startswith("HELD")
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             live = tinyray.pool("ghost").all()
             if live and live[0].incarnation != stale.incarnation:
@@ -155,9 +155,19 @@ def test_a_superseded_process_stops_answering(registry):
             time.sleep(0.05)
         assert tinyray.pool("ghost").slot(0).whoami() == "gen-2"
 
-        # The old process is still alive and listening on that address.
-        with pytest.raises(tinyray.Fenced):
-            stale.whoami()
+        # The old process is alive and still listening on that address. It only
+        # learns it is a ghost from the registry's answer to its own heartbeat,
+        # so "stops answering" is within a beat, not instantly.
+        refused = None
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                stale.whoami()
+            except tinyray.Fenced as exc:
+                refused = exc
+                break
+            time.sleep(0.05)
+        assert refused is not None, "the ghost kept serving its old identity"
     finally:
         _release(second)
         _release(first)

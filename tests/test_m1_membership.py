@@ -71,24 +71,41 @@ def test_join_then_find_each_other(registry):
         me.leave()
 
 
-def test_leaving_is_immediate_not_after_ttl(registry):
+def test_leaving_is_noticed_sooner_than_dying(registry):
+    """A farewell beat frees the seat at once; a kill can only be noticed when
+    the lease runs out.
+
+    The two are measured against each other rather than against the clock. An
+    absolute threshold looks fine on an idle machine and fails under load,
+    while the gap between the two paths survives both.
+    """
+
+    def time_departure(how: str) -> float:
+        procs = _spawn(1, "env")
+        tinyray.pool("env").wait(count=2, timeout=15)
+        t0 = time.monotonic()
+        if how == "leave":
+            _shutdown(procs)  # exits normally, so atexit sends the farewell
+        else:
+            procs[0].kill()
+            procs[0].wait(timeout=5)
+        deadline = t0 + registry.ttl_ms / 1000 * 4 + 5
+        while len(tinyray.pool("env").all()) > 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(tinyray.pool("env").all()) == 1, f"{how} was never noticed"
+        return time.monotonic() - t0
+
     me = tinyray.join("env", "churn")
     me.ready()
-    procs = _spawn(2, "env")
-    tinyray.pool("env").wait(count=3, timeout=10)
-    t0 = time.monotonic()
-    _shutdown(procs)
-    # A departing member sends one last beat, so the seat frees up well
-    # before the 2s lease would have expired.
-    tinyray.pool("env").wait(count=1, timeout=10)
-
-    deadline = time.monotonic() + 5
-    while len(tinyray.pool("env").all()) > 1 and time.monotonic() < deadline:
-        time.sleep(0.02)
-    elapsed = time.monotonic() - t0
-    assert len(tinyray.pool("env").all()) == 1
-    assert elapsed < registry.ttl_ms / 1000, f"took {elapsed:.2f}s, lease is {registry.ttl_ms}ms"
-    me.leave()
+    try:
+        graceful = time_departure("leave")
+        killed = time_departure("kill")
+        assert graceful < killed / 2, (
+            f"a farewell took {graceful:.2f}s against {killed:.2f}s for a kill; "
+            f"it should not be waiting out the lease"
+        )
+    finally:
+        me.leave()
 
 
 def test_dead_member_expires_without_a_supervisor(registry):
