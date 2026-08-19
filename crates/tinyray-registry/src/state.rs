@@ -28,6 +28,13 @@ struct Pool {
     methods: Vec<String>,
     size: Option<u64>,
     members: HashMap<u64, Record>,
+    /// Highest tenure ever seen for a seat, kept even after the occupant is
+    /// gone. Without it a superseded process could sit and wait for its
+    /// replacement to die and then take the seat back -- the record vanishes
+    /// on removal, so the pool would have no memory that the seat had moved on.
+    /// Only slotted pools need this; interchangeable members get a fresh id
+    /// each time, so an old id is never reused.
+    high: HashMap<u64, u64>,
     /// (version, member id) of each change, oldest first.
     log: VecDeque<(u64, u64)>,
 }
@@ -98,47 +105,53 @@ impl Registry {
             p.methods = b.methods.clone();
         }
 
-        let mut accepted = true;
-        match p.members.get(&b.id).map(|r| r.member.incarnation) {
-            // A later tenure already holds this seat: this beat is a ghost.
-            Some(cur) if cur > b.incarnation => accepted = false,
-            Some(cur) if cur == b.incarnation && !b.leaving => {
-                let changed = {
-                    let r = p.members.get(&b.id).unwrap();
-                    r.member.url != b.url || r.member.state != b.state || r.member.ready != b.ready
-                };
-                let r = p.members.get_mut(&b.id).unwrap();
-                r.expires_at = Instant::now() + self.ttl;
-                if changed {
-                    r.member.url = b.url.clone();
-                    r.member.state = b.state.clone();
-                    r.member.ready = b.ready;
-                    p.bump(b.id);
-                }
-            }
-            _ if b.leaving => {
-                if p.members.remove(&b.id).is_some() {
-                    p.roster ^= roster_of(b.id, b.incarnation);
-                    p.bump(b.id);
-                }
-            }
-            // New arrival, or a replacement taking over the seat.
-            other => {
-                if let Some(old) = other {
-                    p.roster ^= roster_of(b.id, old);
-                }
-                let m = Member {
-                    id: b.id,
-                    slot: b.slot,
-                    incarnation: b.incarnation,
-                    url: b.url.clone(),
-                    state: b.state.clone(),
-                    ready: b.ready,
-                };
-                p.roster ^= m.roster_hash();
-                p.members.insert(b.id, Record { member: m, expires_at: Instant::now() + self.ttl });
+        let stored = p.members.get(&b.id).map(|r| r.member.incarnation);
+        let watermark = p.high.get(&b.id).copied().unwrap_or(0);
+        let superseded =
+            b.incarnation < watermark || stored.is_some_and(|cur| cur > b.incarnation);
+
+        let accepted = !superseded;
+        if superseded {
+            // A ghost: a later tenure holds this seat, or held it and left.
+        } else if b.leaving {
+            if let Some(r) = p.members.remove(&b.id) {
+                // XOR out what is actually stored. Using the beat's tenure
+                // would leave a permanently wrong fingerprint if they differ.
+                p.roster ^= r.member.roster_hash();
                 p.bump(b.id);
             }
+        } else if stored == Some(b.incarnation) {
+            let changed = {
+                let r = p.members.get(&b.id).unwrap();
+                r.member.url != b.url || r.member.state != b.state || r.member.ready != b.ready
+            };
+            let r = p.members.get_mut(&b.id).unwrap();
+            r.expires_at = Instant::now() + self.ttl;
+            if changed {
+                r.member.url = b.url.clone();
+                r.member.state = b.state.clone();
+                r.member.ready = b.ready;
+                p.bump(b.id);
+            }
+        } else {
+            // New arrival, or a replacement taking over the seat.
+            if let Some(r) = p.members.remove(&b.id) {
+                p.roster ^= r.member.roster_hash();
+            }
+            let m = Member {
+                id: b.id,
+                slot: b.slot,
+                incarnation: b.incarnation,
+                url: b.url.clone(),
+                state: b.state.clone(),
+                ready: b.ready,
+            };
+            p.roster ^= m.roster_hash();
+            p.members.insert(b.id, Record { member: m, expires_at: Instant::now() + self.ttl });
+            p.bump(b.id);
+        }
+        if b.slot.is_some() && b.incarnation > watermark && !superseded {
+            p.high.insert(b.id, b.incarnation);
         }
 
         let mut out = HashMap::new();
@@ -188,7 +201,3 @@ impl Registry {
     }
 }
 
-fn roster_of(id: u64, incarnation: u64) -> u64 {
-    Member { id, slot: None, incarnation, url: None, state: serde_json::Value::Null, ready: false }
-        .roster_hash()
-}

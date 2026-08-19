@@ -1,9 +1,4 @@
-"""Three exceptions, because the caller needs to tell three situations apart.
-
-Only "did not arrive" is safe to retry blindly. Whether a business failure can
-be repeated is something only the application knows, so tinyray never retries
-one on its behalf.
-"""
+"""Three exceptions, because only "did not arrive" is safe to retry blindly."""
 
 from __future__ import annotations
 
@@ -13,30 +8,25 @@ class TinyrayError(Exception):
 
 
 class Unreachable(TinyrayError):
-    """It never arrived. Retry if the operation can be repeated."""
+    """Never arrived. Retry if the operation can be repeated."""
 
 
 class Fenced(TinyrayError):
-    """It arrived, but a later tenure holds that seat now. Look the address up
-    again -- a stale address is normal, not exceptional."""
+    """Arrived, but a later tenure holds that seat. Look the address up again."""
 
 
 class RemoteError(TinyrayError):
-    """It arrived and the method itself raised.
-
-    The original exception class is not reconstructed: doing so would require
-    both sides to define it, which is a hidden coupling.
-    """
+    """Arrived and the method raised. tinyray never retries this on your behalf."""
 
     def __init__(self, type_name: str, message: str, traceback: str = ""):
         super().__init__(f"{type_name}: {message}")
-        self.type = type_name
-        self.message = message
-        self.traceback = traceback
+        # The original class is not reconstructed: that needs both sides to
+        # define it, which is a hidden coupling.
+        self.type, self.message, self.traceback = type_name, message, traceback
 
 
 class NotFound(LookupError):
-    """Nobody in the pool matched. Failure is explicit; there is no None."""
+    """Nobody matched. Failure is explicit; there is no None."""
 
 
 class PolicyError(ValueError):

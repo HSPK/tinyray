@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::Notify;
 use tinyray_proto::{Beat, BeatAck, Member};
 
 #[derive(Default)]
@@ -46,6 +47,10 @@ pub struct Shared {
     pub beats_ok: AtomicU64,
     pub beats_failed: AtomicU64,
     pub interval_ms: AtomicU64,
+    /// Rung when something we publish changes. Without it, subscribing to a
+    /// pool or declaring readiness costs a full heartbeat interval of silence,
+    /// which is long enough for short-lived peers to come and go unseen.
+    pub wake: Notify,
 }
 
 impl Shared {
@@ -73,9 +78,11 @@ impl Shared {
         }
     }
 
-    fn apply(&self, ack: &BeatAck) {
+    /// Returns false once the seat has been taken by a later tenure.
+    fn apply(&self, ack: &BeatAck) -> bool {
         if !ack.accepted {
             self.accepted.store(false, Ordering::Relaxed);
+            return false;
         }
         let mut cache = self.cache.write().unwrap();
         for (name, d) in &ack.pools {
@@ -94,6 +101,7 @@ impl Shared {
             c.methods = d.methods.clone();
             c.size = d.size;
         }
+        true
     }
 }
 
@@ -142,9 +150,14 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 let ep = &shared.endpoints[(next + i) % shared.endpoints.len()];
                 if let Some(ack) = post(&http, ep, &beat).await {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
-                    shared.apply(&ack);
+                    let alive = shared.apply(&ack);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     next = (next + i) % shared.endpoints.len();
+                    if !alive {
+                        // Superseded. Beating on would only be waiting for the
+                        // replacement to die so we could take the seat back.
+                        return;
+                    }
                     ok = true;
                     break;
                 }
@@ -153,7 +166,8 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 shared.beats_failed.fetch_add(1, Ordering::Relaxed);
             }
             let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
-            tokio::time::sleep(Duration::from_millis(ms)).await;
+            // Wake early if the process has something new to say.
+            let _ = tokio::time::timeout(Duration::from_millis(ms), shared.wake.notified()).await;
         }
     });
     rt

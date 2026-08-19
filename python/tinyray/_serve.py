@@ -1,7 +1,7 @@
-"""The receiving half: turn a plain object into callable methods.
+"""Receiving: a plain object becomes callable methods.
 
-No decorators, no IDL, no code generation. Public methods are the interface and
-their type hints are the schema.
+No decorators, no IDL, no code generation -- public methods are the interface
+and their type hints are the schema.
 """
 
 from __future__ import annotations
@@ -11,8 +11,11 @@ import inspect
 import json
 import threading
 import traceback
+import typing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+
+import msgspec
 
 MAX_BODY = 1 << 20  # Control plane only. Bigger payloads use .url instead.
 
@@ -29,18 +32,49 @@ def scan(obj: Any) -> dict[str, Callable[..., Any]]:
     return out
 
 
+def _hints(fn: Callable[..., Any]) -> dict[str, Any]:
+    try:
+        return typing.get_type_hints(fn)
+    except Exception:  # unresolvable forward ref: skip checking rather than fail
+        return {}
+
+
 def _coerce(fn: Callable[..., Any], payload: Any) -> tuple[list, dict]:
-    """Positional args come as a list, keyword args as an object."""
-    if isinstance(payload, dict):
-        return [], payload
-    if isinstance(payload, list):
-        return payload, {}
-    return [payload], {}
+    """Unpack {"args": [...], "kwargs": {...}} and check it against annotations."""
+    if isinstance(payload, dict) and set(payload) <= {"args", "kwargs"}:
+        args = list(payload.get("args") or [])
+        kwargs = dict(payload.get("kwargs") or {})
+    elif isinstance(payload, dict):
+        args, kwargs = [], dict(payload)  # curl shorthand: a bare object is kwargs
+    elif isinstance(payload, list):
+        args, kwargs = list(payload), {}  # curl shorthand: a bare array is args
+    else:
+        args, kwargs = [payload], {}
+
+    hints = _hints(fn)
+    if not hints:
+        return args, kwargs
+    try:
+        names = [p for p in inspect.signature(fn).parameters]
+    except (TypeError, ValueError):
+        return args, kwargs
+
+    for i, value in enumerate(args):
+        if i < len(names) and names[i] in hints:
+            args[i] = msgspec.convert(value, hints[names[i]], strict=False)
+    for key, value in kwargs.items():
+        if key in hints:
+            kwargs[key] = msgspec.convert(value, hints[key], strict=False)
+    return args, kwargs
 
 
 class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    protocol_version = "HTTP/1.1"  # keep-alive; without it every call burns a socket
     server_version = "tinyray/0.1"
+    # The status line, the headers and the body are three separate writes.
+    # With Nagle on, the last one waits for the peer's delayed ACK and every
+    # call costs an extra 40ms.
+    disable_nagle_algorithm = True
 
     def log_message(self, *args: Any) -> None:  # keep the test output readable
         pass
@@ -50,8 +84,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        # Buffer the head and send it together with the body: one write, one
+        # segment, no interaction with delayed ACK.
+        self._headers_buffer.append(b"\r\n")
+        self.wfile.write(b"".join(self._headers_buffer) + raw)
+        self._headers_buffer = []
 
     def do_GET(self) -> None:
         if self.path == "/_methods":
@@ -65,7 +102,7 @@ class _Handler(BaseHTTPRequestHandler):
         name = self.path[len("/call/") :]
 
         # Fencing lives here, not at the call site: a check fifteen call sites
-        # must remember is a check fourteen of them forget.
+        # must remember is one fourteen of them forget.
         target = self.headers.get("x-tinyray-target")
         if target and target != self.server.identity:
             return self._send(409, {"error": "fenced", "identity": self.server.identity})
@@ -82,6 +119,10 @@ class _Handler(BaseHTTPRequestHandler):
             args, kwargs = _coerce(fn, json.loads(raw or b"{}"))
         except json.JSONDecodeError as e:
             return self._send(400, {"error": str(e)})
+        except msgspec.ValidationError as e:
+            # A type mismatch is the caller's fault, so it is reported as one
+            # rather than dressed up as a business failure.
+            return self._send(422, {"error": f"{name}(): {e}"})
 
         try:
             result = fn(*args, **kwargs)
@@ -108,7 +149,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class MethodServer:
-    """One small HTTP server per process, started only when serves= is given."""
+    """One small server per process, started only when serves= is given."""
 
     def __init__(self, obj: Any, identity: str, host: str = "0.0.0.0"):
         self.dispatch = scan(obj)

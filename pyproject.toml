@@ -7,7 +7,7 @@ name = "tinyray"
 version = "0.1.0"
 description = "A phone book and a roll call for heterogeneous ML fleets"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["msgspec>=0.18", "httpx>=0.27"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

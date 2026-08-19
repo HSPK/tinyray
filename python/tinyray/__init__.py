@@ -11,11 +11,11 @@ import atexit
 import json
 import os
 import random
+import socket
 import time
 from typing import Any
 
-from ._async import AsyncHandleMixin
-from ._call import DEFAULT_TIMEOUT, BoundMethod
+from ._rpc import DEFAULT_TIMEOUT, AsyncHandleMixin, BoundMethod
 from ._errors import Fenced, NotFound, PolicyError, RemoteError, TinyrayError, Unreachable
 from ._serve import MethodServer
 from ._tinyray import Client as _Client
@@ -51,6 +51,30 @@ def _endpoints() -> list[str]:
         if part:
             out.append(part if "://" in part else f"http://{part}")
     return out
+
+
+def _advertise() -> str:
+    """The address peers should use to reach us.
+
+    No loopback fallback: publishing 127.0.0.1 from a multi-node job is silent
+    misrouting -- peers elsewhere reach whatever listens on that port locally.
+    """
+    explicit = os.environ.get("TINYRAY_ADVERTISE")
+    if explicit:
+        return explicit
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Asks the routing table which local address would be used; sends
+        # nothing, and does not require the target to exist.
+        probe.connect(("10.255.255.255", 1))
+        return probe.getsockname()[0]
+    except OSError as exc:
+        raise RuntimeError(
+            "cannot work out which address peers should use to reach this "
+            "process; set TINYRAY_ADVERTISE=<host-or-ip> or pass url=..."
+        ) from exc
+    finally:
+        probe.close()
 
 
 def _from_env(names: tuple[str, ...]) -> int | None:
@@ -110,8 +134,7 @@ class AsyncHandle(AsyncHandleMixin, Handle):
 
 
 class Pool:
-    """A view onto one group. Lookups read the local cache, so they do no
-    network I/O and cannot time out."""
+    """One group. Lookups read the local cache: no network, so no timeouts."""
 
     _handle_cls = Handle
 
@@ -146,8 +169,7 @@ class Pool:
         raise NotFound(f"seat {k} of {self._name!r} is empty")
 
     def wait(self, count: int = 1, timeout: float = 30.0, **filt: Any) -> list[Handle]:
-        """Block until at least `count` members match. Waiting is bounded and
-        the failure says who we were waiting for."""
+        """Block until `count` members match. Bounded, and the failure names them."""
         deadline = time.monotonic() + timeout
         while True:
             found = self._members(filt, require_ready=True)
@@ -188,8 +210,7 @@ class Member:
         self._left = False
 
     def ready(self, **state: Any) -> Member:
-        """Hang out a sign: I can take work, and here is my state. It sends no
-        message to anyone -- the next heartbeat carries it."""
+        """Hang out a sign. Sends nothing now; the next heartbeat carries it."""
         self._state.update(state)
         self._c.set_state(json.dumps(self._state), True)
         return self
@@ -213,6 +234,9 @@ class Member:
     def leave(self) -> None:
         if not self._left:
             self._left = True
+            global _client
+            if _client is self._c:
+                _client = None
             try:
                 self._c.leave()
                 if self._server is not None:
@@ -245,6 +269,11 @@ def join(
 ) -> Member:
     """Report in. One line per process."""
     global _client
+    if _client is not None:
+        raise RuntimeError(
+            "this process has already joined; one process is one member. "
+            "Call leave() first if you meant to re-join."
+        )
     if policy not in POLICIES:
         raise PolicyError(f"policy must be one of {POLICIES}, got {policy!r}")
     slotted = policy in ("stateful", "collective")
@@ -259,9 +288,12 @@ def join(
 
     # Fungible members have no seat, so their key is just a fresh identity.
     ident = slot if slot is not None else random.getrandbits(63)
-    # Tenure must increase when a seat is re-taken; wall clock is enough here
-    # and needs no coordination.
-    incarnation = time.time_ns() // 1_000_000
+    # Tenure must increase when a seat is re-taken. Milliseconds alone collide
+    # when a process restarts inside the same millisecond, which would let the
+    # old one keep the seat; the random low bits break those ties. This assumes
+    # clocks on nodes sharing a seat agree to within a millisecond, which any
+    # cluster running collectives already needs.
+    incarnation = ((time.time_ns() // 1_000_000) << 20) | random.getrandbits(20)
 
     server = None
     methods: list[str] = []
@@ -269,7 +301,7 @@ def join(
         seat = slot if slot is not None else ident
         server = MethodServer(serves, f"{pool}/{seat}#{incarnation}")
         methods = server.methods
-        url = url or server.url(os.environ.get("TINYRAY_ADVERTISE", "127.0.0.1"))
+        url = url or server.url(_advertise())
 
     c = _Client(
         endpoints=_endpoints(),

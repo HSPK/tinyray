@@ -66,6 +66,7 @@ impl Client {
             beats_ok: AtomicU64::new(0),
             beats_failed: AtomicU64::new(0),
             interval_ms: AtomicU64::new(1000),
+            wake: tokio::sync::Notify::new(),
         });
         Ok(Self { shared, rt: None })
     }
@@ -82,11 +83,18 @@ impl Client {
     }
 
     fn watch(&self, pools: Vec<String>) {
-        let mut w = self.shared.watch.lock().unwrap();
-        for p in pools {
-            if !w.contains(&p) {
-                w.push(p);
+        let mut added = false;
+        {
+            let mut w = self.shared.watch.lock().unwrap();
+            for p in pools {
+                if !w.contains(&p) {
+                    w.push(p);
+                    added = true;
+                }
             }
+        }
+        if added {
+            self.shared.wake.notify_one();
         }
     }
 
@@ -95,6 +103,7 @@ impl Client {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         *self.shared.state.lock().unwrap() = v;
         self.shared.ready.store(ready, Ordering::Relaxed);
+        self.shared.wake.notify_one();
         Ok(())
     }
 
