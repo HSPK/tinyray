@@ -14,23 +14,33 @@ import random
 import time
 from typing import Any
 
+from ._async import AsyncHandleMixin
+from ._call import DEFAULT_TIMEOUT, BoundMethod
+from ._errors import Fenced, NotFound, PolicyError, RemoteError, TinyrayError, Unreachable
+from ._serve import MethodServer
 from ._tinyray import Client as _Client
 
-__all__ = ["join", "pool", "Member", "Pool", "Handle", "NotFound", "PolicyError"]
+__all__ = [
+    "join",
+    "pool",
+    "Member",
+    "Pool",
+    "Handle",
+    "AsyncHandle",
+    "NotFound",
+    "PolicyError",
+    "TinyrayError",
+    "Unreachable",
+    "Fenced",
+    "RemoteError",
+    "apool",
+]
 
 POLICIES = ("churn", "serving", "stateful", "collective")
 
 # Seats are declared by the launcher, never handed out by tinyray.
 _RANK_VARS = ("TINYRAY_SLOT", "RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK")
 _SIZE_VARS = ("TINYRAY_SIZE", "WORLD_SIZE", "SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE")
-
-
-class NotFound(LookupError):
-    """Nobody in the pool matched. Failure is explicit; there is no None."""
-
-
-class PolicyError(ValueError):
-    pass
 
 
 def _endpoints() -> list[str]:
@@ -52,11 +62,12 @@ def _from_env(names: tuple[str, ...]) -> int | None:
 
 
 class Handle:
-    """One member. Read-only; the calling layer arrives in M2."""
+    """One member. Attribute access proxies to a method on the far side."""
 
-    __slots__ = ("pool", "id", "slot", "incarnation", "url", "state", "ready")
+    __slots__ = ("pool", "id", "slot", "incarnation", "url", "state", "ready", "_methods")
 
-    def __init__(self, pool_name: str, raw: dict[str, Any]):
+    def __init__(self, pool_name: str, raw: dict[str, Any], methods: tuple[str, ...] = ()):
+        self._methods = methods
         self.pool = pool_name
         self.id = raw["id"]
         self.slot = raw.get("slot")
@@ -65,9 +76,23 @@ class Handle:
         self.state = raw.get("state") or {}
         self.ready = raw["ready"]
 
-    def __repr__(self) -> str:
+    @property
+    def identity(self) -> str:
         seat = self.slot if self.slot is not None else self.id
-        return f"<Handle {self.pool}/{seat}#{self.incarnation} {self.url}>"
+        return f"{self.pool}/{seat}#{self.incarnation}"
+
+    def __getattr__(self, name: str) -> BoundMethod:
+        # Only names the pool actually serves. An earlier design proxied
+        # everything, which made hasattr() always true and turned a typo into a
+        # runtime failure much later.
+        if name.startswith("_") or name not in self._methods:
+            raise AttributeError(
+                f"{self.identity} serves {sorted(self._methods) or 'no methods'}, not {name!r}"
+            )
+        return BoundMethod(self, name, DEFAULT_TIMEOUT)
+
+    def __repr__(self) -> str:
+        return f"<Handle {self.identity} {self.url}>"
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -80,9 +105,15 @@ class Handle:
         return hash((self.pool, self.id, self.incarnation))
 
 
+class AsyncHandle(AsyncHandleMixin, Handle):
+    """A Handle whose methods return awaitables."""
+
+
 class Pool:
     """A view onto one group. Lookups read the local cache, so they do no
     network I/O and cannot time out."""
+
+    _handle_cls = Handle
 
     def __init__(self, name: str, client: _Client):
         self._name = name
@@ -91,7 +122,11 @@ class Pool:
 
     def _members(self, filt: dict[str, Any], require_ready: bool) -> list[Handle]:
         raw = self._c.lookup(self._name, json.dumps(filt), require_ready)
-        return [Handle(self._name, m) for m in json.loads(raw)]
+        # The method list is stored once per pool, not once per member: members
+        # of a pool run the same code.
+        info = self._c.pool_info(self._name)
+        methods = tuple(info[3]) if info else ()
+        return [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
 
     def all(self, **filt: Any) -> list[Handle]:
         return self._members(filt, require_ready=True)
@@ -136,8 +171,16 @@ class Pool:
 class Member:
     """This process's own registration."""
 
-    def __init__(self, client: _Client, pool_name: str, slot: int | None, incarnation: int):
+    def __init__(
+        self,
+        client: _Client,
+        pool_name: str,
+        slot: int | None,
+        incarnation: int,
+        server: MethodServer | None = None,
+    ):
         self._c = client
+        self._server = server
         self.pool = pool_name
         self.slot = slot
         self.incarnation = incarnation
@@ -172,6 +215,8 @@ class Member:
             self._left = True
             try:
                 self._c.leave()
+                if self._server is not None:
+                    self._server.close()
             except Exception:  # interpreter teardown: nothing useful left to do
                 pass
 
@@ -202,9 +247,6 @@ def join(
     global _client
     if policy not in POLICIES:
         raise PolicyError(f"policy must be one of {POLICIES}, got {policy!r}")
-    if serves is not None:
-        raise NotImplementedError("serves= arrives in M2")
-
     slotted = policy in ("stateful", "collective")
     if slotted and slot is None:
         slot = _from_env(_RANK_VARS)
@@ -221,6 +263,14 @@ def join(
     # and needs no coordination.
     incarnation = time.time_ns() // 1_000_000
 
+    server = None
+    methods: list[str] = []
+    if serves is not None:
+        seat = slot if slot is not None else ident
+        server = MethodServer(serves, f"{pool}/{seat}#{incarnation}")
+        methods = server.methods
+        url = url or server.url(os.environ.get("TINYRAY_ADVERTISE", "127.0.0.1"))
+
     c = _Client(
         endpoints=_endpoints(),
         pool=pool,
@@ -230,11 +280,12 @@ def join(
         slot=slot,
         size=size,
         url=url,
+        methods=methods,
     )
     c.watch([pool])
     c.start()
     _client = c
-    member = Member(c, pool, slot, incarnation)
+    member = Member(c, pool, slot, incarnation, server)
     # A process that exits normally should say goodbye, so the seat frees up
     # immediately instead of waiting out the lease. SIGKILL still falls back
     # to lease expiry -- both paths work, they just differ in speed.
@@ -242,7 +293,20 @@ def join(
     return member
 
 
+class AsyncPool(Pool):
+    """Same lookups -- they read the local cache and never block -- but the
+    handles they return produce awaitables."""
+
+    _handle_cls = AsyncHandle
+
+
 def pool(name: str) -> Pool:
     if _client is None:
         raise RuntimeError("call tinyray.join(...) before looking anyone up")
     return Pool(name, _client)
+
+
+def apool(name: str) -> AsyncPool:
+    if _client is None:
+        raise RuntimeError("call tinyray.join(...) before looking anyone up")
+    return AsyncPool(name, _client)

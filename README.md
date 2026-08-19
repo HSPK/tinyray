@@ -17,8 +17,29 @@ print(engine.url)
 
 ## 现状
 
-**M1 已实现**：报到、租约、本地缓存、找人（`join` / `pool` / `pick` / `slot` / `all`）。
-M2（调用层）和 M3（编组与 `epoch`）还没写。
+**M1 + M2 已实现。** 报到、租约、本地缓存、找人，以及调用层：
+
+```python
+class Collector:
+    def assign(self, task: str) -> dict:
+        return {"took": task}
+
+me = tinyray.join("collector", "stateful", slot=0, serves=Collector())
+me.ready()
+
+# 另一个进程里
+tinyray.pool("collector").slot(0).assign("task-7")
+await tinyray.apool("collector").slot(0).assign("task-7")
+```
+
+底下就是普通 HTTP，所以 `curl` 排障能力一点没丢：
+
+```bash
+curl -X POST http://host:port/call/assign -d '{"task":"t"}'
+curl http://host:port/_methods
+```
+
+**M3（编组与 `epoch`）还没写。**
 
 ## 文档
 
