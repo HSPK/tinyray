@@ -51,6 +51,12 @@ impl Member {
     }
 }
 
+/// How many pools one member may subscribe to. The list rides on every beat
+/// and its answer rides back, so it is bounded. Crossing it used to make the
+/// registry refuse the whole beat, which stopped the loop and killed the
+/// member in silence.
+pub const MAX_WATCH: usize = 64;
+
 /// JSON keeps 3 and 3.0 apart and Python does not, so `shard=6/2` -- the
 /// obvious way to compute a shard index -- found nobody while `shard=3` found
 /// the member. A filter is a label, so numbers compare by value.

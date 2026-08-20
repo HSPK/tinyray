@@ -22,7 +22,9 @@ class Client:
     def start(self) -> bool:
         """Sends one beat and blocks on it. False means it did not land."""
 
-    def watch(self, pools: list[str]) -> None: ...
+    def watch(self, pools: list[str]) -> None:
+        """Raises once the subscription list is full."""
+
     def set_state(self, state_json: str, ready: bool) -> None: ...
     def set_url(self, url: str | None = ...) -> None: ...
     def lookup(self, pool: str, filter_json: str = ..., require_ready: bool = ...) -> str:

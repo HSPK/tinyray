@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
-use tinyray_proto::{Beat, BeatAck, Member, PoolDelta};
+use tinyray_proto::{Beat, BeatAck, Member, PoolDelta, MAX_WATCH};
 
 /// How many past versions of change history to keep per pool. A client that
 /// falls further behind than this gets a full roster instead of a delta.
@@ -164,7 +164,7 @@ impl Registry {
 
         b.pool.len() <= MAX_NAME
             && b.incarnation <= MAX_INCARNATION
-            && b.watch.len() <= 64
+            && b.watch.len() <= MAX_WATCH
             && b.watch.iter().all(|w| w.len() <= MAX_NAME)
             && b.url.as_ref().is_none_or(|u| u.len() <= MAX_NAME)
             && b.methods.len() <= MAX_METHODS

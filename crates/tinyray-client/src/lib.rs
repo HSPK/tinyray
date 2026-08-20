@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tinyray_proto::Member;
+use tinyray_proto::{Member, MAX_WATCH};
 
 #[pyclass]
 pub struct Client {
@@ -99,12 +99,26 @@ impl Client {
         Ok(ok)
     }
 
-    fn watch(&self, pools: Vec<String>) {
+    fn watch(&self, pools: Vec<String>) -> PyResult<()> {
         let mut added = false;
         {
             let mut w = self.shared.watch.lock().unwrap();
             for p in pools {
                 if !w.contains(&p) {
+                    if w.len() >= MAX_WATCH {
+                        // Adding it anyway made the registry refuse the whole
+                        // beat, which stopped the loop: measured as a member
+                        // frozen at zero beats with accepted false, no error
+                        // recorded, and its own stale cache still showing it
+                        // present. Refusing here names the pool that did it.
+                        return Err(PyRuntimeError::new_err(format!(
+                            "cannot watch {p:?}: already subscribed to {} pools, \
+                             the limit is {MAX_WATCH} including your own. Look \
+                             up fewer pool names, or split the work across \
+                             processes.",
+                            w.len()
+                        )));
+                    }
                     w.push(p);
                     added = true;
                 }
@@ -113,6 +127,7 @@ impl Client {
         if added {
             self.shared.wake.notify_one();
         }
+        Ok(())
     }
 
     fn set_state(&self, state_json: &str, ready: bool) -> PyResult<()> {
