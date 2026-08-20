@@ -44,8 +44,26 @@ impl Member {
     pub fn matches(&self, filter: &Value) -> bool {
         match filter.as_object() {
             None => true,
-            Some(f) => f.iter().all(|(k, v)| self.state.get(k) == Some(v)),
+            Some(f) => f
+                .iter()
+                .all(|(k, v)| self.state.get(k).is_some_and(|got| same_value(got, v))),
         }
+    }
+}
+
+/// JSON keeps 3 and 3.0 apart and Python does not, so `shard=6/2` -- the
+/// obvious way to compute a shard index -- found nobody while `shard=3` found
+/// the member. A filter is a label, so numbers compare by value.
+///
+/// Booleans stay strict: `True == 1` is Python's anomaly, and letting
+/// `free=1` match `free=true` would surprise more than it helps.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
+            (Some(i), Some(j)) => i == j,
+            _ => x.as_f64() == y.as_f64(),
+        },
+        _ => a == b,
     }
 }
 
