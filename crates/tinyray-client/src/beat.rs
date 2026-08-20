@@ -51,6 +51,8 @@ pub struct Shared {
     /// Monotonic ms of the last successful beat. Freezing a round on a stale
     /// roster is unsafe, so epoch() needs to know when we are flying blind.
     pub last_ok_ms: AtomicU64,
+    /// Which registry process the cache came from.
+    pub seen_epoch: AtomicU64,
     pub started: std::time::Instant,
     /// Rung when something we publish changes. Without it, subscribing to a
     /// pool or declaring readiness costs a full heartbeat interval of silence,
@@ -96,6 +98,14 @@ impl Shared {
 
     /// Returns false once the seat has been taken by a later tenure.
     fn apply(&self, ack: &BeatAck) -> bool {
+        // A restarted registry counts from zero again. Keeping a cache built
+        // against the old numbering means asking for changes since a version
+        // it has never reached, being told there are none, and holding a stale
+        // roster forever with nothing to show for it.
+        let previous = self.seen_epoch.swap(ack.epoch, Ordering::Relaxed);
+        if previous != 0 && previous != ack.epoch {
+            self.cache.write().unwrap().clear();
+        }
         if !ack.accepted {
             self.accepted.store(false, Ordering::Relaxed);
             return false;

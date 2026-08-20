@@ -97,6 +97,11 @@ pub struct PoolDelta {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BeatAck {
+    /// Random per registry process. Versions restart from zero when it does,
+    /// so a client holding a higher one would be told nothing had changed and
+    /// would sit on a stale roster forever, silently.
+    #[serde(default)]
+    pub epoch: u64,
     pub ttl_ms: u64,
     /// False means the seat was taken by a later incarnation. Give up.
     pub accepted: bool,

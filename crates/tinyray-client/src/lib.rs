@@ -70,6 +70,7 @@ impl Client {
             beats_failed: AtomicU64::new(0),
             interval_ms: AtomicU64::new(1000),
             last_ok_ms: AtomicU64::new(0),
+            seen_epoch: AtomicU64::new(0),
             started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
         });

@@ -99,11 +99,19 @@ impl Pool {
 pub struct Registry {
     pools: RwLock<HashMap<String, Pool>>,
     pub ttl: Duration,
+    /// Identifies this registry process, so clients can tell a restart from a
+    /// quiet period.
+    epoch: u64,
 }
 
 impl Registry {
     pub fn new(ttl: Duration) -> Self {
-        Self { pools: RwLock::new(HashMap::new()), ttl }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1)
+            | 1;
+        Self { pools: RwLock::new(HashMap::new()), ttl, epoch }
     }
 
     /// Rejects a beat that could damage state rather than merely being wrong.
@@ -117,6 +125,7 @@ impl Registry {
     pub fn beat(&self, b: &Beat) -> BeatAck {
         if !Self::admissible(b) {
             return BeatAck {
+                epoch: self.epoch,
                 ttl_ms: self.ttl.as_millis() as u64,
                 accepted: false,
                 pools: HashMap::new(),
@@ -193,7 +202,7 @@ impl Registry {
                 }
             }
         }
-        BeatAck { ttl_ms: self.ttl.as_millis() as u64, accepted, pools: out }
+        BeatAck { epoch: self.epoch, ttl_ms: self.ttl.as_millis() as u64, accepted, pools: out }
     }
 
     /// Drop members whose lease ran out. Runs on a timer, never on the request
