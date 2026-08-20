@@ -49,6 +49,7 @@ __all__ = [
     "RemoteError",
     "apool",
     "MAX_STATE",
+    "FIRST_BEAT_S",
 ]
 
 POLICIES = ("churn", "serving", "stateful", "collective")
@@ -424,6 +425,12 @@ _FIRST_ANSWER_S = 2.0
 # something. See tests/test_state_budget.py for the amplification measurement.
 MAX_STATE = 16 << 10
 
+# How long join() waits for its first beat to land. Long enough to cross a
+# registry restart (measured at about a second) and to tolerate a launcher
+# that starts ranks before the registry, short enough that a typo in
+# TINYRAY_REGISTRY fails at startup rather than at the first wait().
+FIRST_BEAT_S = 10.0
+
 _client: _Client | None = None
 _left = False
 _owner_pid = os.getpid()
@@ -508,7 +515,24 @@ def join(
         # a cheerful reply from the wrong process.
         server.still_ours = lambda: c.accepted
     c.watch([pool])
-    c.start()
+    if not c.start():
+        # Losing the registry later is survivable -- the cache carries the
+        # process. Never reaching it is not: there is nothing to carry, and
+        # the process would publish state nobody sees and wait for peers who
+        # cannot appear. Measured against a wrong port, an unroutable address
+        # and a name that does not resolve: join() returned in 0.0s to 5.0s
+        # with accepted=True, zero beats through and its own pool empty.
+        deadline = time.monotonic() + FIRST_BEAT_S
+        while not c.stats()["beats_ok"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not c.stats()["beats_ok"]:
+            c.leave()
+            if server is not None:
+                server.close()
+            raise Unreachable(
+                f"no answer from the registry at {_endpoint()} after "
+                f"{FIRST_BEAT_S:g}s; {c.stats()['beats_failed']} attempts made"
+            )
     if exclusive and not c.accepted:
         # Seats are last-writer-wins by default, because a restarting rank has
         # to reclaim its seat while the dead one's lease is still running.
