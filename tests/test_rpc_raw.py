@@ -17,6 +17,8 @@ SERVER = textwrap.dedent(
     class S:
         def ping(self) -> str: return "pong"
         def threads(self) -> int: return threading.active_count()
+        def echo(self, x: int) -> int: return x
+        def boom(self): raise ValueError("expected")
         def unserializable(self): return object()
         def selfref(self):
             d = {}; d["me"] = d; return d
@@ -150,3 +152,46 @@ def test_a_fenced_call_does_not_poison_the_next_one(registry):
             p.wait(timeout=5)
         except Exception:
             p.kill()
+
+
+def _call(path: bytes, body: bytes = b"{}", extra: bytes = b"") -> bytes:
+    return (
+        b"POST "
+        + path
+        + b" HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: "
+        + str(len(body)).encode()
+        + b"\r\n"
+        + extra
+        + b"\r\n"
+        + body
+    )
+
+
+@pytest.mark.parametrize(
+    "label,first",
+    [
+        ("wrong-path", _call(b"/nope")),
+        ("no-such-method", _call(b"/call/nosuch")),
+        ("bad-argument", _call(b"/call/echo", b'{"args":["x"],"kwargs":{}}')),
+        ("raises", _call(b"/call/boom")),
+        ("not-json", _call(b"/call/echo", b"not json at all")),
+        ("fenced", _call(b"/call/echo", extra=b"x-tinyray-target: s/0#999\r\n")),
+        ("get-methods", b"GET /_methods HTTP/1.1\r\nHost: x\r\n\r\n"),
+        ("get-unknown", b"GET /zzz HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ],
+)
+def test_no_reply_leaves_the_connection_unusable(served, label, first):
+    """每一种应答都要么读掉请求体，要么关掉连接。漏一条，keep-alive 上
+    紧跟着的那个请求就会从残字节开始解析 —— 围栏那条就是这么漏的。"""
+    good = _call(b"/call/echo", b'{"args":[7],"kwargs":{}}')
+    s = socket.create_connection(("127.0.0.1", served), timeout=15)
+    try:
+        s.sendall(first)
+        assert s.recv(65536), f"{label} 没有应答"
+        s.sendall(good)
+        after = s.recv(65536)
+        if not after:
+            return  # 关掉连接是可接受的处理方式
+        assert after.split(b"\r\n")[0].split()[1] == b"200", f"{label} 之后连接坏了: {after[:80]}"
+    finally:
+        s.close()
