@@ -540,13 +540,27 @@ def join(
                 f"{FIRST_BEAT_S:g}s and {c.stats()['beats_failed']} attempts: "
                 f"{c.last_error()}"
             )
-    if exclusive and not c.accepted:
+    if not c.accepted:
         # Seats are last-writer-wins by default, because a restarting rank has
         # to reclaim its seat while the dead one's lease is still running.
         # exclusive= asks for the opposite, which is what an election wants.
+        #
+        # Either way a refusal has to be raised. The beat loop stops on one,
+        # so returning would hand back a member that never beats again while
+        # accepted, silence_ms and an empty pool are the only clues -- measured
+        # at beats_ok frozen at 2, last_error empty and its own pool showing
+        # zero members.
+        c.leave()
         if server is not None:
             server.close()
-        raise SeatTaken(f"seat {slot} of {pool!r} is already held")
+        if exclusive:
+            raise SeatTaken(f"seat {slot} of {pool!r} is already held")
+        raise SeatTaken(
+            f"the registry refused tenure {incarnation} for seat {slot} of "
+            f"{pool!r}: a later one holds it. A restarting process normally "
+            f"carries the newer tenure, so the usual cause is a clock that "
+            f"went backwards on this node."
+        )
     _client = c
     _owner_pid = os.getpid()
     member = Member(c, pool, slot, incarnation, server)
