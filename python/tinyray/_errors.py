@@ -39,3 +39,12 @@ class NotFound(LookupError):
 
 class PolicyError(ValueError):
     """The policy, seat or size asked for does not make sense together."""
+
+
+class OversizeWarning(UserWarning):
+    """A payload past the size the control plane is meant for; see SOFT_BODY.
+
+    Silence it the usual way:
+
+        warnings.filterwarnings("ignore", category=tinyray.OversizeWarning)
+    """

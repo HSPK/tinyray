@@ -18,8 +18,6 @@ from typing import Any
 
 import msgspec
 
-MAX_BODY = 1 << 20  # Control plane only. Bigger payloads use .url instead.
-
 # A caller that announces a body and never sends it pins a thread for as long
 # as it cares to: measured 200 such connections holding 203 threads, released
 # only when the attacker closed them. Real bodies are under a megabyte.
@@ -116,17 +114,6 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 }
             ).encode()
-        if len(raw) > MAX_BODY and "result" in body:
-            # The budget was only enforced on the way in, which is the wrong
-            # half: a reply is where "while I am here, take this too" creeps in.
-            # Same 413 as an oversized request -- to the caller it is one rule.
-            code = 413
-            raw = json.dumps(
-                {
-                    "error": f"reply is {len(raw)} bytes, over the {MAX_BODY} "
-                    f"limit; return a reference and let the caller fetch it"
-                }
-            ).encode()
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
@@ -162,6 +149,23 @@ class _Handler(BaseHTTPRequestHandler):
         # request parses from the leftovers: measured as a fenced call and a
         # good one alternating, every second call coming back with an empty
         # body. Fencing and routing used to answer above this point.
+        #
+        # A chunked body reaches that same failure by another road: it carries
+        # no content-length, so the read below sized itself to zero and left
+        # the whole body in the socket. Measured: echo(x=7) answered as echo()
+        # -- a wrong result with a 200 on it -- and the chunk framing then
+        # parsed as the next request line, ending the connection with an HTML
+        # 400 that the next request never got past. Decoding chunked properly
+        # means chunk extensions and trailers, which is more framing code than
+        # a control plane capped at a megabyte should carry, so it is refused
+        # in the one way HTTP has for exactly this. The connection goes with
+        # it: the framing bytes are still unread, so it can never be reused.
+        if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
+            self.close_connection = True
+            return self._send(
+                411,
+                {"error": "chunked bodies are not read; send a content-length"},
+            )
         try:
             length = int(self.headers.get("content-length") or 0)
         except ValueError:
@@ -170,10 +174,6 @@ class _Handler(BaseHTTPRequestHandler):
         if length < 0:
             self.close_connection = True
             return self._send(400, {"error": "content-length is negative"})
-        if length > MAX_BODY:
-            # Deliberately not read, so this connection cannot be reused.
-            self.close_connection = True
-            return self._send(413, {"error": "payload too large"})
         raw = b"{}"
         if length:
             self.connection.settimeout(BODY_TIMEOUT)

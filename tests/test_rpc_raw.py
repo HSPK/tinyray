@@ -195,3 +195,83 @@ def test_no_reply_leaves_the_connection_unusable(served, label, first):
         assert after.split(b"\r\n")[0].split()[1] == b"200", f"{label} 之后连接坏了: {after[:80]}"
     finally:
         s.close()
+
+
+def test_a_chunked_body_is_refused_rather_than_silently_dropped(served):
+    """分块请求没有 content-length，而 body 的长度只从那个头取。
+
+    结果是两重的，而且第一重更糟：body 整个留在 socket 里，方法拿默认参数跑完
+    并"成功"返回 —— echo(x=7) 被当成 echo() 执行。第二重是分块的框架字节接着被
+    当成下一个请求行解析，连接以一个 HTML 400 收场，同一条连接上的下一个请求
+    根本没人应答。
+
+    实测（修复前，一条连接上先发分块再发普通请求）：只回来 1 个状态行，内容是
+    `{"result": {"took": "none"}}`，然后是 `Bad request syntax ('23')` 的 HTML
+    错误页，第二个请求的答复从未出现。
+
+    把分块 body 正确解码要连 trailer 和 chunk-extension 一起处理，对一个上限
+    1MB 的控制平面来说不值这些框架代码；HTTP 对这种情况本来就有一个说法。
+    """
+    head = (
+        b"POST /call/echo HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"content-type: application/json\r\n"
+        b"transfer-encoding: chunked\r\n"
+        b"\r\n"
+    )
+    payload = b'{"kwargs": {"x": 7}}'
+    body = b"%x\r\n" % len(payload) + payload + b"\r\n0\r\n\r\n"
+
+    got = _raw(served, head, body)
+    assert b"411" in got.split(b"\r\n")[0], got[:200]
+    assert b'"result"' not in got, f"the method ran on a body that was never read: {got[:200]!r}"
+
+
+def test_a_chunked_request_cannot_desynchronise_the_next_one(served):
+    """拒绝还不够 —— 拒绝之后连接必须关掉。
+
+    否则那些框架字节还在流里，下一个请求依然会从残渣开始解析。
+    """
+    chunked = (
+        b"POST /call/echo HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"transfer-encoding: chunked\r\n"
+        b"\r\n"
+        b"14\r\n"
+        b'{"kwargs": {"x": 7}}'
+        b"\r\n0\r\n\r\n"
+    )
+    plain_body = b'{"kwargs": {"x": 99}}'
+    plain = (
+        b"POST /call/echo HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"content-type: application/json\r\n"
+        b"content-length: %d\r\n\r\n" % len(plain_body)
+    ) + plain_body
+
+    s = socket.create_connection(("127.0.0.1", served), timeout=20)
+    try:
+        s.sendall(chunked)
+        time.sleep(0.3)
+        try:
+            s.sendall(plain)
+        except OSError:
+            pass  # already closed on us, which is the intended outcome
+        time.sleep(0.5)
+        got = b""
+        s.settimeout(3)
+        try:
+            while True:
+                part = s.recv(65536)
+                if not part:
+                    break
+                got += part
+        except TimeoutError:
+            pass
+    finally:
+        s.close()
+
+    # 关键是"绝不能把残渣当成请求来解析"：不许出现按分块框架回的第二个答复，
+    # 更不许把 x=7 当成结果返回。
+    assert b'"result": 7' not in got, f"the dropped body was answered anyway: {got[:300]!r}"
+    assert b"Bad request syntax" not in got, f"the stream desynchronised: {got[:300]!r}"

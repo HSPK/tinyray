@@ -28,6 +28,8 @@ SERVER = textwrap.dedent(
             time.sleep(0.02); return "ok"
         def boom(self): raise ValueError("expected")
         def count(self) -> int: return self.n
+        def echo(self, tag: str) -> str: return tag
+        def sized(self, tag: str, n: int) -> str: return tag + "." + "z" * n
     with tinyray.join("s", "stateful", slot=0, serves=S()) as me:
         me.ready()
         print("READY", flush=True)
@@ -169,3 +171,57 @@ def test_rapid_join_and_leave_cycles(registry):
     me.ready()
     assert len(tinyray.pool("q").wait(count=1, timeout=10)) == 1
     me.leave()
+
+
+def test_concurrent_calls_each_get_their_own_answer(served):
+    """每个调用者拿回的必须是**自己**那次调用的结果。
+
+    上面几条并发测试全都调 fast(1)，参数永远一样 —— 应答就算串了线（这个线程
+    收到另一个线程的回复），返回值也还是 1，看不出来。而答复串线正是这套代码
+    出过一次的那一类：分块请求把 body 留在 socket 里，keep-alive 从残渣继续
+    解析，下一个请求拿到的就是上一个的答复。
+
+    所以这里每次调用都带一个全局唯一的标签，并且长度不一 —— 长度不同才会让
+    content-length 各不相同，framing 一旦错位就对不上。
+    """
+    h = tinyray.pool("s").slot(0)
+    mismatches: list[str] = []
+    lock = threading.Lock()
+    counter = [0]
+
+    def worker(worker_id: int) -> None:
+        for i in range(60):
+            with lock:
+                counter[0] += 1
+                seq = counter[0]
+            tag = f"w{worker_id}-i{i}-s{seq}"
+            # 长度在 0..4095 之间变化，让每次的 content-length 都不一样。
+            pad = (seq * 37) % 4096
+            got = h.sized(tag, pad)
+            want = tag + "." + "z" * pad
+            if got != want:
+                with lock:
+                    mismatches.append(f"{tag}: got {got[:60]!r} ({len(got)} bytes)")
+
+    ts = [threading.Thread(target=worker, args=(w,)) for w in range(16)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=90)
+
+    assert not any(t.is_alive() for t in ts), "有线程没跑完"
+    assert not mismatches, f"{len(mismatches)} 次调用拿到了别人的答复: {mismatches[:3]}"
+
+
+def test_concurrent_calls_do_not_cross_between_pools_of_connections(served):
+    """同一条连接被复用时，上一次的答复不能溢到下一次。
+
+    串行地在一条复用连接上交替长短回复：如果 framing 有残留，短回复之后紧跟的
+    读取会拿到上一次的尾巴。
+    """
+    h = tinyray.pool("s").slot(0)
+    for i in range(200):
+        big = h.sized(f"big{i}", 8192)
+        assert big == f"big{i}." + "z" * 8192, f"第 {i} 次长回复对不上（{len(big)} 字节）"
+        small = h.echo(f"small{i}")
+        assert small == f"small{i}", f"第 {i} 次短回复拿到了 {small[:60]!r}"

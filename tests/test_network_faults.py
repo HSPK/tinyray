@@ -49,12 +49,23 @@ def run_against(proxy: FaultyProxy, seconds: float, timeout: float) -> tuple[int
 
 def test_a_dropped_packet_does_not_hang_join_forever(registry):
     """join() blocks on its first beat. With no deadline on the request, one
-    lost packet hung it for as long as anyone was willing to wait."""
+    lost packet hung it for as long as anyone was willing to wait.
+
+    只有"挂住"才算失败。40% 丢包下单次启动本来就有约 0.8% 的概率以 Unreachable
+    收场 —— 那个数字是下面 test_the_first_beat_deadline_survives_a_lossy_link
+    量出来的，也正是它为什么要容忍一次失败。这条测的是"有没有界"，不是"那道界
+    有多宽"，所以一个有界的放弃同样证明了要证明的事；照抄零容忍会让它每约 125
+    次全量跑就乱叫一次，而教人忽略一条测试比没有它更糟。实测撞到过一次。
+    """
     proxy = FaultyProxy(registry.endpoint, drop_rate=0.4, seed=1)
     try:
         # The timeout here is the assertion: without a bounded beat this never
-        # returns at all.
-        run_against(proxy, seconds=3, timeout=60)
+        # returns at all. TimeoutExpired 会穿出去，那才是这条测试要抓的。
+        try:
+            run_against(proxy, seconds=3, timeout=60)
+        except AssertionError as gave_up:
+            # 有界地放弃是通过；别的非零退出不是，所以这里只认这一种。
+            assert "Unreachable" in str(gave_up), gave_up
         assert proxy.stats()["dropped"] > 0, "the proxy never actually dropped anything"
     finally:
         proxy.close()

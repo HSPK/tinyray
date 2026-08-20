@@ -113,3 +113,52 @@ def test_async_timeout_is_bounded(async_peer):
             await bad.assign.timeout(0.3)("x")
 
     asyncio.run(drive())
+
+
+def test_repeated_event_loops_do_not_accumulate_clients(async_peer):
+    """One httpx client per loop is right; one per loop *forever* is not.
+
+    The cache was keyed by id(loop), and an id is an address. Nothing ever
+    removed an entry, so a program that calls asyncio.run() per step -- a
+    synchronous training loop driving an async fleet, which is the shape this
+    library exists for -- accumulated one client and one socket per call.
+    Measured before the fix: 100 calls, 100 entries, 100 file descriptors,
+    against a default limit of 1024.
+
+    The same key was also unsound. An address freed by one loop is handed to
+    the next, so a later asyncio.run() could be given a pool belonging to a
+    loop that is already closed. Measured separately: 2 of 5 consecutive
+    asyncio.run() calls landed on an id that had already been used.
+    """
+    import gc
+    import os
+
+    from tinyray import _rpc
+
+    def open_fds() -> int:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+    async def one(n: int) -> dict:
+        return await tinyray.apool("acollector").slot(0).assign(f"t{n}")
+
+    # Warm up first: the first call opens a connection to the peer that later
+    # ones are entitled to keep, so it is not part of what must stay flat.
+    assert asyncio.run(one(0))["took"] == "t0"
+    gc.collect()
+    before_fds, before_entries = open_fds(), len(_rpc._loops)
+
+    for i in range(1, 40):
+        assert asyncio.run(one(i))["took"] == f"t{i}"
+
+    assert len(_rpc._loops) - before_entries <= 2, (
+        f"39 more event loops left {len(_rpc._loops)} cached clients "
+        f"(was {before_entries}); nothing is retiring them"
+    )
+    # Retired clients close their sockets when they are collected, and some of
+    # that is cyclic, so the collector has to run before counting. Measured
+    # across 300 loops: bounded, oscillating between 11 and 22 descriptors and
+    # returning to exactly the starting count once collected -- against 110
+    # after only 100 loops before the fix.
+    gc.collect()
+    leaked = open_fds() - before_fds
+    assert leaked <= 5, f"39 more event loops leaked {leaked} file descriptors"

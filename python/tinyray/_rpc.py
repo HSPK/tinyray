@@ -7,18 +7,34 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
+import weakref
 from typing import Any
 
 import httpx
 
-from ._errors import Fenced, RemoteError, Unreachable
+from ._errors import Fenced, OversizeWarning, RemoteError, Unreachable
 
-MAX_BODY = 1 << 20
+# Past this a call is warned about, not refused. The control plane carries
+# facts about where things are, not the things -- but a call is point to point,
+# so going over is slow for the two ends and nothing else, and refusing at a
+# threshold would turn a payload that grew from 900 KB to 1.1 MB into an
+# outage. There is deliberately no ceiling above it.
+SOFT_BODY = 1 << 20
 DEFAULT_TIMEOUT = 30.0  # the measured control-plane band is 2-30s
 
 _LIMITS = httpx.Limits(max_keepalive_connections=64, keepalive_expiry=60.0)
 _sync: httpx.Client | None = None
-_loops: dict[int, httpx.AsyncClient] = {}
+# A client belongs to one loop, so it is cached per loop -- but held weakly and
+# under a liveness check, because an id() is an address. Nothing retired an
+# entry, so a program calling asyncio.run() per step (a synchronous training
+# loop driving an async fleet, which is the shape this exists for) accumulated
+# one client and one socket per call: measured at 100 calls, 100 entries, 100
+# file descriptors, against a default limit of 1024. And the address a freed
+# loop leaves behind is handed to the next one, so a later run could be given a
+# pool belonging to a loop that is already closed -- 2 of 5 consecutive
+# asyncio.run() calls landed on an id that had already been used.
+_loops: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], httpx.AsyncClient]] = {}
 
 
 def _sync_client() -> httpx.Client:
@@ -31,24 +47,45 @@ def _sync_client() -> httpx.Client:
 
 
 def _async_client() -> httpx.AsyncClient:
-    key = id(asyncio.get_running_loop())  # a client belongs to one loop
-    client = _loops.get(key)
-    if client is None:
-        client = _loops[key] = httpx.AsyncClient(limits=_LIMITS)
+    loop = asyncio.get_running_loop()
+    # Drop whatever belongs to a loop that has gone. Dropping the reference is
+    # what closes the sockets: the pool cannot be awaited shut once its loop
+    # is closed, so this is the only lever left.
+    for key, (ref, _) in list(_loops.items()):
+        held = ref()
+        if held is None or held.is_closed():
+            del _loops[key]
+
+    key = id(loop)
+    got = _loops.get(key)
+    if got is not None and got[0]() is loop:
+        return got[1]
+    client = httpx.AsyncClient(limits=_LIMITS)
+    _loops[key] = (weakref.ref(loop), client)
     return client
+
+
+def _nudge(what: str, size: int, where: str | None) -> None:
+    """Oversize is worth saying and never worth refusing."""
+    if size <= SOFT_BODY:
+        return
+    # stacklevel 4: here, invoke/ainvoke, BoundMethod.__call__, then the line
+    # the application wrote -- which is why both directions are nudged from
+    # invoke and not from _prepare, one frame deeper. The default filter
+    # collapses repeats, so a hot loop nudges once rather than screaming.
+    warnings.warn(
+        f"{what} {size} bytes, past the {SOFT_BODY} the control plane is meant "
+        f"for. It goes through -- a nudge, not a limit -- but consider passing a "
+        f"reference and fetching the payload from {where} yourself.",
+        OversizeWarning,
+        stacklevel=4,
+    )
 
 
 def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str, str]]:
     if handle.url is None:
         raise Unreachable(f"{handle} advertises no address; it joined without serves=")
     body = json.dumps(payload).encode()
-    if len(body) > MAX_BODY:
-        # The byte budget is enforced, not documented: failing loudly beats
-        # getting quietly slower with nobody noticing.
-        raise ValueError(
-            f"{name}() payload is {len(body)} bytes, over the {MAX_BODY} limit; "
-            f"use {handle}.url and send it yourself"
-        )
     headers = {"content-type": "application/json", "x-tinyray-target": handle.identity}
     return f"{handle.url}/call/{name}", body, headers
 
@@ -76,19 +113,25 @@ def _decode(status: int, raw: bytes, target: str) -> Any:
 
 def invoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
     url, body, headers = _prepare(handle, name, payload)
+    _nudge(f"{name}() is sending", len(body), handle.url)
     try:
         r = _sync_client().post(url, content=body, headers=headers, timeout=timeout)
     except httpx.HTTPError as e:
         raise Unreachable(f"{handle.identity} at {handle.url}: {e}") from e
+    # Nudged here rather than on the far side: a served process routinely has
+    # its output sent to /dev/null, so a warning there is one nobody reads.
+    _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
     return _decode(r.status_code, r.content, handle.identity)
 
 
 async def ainvoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
     url, body, headers = _prepare(handle, name, payload)
+    _nudge(f"{name}() is sending", len(body), handle.url)
     try:
         r = await _async_client().post(url, content=body, headers=headers, timeout=timeout)
     except httpx.HTTPError as e:
         raise Unreachable(f"{handle.identity} at {handle.url}: {e}") from e
+    _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
     return _decode(r.status_code, r.content, handle.identity)
 
 
