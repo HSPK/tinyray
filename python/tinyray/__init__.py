@@ -343,9 +343,10 @@ class Member:
     def leave(self) -> None:
         if not self._left:
             self._left = True
-            global _client
+            global _client, _left
             if _client is self._c:
                 _client = None
+                _left = True
             try:
                 self._c.leave()
                 if self._server is not None:
@@ -365,6 +366,7 @@ class Member:
 
 
 _client: _Client | None = None
+_left = False
 
 
 def join(
@@ -378,7 +380,8 @@ def join(
     exclusive: bool = False,
 ) -> Member:
     """Report in. One line per process."""
-    global _client
+    global _client, _left
+    _left = False
     if _client is not None:
         raise RuntimeError(
             "this process has already joined; one process is one member. "
@@ -456,15 +459,24 @@ class AsyncPool(Pool):
     _handle_cls = AsyncHandle
 
 
+def _require_client() -> _Client:
+    if _client is not None:
+        return _client
+    # Never joined and already left look the same from here, and they need
+    # opposite reactions, so say which one it is.
+    if _left:
+        raise RuntimeError(
+            "this process has left; a lookup after leave() cannot work. "
+            "Background threads outliving leave() are the usual cause."
+        )
+    raise RuntimeError("call tinyray.join(...) before looking anyone up")
+
+
 def pool(name: str) -> Pool:
     """Look up a group. Subscribing is implicit and takes effect immediately."""
-    if _client is None:
-        raise RuntimeError("call tinyray.join(...) before looking anyone up")
-    return Pool(name, _client)
+    return Pool(name, _require_client())
 
 
 def apool(name: str) -> AsyncPool:
     """Same as `pool`, but its handles hand back awaitables."""
-    if _client is None:
-        raise RuntimeError("call tinyray.join(...) before looking anyone up")
-    return AsyncPool(name, _client)
+    return AsyncPool(name, _require_client())
