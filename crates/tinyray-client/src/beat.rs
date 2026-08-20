@@ -124,6 +124,21 @@ impl Shared {
         }
         let mut cache = self.cache.write().unwrap();
         for (name, d) in &ack.pools {
+            // An incremental delta answers "what changed since version V", and
+            // after a restart the V we asked from was issued by the previous
+            // process. This one has never used that numbering, so the answer
+            // silently omits everyone it placed at or below that number, and
+            // the version it comes with says we are up to date -- so nothing
+            // ever asks again. Measured: two members registered, the client
+            // holding one of them, and its roster fingerprint equal to the
+            // registry's, which is what an epoch freezes on.
+            //
+            // A full roster describes itself and is safe whoever numbered it.
+            // Dropping the rest leaves no entry for the pool, so the next beat
+            // asks with no position at all and is sent one.
+            if restarted && !d.full {
+                continue;
+            }
             let c = cache.entry(name.clone()).or_default();
             if d.full {
                 c.members.clear();
