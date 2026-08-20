@@ -67,11 +67,18 @@ def test_a_restart_does_not_freeze_the_cache(registry):
     )
     try:
         assert bumper.stdout.readline().strip() == "DONE"
+        # Wait on the counter itself: an entry now appears as soon as the
+        # registry answers, empty pool included, so its presence says nothing
+        # about how far the counter got.
         deadline = time.monotonic() + 20
-        while watched._c.pool_info("w") is None and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            info = watched._c.pool_info("w")
+            if info is not None and info[0] > 5:
+                break
             time.sleep(0.05)
-        assert watched._c.pool_info("w") is not None
-        high = watched._c.pool_info("w")[0]
+        info = watched._c.pool_info("w")
+        assert info is not None
+        high = info[0]
         assert high > 5, f"the counter only reached {high}"
     finally:
         _stop(bumper)

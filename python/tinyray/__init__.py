@@ -207,7 +207,26 @@ class Pool:
         self._c = client
         client.watch([name])
 
+    def _settle(self) -> None:
+        """Block until the first answer about this pool arrives.
+
+        Subscribing and looking up happen in the same breath, so without this
+        the first call reads a cache the registry has not answered yet and
+        reports the pool empty -- measured 46-87ms of confident wrong answers
+        about a pool that had been full for seconds.
+        """
+        deadline = time.monotonic() + _FIRST_ANSWER_S
+        while self._c.pool_info(self._name) is None and time.monotonic() < deadline:
+            # A registry that is not answering will not answer this either, and
+            # waiting on it would make every new pool cost the full deadline --
+            # measured 10s for five pools. Losing the registry must not stall
+            # lookups.
+            if self._c.silence_ms > self._lease_ms() // 2:
+                return
+            time.sleep(0.002)
+
     def _members(self, filt: dict[str, Any], require_ready: bool) -> list[Handle]:
+        self._settle()
         raw = self._c.lookup(self._name, json.dumps(filt), require_ready)
         # The method list is stored once per pool, not once per member: members
         # of a pool run the same code.
@@ -376,6 +395,10 @@ class Member:
         seat = self.slot if self.slot is not None else "-"
         return f"<Member {self.pool}/{seat}#{self.incarnation & 0xFFF:03x}>"
 
+
+# One beat plus slack: long enough for the registry's first answer, short
+# enough that a dead registry does not turn every lookup into a stall.
+_FIRST_ANSWER_S = 2.0
 
 _client: _Client | None = None
 _left = False

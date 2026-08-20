@@ -97,13 +97,14 @@ impl Shared {
     }
 
     /// Returns false once the seat has been taken by a later tenure.
-    fn apply(&self, ack: &BeatAck) -> bool {
+    fn apply(&self, ack: &BeatAck, watch: &[String]) -> bool {
         // A restarted registry counts from zero again. Keeping a cache built
         // against the old numbering means asking for changes since a version
         // it has never reached, being told there are none, and holding a stale
         // roster forever with nothing to show for it.
         let previous = self.seen_epoch.swap(ack.epoch, Ordering::Relaxed);
-        if previous != 0 && previous != ack.epoch {
+        let restarted = previous != 0 && previous != ack.epoch;
+        if restarted {
             self.cache.write().unwrap().clear();
         }
         if !ack.accepted {
@@ -126,6 +127,17 @@ impl Shared {
             c.roster = d.roster;
             c.methods = d.methods.clone();
             c.size = d.size;
+        }
+        // A pool we asked about and heard nothing back for is empty, not
+        // unknown. Without this an entry stays missing and the first lookup
+        // cannot tell "nobody joined" from "I subscribed a moment ago" -- it
+        // calls the pool empty either way, about a pool that may be full.
+        // Skipped right after a restart, when the cleared cache really is
+        // ignorance rather than an answer.
+        if !restarted {
+            for name in watch {
+                cache.entry(name.clone()).or_default();
+            }
         }
         true
     }
@@ -199,7 +211,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             match post(&http, &shared.endpoint, &beat, beat_timeout(interval)).await {
                 Some(ack) => {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
-                    let alive = shared.apply(&ack);
+                    let alive = shared.apply(&ack, &beat.watch);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     shared.mark_ok();
                     if !alive {
@@ -239,7 +251,7 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
         match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
             Some(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
-                s.apply(&ack);
+                s.apply(&ack, &beat.watch);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
                 s.mark_ok();
                 true
