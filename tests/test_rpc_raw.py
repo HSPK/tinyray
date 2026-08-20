@@ -100,3 +100,53 @@ def test_a_return_value_json_cannot_carry_is_reported_not_dropped(served, method
         with pytest.raises(tinyray.RemoteError, match="cannot be sent as JSON"):
             getattr(h, method)()
         assert h.ping() == "pong", "报错之后连接必须还能用"
+
+
+STALE_SRV = textwrap.dedent(
+    """
+    import sys, tinyray
+    class S:
+        def who(self) -> str: return "ok"
+    with tinyray.join("s", "stateful", slot=0, size=1, serves=S()) as m:
+        m.ready(); print(m._server.port, flush=True); sys.stdin.readline()
+    """
+)
+
+
+def test_a_fenced_call_does_not_poison_the_next_one(registry):
+    """提前回复而不读掉请求体，会让 keep-alive 的下一个请求从残字节开始解析。
+
+    实测表现为完美交替：过期句柄第 1、3、5 轮拿到 Fenced，第 2、4、6 轮拿到
+    Unreachable（空 body），因为每个被围栏拒绝的请求都毁掉了它后面那一个。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", STALE_SRV], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        port = int(p.stdout.readline().strip())
+        with tinyray.join("c", "churn") as me:
+            me.ready()
+            good = tinyray.pool("s").wait(count=1, timeout=15)[0]
+            stale = tinyray.Handle(
+                "s",
+                {
+                    "id": 0,
+                    "slot": 0,
+                    "incarnation": good.incarnation - 1,
+                    "url": f"http://127.0.0.1:{port}",
+                    "ready": True,
+                    "state": {},
+                },
+                ("who",),
+            )
+            for i in range(6):
+                with pytest.raises(tinyray.Fenced):
+                    stale.who()
+                assert good.who() == "ok", f"第 {i + 1} 轮：围栏拒绝毁掉了下一个请求"
+    finally:
+        try:
+            p.stdin.write("\n")
+            p.stdin.flush()
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()

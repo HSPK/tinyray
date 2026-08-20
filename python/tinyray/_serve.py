@@ -157,6 +157,35 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self) -> None:
+        # Read the body before anything else can return. An early reply that
+        # leaves it in the socket desynchronises keep-alive, and the next
+        # request parses from the leftovers: measured as a fenced call and a
+        # good one alternating, every second call coming back with an empty
+        # body. Fencing and routing used to answer above this point.
+        try:
+            length = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return self._send(400, {"error": "content-length is not a number"})
+        if length < 0:
+            self.close_connection = True
+            return self._send(400, {"error": "content-length is negative"})
+        if length > MAX_BODY:
+            # Deliberately not read, so this connection cannot be reused.
+            self.close_connection = True
+            return self._send(413, {"error": "payload too large"})
+        raw = b"{}"
+        if length:
+            self.connection.settimeout(BODY_TIMEOUT)
+            try:
+                raw = self.rfile.read(length)
+            except (TimeoutError, OSError):
+                # The stream cannot be resynchronised after a partial body.
+                self.close_connection = True
+                return self._send(408, {"error": "body never arrived"})
+            finally:
+                self.connection.settimeout(None)
+
         if not self.path.startswith("/call/"):
             return self._send(404, {})
         name = self.path[len("/call/") :]
@@ -173,28 +202,6 @@ class _Handler(BaseHTTPRequestHandler):
         target = self.headers.get("x-tinyray-target")
         if target and target != self.server.identity:
             return self._send(409, {"error": "fenced", "identity": self.server.identity})
-
-        try:
-            length = int(self.headers.get("content-length") or 0)
-        except ValueError:
-            self.close_connection = True
-            return self._send(400, {"error": "content-length is not a number"})
-        if length < 0:
-            self.close_connection = True
-            return self._send(400, {"error": "content-length is negative"})
-        if length > MAX_BODY:
-            return self._send(413, {"error": "payload too large"})
-        raw = b"{}"
-        if length:
-            self.connection.settimeout(BODY_TIMEOUT)
-            try:
-                raw = self.rfile.read(length)
-            except (TimeoutError, OSError):
-                # The stream cannot be resynchronised after a partial body.
-                self.close_connection = True
-                return self._send(408, {"error": "body never arrived"})
-            finally:
-                self.connection.settimeout(None)
 
         fn = self.server.dispatch.get(name)
         if fn is None:
