@@ -15,10 +15,11 @@ from conftest import BIN, free_port
 
 PROBE = textwrap.dedent(
     """
-    import time, tinyray
+    import sys, time, tinyray
+    kw = {} if len(sys.argv) < 2 else {"timeout": float(sys.argv[1])}
     t0 = time.monotonic()
     try:
-        me = tinyray.join("c", "churn")
+        me = tinyray.join("c", "churn", **kw)
         me.ready()
         print(f"OK {time.monotonic()-t0:.1f} {me.stats()['beats_ok']}")
         me.leave()
@@ -28,11 +29,14 @@ PROBE = textwrap.dedent(
 )
 
 
-def _run(endpoint: str, timeout: float = 90) -> tuple[str, float, str]:
+def _run(
+    endpoint: str, timeout: float = 90, join_timeout: float | None = None
+) -> tuple[str, float, str]:
     env = dict(os.environ, TINYRAY_REGISTRY=endpoint)
-    out = subprocess.run(
-        [sys.executable, "-c", PROBE], env=env, capture_output=True, text=True, timeout=timeout
-    )
+    argv = [sys.executable, "-c", PROBE]
+    if join_timeout is not None:
+        argv.append(str(join_timeout))
+    out = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
     assert out.returncode == 0, out.stderr[-500:]
     kind, secs, rest = out.stdout.strip().split(" ", 2)
     return kind, float(secs), rest
@@ -90,3 +94,41 @@ def test_losing_the_registry_after_joining_is_still_survivable(registry):
         time.sleep(2.0)
         assert me.silence_ms > 500
         assert len(tinyray.pool("c").all()) == 1, "缓存没有把它带下去"
+
+
+def test_join_timeout_bounds_the_wait():
+    """等待是常态，但等多久该由调用方决定：地址写错时想立刻知道，
+    注册中心晚起时想等下去。"""
+    dead = f"127.0.0.1:{free_port()}"
+    for want in (1.0, 4.0):
+        kind, secs, msg = _run(dead, join_timeout=want)
+        assert kind == "UNREACHABLE", msg
+        assert want <= secs < want + 3.0, f"要求等 {want}s，实际 {secs}s"
+        assert "join(timeout=)" in msg, "报错没说怎么等更久"
+
+
+def test_a_longer_timeout_outlasts_a_late_registry():
+    """默认 30s 之外，调用方还能自己加码。"""
+    port = free_port()
+    started: list[subprocess.Popen] = []
+
+    def later():
+        time.sleep(8.0)
+        started.append(
+            subprocess.Popen(
+                [str(BIN), "--listen", f"127.0.0.1:{port}", "--ttl-ms", "4000"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        )
+
+    t = threading.Thread(target=later)
+    t.start()
+    try:
+        kind, secs, rest = _run(f"127.0.0.1:{port}", join_timeout=25.0)
+        assert kind == "OK", rest
+        assert 7.0 < secs < 15.0, f"等了 {secs}s，与 8s 的启动延迟对不上"
+    finally:
+        t.join()
+        for p in started:
+            p.terminate()

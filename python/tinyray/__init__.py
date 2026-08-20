@@ -458,11 +458,18 @@ _FIRST_ANSWER_S = 2.0
 # something. See tests/test_state_budget.py for the amplification measurement.
 MAX_STATE = 16 << 10
 
-# How long join() waits for its first beat to land. Long enough to cross a
-# registry restart (measured at about a second) and to tolerate a launcher
-# that starts ranks before the registry, short enough that a typo in
-# TINYRAY_REGISTRY fails at startup rather than at the first wait().
-FIRST_BEAT_S = 10.0
+# Default for join(timeout=): how long to keep trying to reach the registry.
+#
+# Ten seconds sat exactly on the coin flip. Measured against a 40% drop rate,
+# a link that works but loses packets: the first beat lands at a median of
+# 5.0s, p90 9.8s, worst 12.3s -- so join() failed roughly one launch in
+# fifteen on a network the member would then have run on perfectly well.
+# Thirty gives 2.4x margin over the worst observed and covered 20 of 20.
+#
+# At 60% loss the p90 is 50.8s and this will still give up on some launches.
+# That is a network where nothing else works either, and the alternative --
+# waiting forever on an endpoint that may simply be wrong -- is worse.
+FIRST_BEAT_S = 30.0
 
 _client: _Client | None = None
 _left = False
@@ -491,8 +498,15 @@ def join(
     url: str | None = None,
     serves: Any = None,
     exclusive: bool = False,
+    timeout: float = FIRST_BEAT_S,
 ) -> Member:
-    """Report in. One line per process."""
+    """Report in. One line per process.
+
+    `timeout` is how long to keep trying before giving up on the registry.
+    Launchers routinely start ranks before it is listening, so waiting is the
+    normal case; raise it when the registry comes up late or the link is bad,
+    and lower it when a wrong address should be reported straight away.
+    """
     global _client, _left, _owner_pid
     _left = False
     if _client is not None:
@@ -555,7 +569,7 @@ def join(
         # cannot appear. Measured against a wrong port, an unroutable address
         # and a name that does not resolve: join() returned in 0.0s to 5.0s
         # with accepted=True, zero beats through and its own pool empty.
-        deadline = time.monotonic() + FIRST_BEAT_S
+        deadline = time.monotonic() + timeout
         while not c.stats()["beats_ok"] and time.monotonic() < deadline:
             time.sleep(0.02)
         if not c.stats()["beats_ok"]:
@@ -564,8 +578,8 @@ def join(
                 server.close()
             raise Unreachable(
                 f"no answer from the registry at {_endpoint()} after "
-                f"{FIRST_BEAT_S:g}s and {c.stats()['beats_failed']} attempts: "
-                f"{c.last_error()}"
+                f"{timeout:g}s and {c.stats()['beats_failed']} attempts: "
+                f"{c.last_error()}. Pass join(timeout=) to wait longer."
             )
     if not c.accepted:
         # Seats are last-writer-wins by default, because a restarting rank has

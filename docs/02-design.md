@@ -71,6 +71,7 @@ tinyray 知道「engine/17 说自己没准备好」，但不知道 model version
 | | `timeout` | 改这一次调用的超时 |
 | Epoch | `members` | 冻住的那份名单 |
 | | `valid` | 这份名单还作不作数 |
+| `join()` | `timeout=` | 等注册中心多久，默认 30 秒 |
 | 异常 | `Unreachable` / `Fenced` / `RemoteError` | 见 §5 |
 | | `Stale` / `SeatTaken` / `NotFound` | 断线开轮 / 座位被占 / 找不到人 |
 
@@ -81,6 +82,10 @@ import tinyray
 me = tinyray.join("engine", policy="serving", slot=3, serves=svc)
 me.ready(model_version=17)
 me.leave()                        # 或者 with tinyray.join(...) as me
+
+# join() 会等注册中心 —— launcher 常常比它先起来。等多久你说了算：
+tinyray.join("engine", timeout=120)   # 注册中心起得慢，或者链路差
+tinyray.join("engine", timeout=2)     # 地址写错了要立刻知道
 
 # ── 找人 ───────────────────────────────────────────
 p = tinyray.pool("engine")

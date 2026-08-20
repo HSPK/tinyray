@@ -32,8 +32,11 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["examples: runs the example programs end to end; minutes, not seconds"]
-addopts = "-m 'not examples'"
+markers = [
+    "examples: runs the example programs end to end; minutes, not seconds",
+    "slow: needs many trials to discriminate a rare failure; minutes",
+]
+addopts = "-m 'not examples and not slow'"
 
 # Bare `mypy` in CI needs to know what to look at. Only the package: the tests
 # and examples deliberately reach into private attributes to check internals.

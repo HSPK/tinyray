@@ -54,8 +54,27 @@ def test_a_dropped_packet_does_not_hang_join_forever(registry):
     try:
         # The timeout here is the assertion: without a bounded beat this never
         # returns at all.
-        run_against(proxy, seconds=3, timeout=45)
+        run_against(proxy, seconds=3, timeout=60)
         assert proxy.stats()["dropped"] > 0, "the proxy never actually dropped anything"
+    finally:
+        proxy.close()
+
+
+@pytest.mark.parametrize("seed", [11, 12, 13, 14, 15])
+def test_a_lossy_link_still_lets_a_member_start(registry, seed):
+    """一条只是丢包的链路不该把 rank 拦在门外。
+
+    这是冒烟，不是回归：把截止时间调回 10 秒它照样 5/5 通过。10 秒时的失败率
+    实测 6.7%，5 次试验抓到的概率只有 29%。真正有判别力的那条在下面，
+    带 slow 标记。
+    """
+    proxy = FaultyProxy(registry.endpoint, drop_rate=0.4, seed=seed)
+    try:
+        # run_against 已经断言了退出码 —— join() 抛 Unreachable 就是失败。
+        # 不断言"能看见自己"：ready() 要等下一拍才生效，那是另一件事的时序。
+        ok, failed, _ = run_against(proxy, seconds=3, timeout=90)
+        assert failed > 0, "这一轮没丢到包，等于没测"
+        assert ok >= 1, "一拍都没落地却返回了成功"
     finally:
         proxy.close()
 
@@ -153,3 +172,33 @@ def test_calls_are_bounded_when_the_far_side_stops_answering(registry):
         assert time.monotonic() - t0 < 5
     finally:
         me.leave()
+
+
+@pytest.mark.slow
+def test_the_first_beat_deadline_survives_a_lossy_link(registry):
+    """启动 40 次，因为要防的是一个罕见事件，而它量的是比率不是有无。
+
+    截止时间既要识破"注册中心根本不存在"，又要熬过丢包。10 秒正好坐在抛硬币
+    的位置上：40% 丢包下首拍落地中位 5.0s、p90 9.8s、最慢 12.3s，实测 15 次
+    启动失败 1 次（6.7%），在套件里表现为偶发。
+
+    改成 30 秒之后，三轮共 120 次启动失败 1 次（约 0.8%）—— 降了，没有归零。
+    所以这里允许 1 次失败：断言"一次都不许失败"会让这条测试自己有 4% 的概率
+    乱叫，而教人忽略一条测试比没有它更糟。
+
+    代价是判别力：允许 1 次时，它抓住 10 秒那个回归的概率是 75%（40 次试验、
+    6.7% 失败率）。这条数字写在这里，免得下次有人以为它是把铁锁。
+    """
+    launches, tolerated = 40, 1
+    failures = []
+    for seed in range(200, 200 + launches):
+        proxy = FaultyProxy(registry.endpoint, drop_rate=0.4, seed=seed)
+        try:
+            run_against(proxy, seconds=1, timeout=120)
+        except AssertionError as e:
+            failures.append(f"seed={seed}: {e}"[-600:])
+        finally:
+            proxy.close()
+    assert len(failures) <= tolerated, (
+        f"{len(failures)}/{launches} 次启动失败，超过实测到的 1/120:\n" + "\n".join(failures[:3])
+    )
