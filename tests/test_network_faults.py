@@ -61,32 +61,60 @@ def test_a_dropped_packet_does_not_hang_join_forever(registry):
         proxy.close()
 
 
-def test_lost_packets_do_not_cost_the_lease(registry):
+BLACKHOLE_PROBE = textwrap.dedent(
+    """
+    import sys, time, tinyray
+    flag, seconds = sys.argv[1], float(sys.argv[2])
+    me = tinyray.join("n", "churn")
+    me.ready()
+    time.sleep(1.0)
+    before = me.stats()
+    open(flag, "w").write("GO")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        time.sleep(0.02)
+    s = me.stats()
+    print(f"{s['beats_failed'] - before['beats_failed']} {s['beats_ok'] - before['beats_ok']}")
+    me.leave()
+    """
+)
+
+
+def test_a_beat_gives_up_inside_its_own_interval(registry, tmp_path):
     """The beat loop is serial, so a request deadline is also how long a lost
-    packet stops us beating. A five-second deadline against a 500 ms interval
-    meant one drop took the member out of the roster."""
-    clean = FaultyProxy(registry.endpoint)
-    try:
-        baseline, _, _ = run_against(clean, seconds=8, timeout=60)
-    finally:
-        clean.close()
+    packet stops us beating. A five-second deadline against a 500ms interval
+    meant one drop took the member out of the roster.
 
-    lossy = FaultyProxy(registry.endpoint, drop_rate=0.3, seed=2)
+    Counted attempts under a total blackhole rather than beats through random
+    loss: at 30% drop the loss pattern dominates and healthy and broken builds
+    overlap (10-19 beats against 3-7). Swallowing everything makes it
+    arithmetic -- deadline plus interval per attempt -- and the two builds
+    separate with no variance at all: 9, 9, 9 attempts in eight seconds
+    against 1, 1, 1 with the deadline restored to five seconds.
+    """
+    flag = tmp_path / "go"
+    proxy = FaultyProxy(registry.endpoint)
     try:
-        ok, failed, seen = run_against(lossy, seconds=8, timeout=60)
+        env = dict(os.environ, TINYRAY_REGISTRY=proxy.endpoint)
+        p = subprocess.Popen(
+            [sys.executable, "-c", BLACKHOLE_PROBE, str(flag), "8"],
+            env=env,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 30
+        while not flag.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert flag.exists(), "the probe never got going"
+        proxy.drop_rate = 1.0
+        failed, ok = (int(x) for x in p.communicate(timeout=60)[0].split())
     finally:
-        lossy.close()
-
-    assert failed > 0, "no packets were lost, so this proved nothing"
-    # Measured against a clean run in the same session rather than a fixed
-    # number: an absolute threshold holds on an idle machine and not under
-    # load. Stalling behind the timeout took this to one beat in thirteen
-    # seconds; keeping the deadline inside the interval keeps most of them.
-    assert ok >= baseline / 3, (
-        f"{ok} beats through with loss against {baseline} clean; the loop is "
-        f"stalling behind its own timeout"
+        proxy.close()
+    assert ok == 0, f"{ok} beats got through a total blackhole; the probe is wrong"
+    assert failed >= 5, (
+        f"only {failed} attempts in 8s with everything dropped; the loop is "
+        f"stalling behind its own timeout instead of giving up inside the interval"
     )
-    assert seen == 1, "the member could not see itself in its own pool"
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,11 @@ import msgspec
 
 MAX_BODY = 1 << 20  # Control plane only. Bigger payloads use .url instead.
 
+# A caller that announces a body and never sends it pins a thread for as long
+# as it cares to: measured 200 such connections holding 203 threads, released
+# only when the attacker closed them. Real bodies are under a megabyte.
+BODY_TIMEOUT = 15.0
+
 
 def scan(obj: Any) -> dict[str, Callable[..., Any]]:
     """Public methods, in declaration order. Leading underscore means private."""
@@ -80,7 +85,22 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code: int, body: dict) -> None:
-        raw = json.dumps(body).encode()
+        try:
+            raw = json.dumps(body).encode()
+        except (TypeError, ValueError) as e:
+            # A method returning something JSON cannot carry used to kill the
+            # handler thread, and the caller saw a reset connection -- which
+            # reads as "the peer died" rather than "your return value".
+            code = 200
+            raw = json.dumps(
+                {
+                    "error": {
+                        "type": "TypeError",
+                        "message": f"the return value cannot be sent as JSON: {e}",
+                        "traceback": "",
+                    }
+                }
+            ).encode()
         if len(raw) > MAX_BODY and "result" in body:
             # The budget was only enforced on the way in, which is the wrong
             # half: a reply is where "while I am here, take this too" creeps in.
@@ -107,6 +127,18 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {})
 
+    def handle_one_request(self) -> None:
+        # A handler that raises answers nothing and the caller sees a reset,
+        # which is indistinguishable from the process dying.
+        try:
+            super().handle_one_request()
+        except Exception as e:
+            self.close_connection = True
+            try:
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            except Exception:
+                pass
+
     def do_POST(self) -> None:
         if not self.path.startswith("/call/"):
             return self._send(404, {})
@@ -125,10 +157,27 @@ class _Handler(BaseHTTPRequestHandler):
         if target and target != self.server.identity:
             return self._send(409, {"error": "fenced", "identity": self.server.identity})
 
-        length = int(self.headers.get("content-length") or 0)
+        try:
+            length = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return self._send(400, {"error": "content-length is not a number"})
+        if length < 0:
+            self.close_connection = True
+            return self._send(400, {"error": "content-length is negative"})
         if length > MAX_BODY:
             return self._send(413, {"error": "payload too large"})
-        raw = self.rfile.read(length) if length else b"{}"
+        raw = b"{}"
+        if length:
+            self.connection.settimeout(BODY_TIMEOUT)
+            try:
+                raw = self.rfile.read(length)
+            except (TimeoutError, OSError):
+                # The stream cannot be resynchronised after a partial body.
+                self.close_connection = True
+                return self._send(408, {"error": "body never arrived"})
+            finally:
+                self.connection.settimeout(None)
 
         fn = self.server.dispatch.get(name)
         if fn is None:
