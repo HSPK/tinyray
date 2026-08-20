@@ -216,6 +216,10 @@ class Pool:
         the first call reads a cache the registry has not answered yet and
         reports the pool empty -- measured 46-87ms of confident wrong answers
         about a pool that had been full for seconds.
+
+        This is the one place a lookup waits on the network. On an event loop
+        that shows up as a stalled tick, so AsyncPool's docstring says how to
+        pay it at startup instead.
         """
         deadline = time.monotonic() + _FIRST_ANSWER_S
         while self._c.pool_info(self._name) is None and time.monotonic() < deadline:
@@ -578,8 +582,19 @@ def join(
 
 
 class AsyncPool(Pool):
-    """Same lookups -- they read the local cache and never block -- but the
-    handles they return produce awaitables."""
+    """Same lookups, but the handles they return produce awaitables.
+
+    Lookups read the local cache, with one exception worth knowing about on an
+    event loop: the very first one for a pool has to wait for the registry's
+    first answer, or it would report a full pool empty. Measured at 42ms of
+    stalled loop per unfamiliar pool, 169ms for four of them.
+
+    Constructing the pool is what subscribes, so building the ones you need at
+    startup removes it entirely -- the same four then cost 0ms, with the loop
+    never stalled longer than one of its own ticks:
+
+        POOLS = [tinyray.pool(n) for n in ("trainers", "rollout")]
+    """
 
     _handle_cls = AsyncHandle
 
