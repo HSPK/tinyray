@@ -123,7 +123,19 @@ impl Shared {
 
 type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
 
-async fn post(http: &HttpClient, endpoint: &str, beat: &Beat) -> Option<BeatAck> {
+/// A beat is small and local; anything slower than this is a lost packet, not
+/// a slow server. Without a deadline a single dropped packet hangs the caller
+/// forever, which is exactly what "failure must be explicitly bounded" is for.
+///
+/// The loop is serial, so this deadline is also how long a lost packet stops
+/// us beating. It has to stay well inside the interval, or one drop costs the
+/// lease: at a 500 ms interval a five-second timeout meant a single lost packet
+/// took the member out of the roster.
+fn beat_timeout(interval_ms: u64) -> Duration {
+    Duration::from_millis(interval_ms.clamp(50, 30_000) * 3 / 4)
+}
+
+async fn post(http: &HttpClient, endpoint: &str, beat: &Beat, budget: Duration) -> Option<BeatAck> {
     let body = Full::new(Bytes::from(serde_json::to_vec(beat).ok()?));
     let req = hyper::Request::builder()
         .method("POST")
@@ -131,8 +143,17 @@ async fn post(http: &HttpClient, endpoint: &str, beat: &Beat) -> Option<BeatAck>
         .header("content-type", "application/json")
         .body(body)
         .ok()?;
-    let resp = http.request(req).await.ok()?;
-    let bytes = resp.into_body().collect().await.ok()?.to_bytes();
+    let resp = tokio::time::timeout(budget, http.request(req)).await.ok()?.ok()?;
+    if !resp.status().is_success() {
+        // A 4xx is our fault and retrying will not fix it, but it is still not
+        // an answer, so it counts as a failed beat rather than a hang.
+        return None;
+    }
+    let bytes = tokio::time::timeout(budget, resp.into_body().collect())
+        .await
+        .ok()?
+        .ok()?
+        .to_bytes();
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -164,7 +185,8 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 return;
             }
             let beat = shared.compose();
-            match post(&http, &shared.endpoint, &beat).await {
+            let interval = shared.interval_ms.load(Ordering::Relaxed);
+            match post(&http, &shared.endpoint, &beat, beat_timeout(interval)).await {
                 Some(ack) => {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                     let alive = shared.apply(&ack);
@@ -202,7 +224,9 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
                 .http2_only(true)
                 .build_http();
         let beat = s.compose();
-        match post(&http, &s.endpoint, &beat).await {
+        // join() and leave() are one-shot and a caller is waiting, so they get
+        // a fixed budget rather than the loop's.
+        match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
             Some(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.apply(&ack);
