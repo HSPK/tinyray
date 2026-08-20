@@ -4,6 +4,9 @@
 首次查询等回音、方法服务端答复超预算），全都是能让示例静默失效的改动。
 
 用 `-m examples` 跑。默认排除，因为它要几分钟。
+
+19_pool_size_guard 还要 `cargo build --release --bin loadgen`：它不在 wheel 里，
+在写这些示例的机器上早就存在，所以这个依赖一直没被发现，直到 CI 第一次跑它们。
 """
 
 from __future__ import annotations

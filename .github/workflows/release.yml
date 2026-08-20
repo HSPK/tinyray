@@ -70,6 +70,12 @@ jobs:
       - run: mypy
       - run: pytest tests/ -q
 
+      # 19_pool_size_guard drives the registry with the load generator, which
+      # is a workspace binary rather than part of the wheel. It was present on
+      # the machine these examples were written on and absent here, which is
+      # the whole reason they now run in CI.
+      - run: cargo build --release --bin loadgen
+
       # The examples are part of the documented surface and are excluded from
       # the default run because they take minutes. A release should not ship
       # with them broken.
