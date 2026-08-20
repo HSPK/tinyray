@@ -11,6 +11,16 @@ use tinyray_proto::{Beat, BeatAck, Member, PoolDelta};
 /// falls further behind than this gets a full roster instead of a delta.
 const LOG_CAP: usize = 4096;
 
+/// A tenure is milliseconds shifted left twenty bits, so anything past a few
+/// centuries in the future came from a broken clock rather than a real process.
+/// Accepting one would raise the high-water mark beyond anything a healthy peer
+/// can produce and lock that seat out permanently -- for a trainer rank, that
+/// means the job can never start again.
+const MAX_INCARNATION: u64 = (4_000_000_000_000u64) << 20;
+
+/// Names are used as map keys and echoed back to every subscriber.
+const MAX_NAME: usize = 512;
+
 struct Record {
     member: Member,
     expires_at: Instant,
@@ -96,7 +106,22 @@ impl Registry {
         Self { pools: RwLock::new(HashMap::new()), ttl }
     }
 
+    /// Rejects a beat that could damage state rather than merely being wrong.
+    fn admissible(b: &Beat) -> bool {
+        b.pool.len() <= MAX_NAME
+            && b.incarnation <= MAX_INCARNATION
+            && b.watch.len() <= 64
+            && b.watch.iter().all(|w| w.len() <= MAX_NAME)
+    }
+
     pub fn beat(&self, b: &Beat) -> BeatAck {
+        if !Self::admissible(b) {
+            return BeatAck {
+                ttl_ms: self.ttl.as_millis() as u64,
+                accepted: false,
+                pools: HashMap::new(),
+            };
+        }
         let mut pools = self.pools.write().unwrap();
         let p = pools.entry(b.pool.clone()).or_default();
         if p.policy.is_empty() {
