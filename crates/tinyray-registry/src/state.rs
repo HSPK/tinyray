@@ -77,6 +77,18 @@ struct Pool {
     /// Only slotted pools need this; interchangeable members get a fresh id
     /// each time, so an old id is never reused.
     high: HashMap<u64, u64>,
+    /// Tenures that said goodbye, and when it stops mattering.
+    ///
+    /// A beat that timed out on the client was not necessarily lost: the
+    /// caller stopped waiting, but the request can still arrive here
+    /// afterwards -- saying leaving=false, on the tenure that has just said
+    /// goodbye -- and put the member back for a whole lease, which is the one
+    /// thing saying goodbye is meant to avoid.
+    ///
+    /// Only explicit goodbyes go in here. A lease that merely lapsed must not:
+    /// that member is alive and simply missed some beats, and soft state is
+    /// supposed to let its next beat put it back.
+    gone: HashMap<u64, (u64, Instant)>,
     /// (version, member id) of each change, oldest first.
     log: VecDeque<(u64, u64)>,
 }
@@ -212,11 +224,22 @@ impl Registry {
 
         let stored = p.members.get(&b.id).map(|r| r.member.incarnation);
         let watermark = p.high.get(&b.id).copied().unwrap_or(0);
+        // A beat this tenure sent before it said goodbye, arriving after it.
+        // Measured at the 200ms lease floor: 6 of 300 leave() calls left the
+        // member registered, with the goodbye itself reporting no failure.
+        // A goodbye is exempt, so repeating one is not an error: leave() sends
+        // one and the beat loop may send another behind it.
+        let straggler = !b.leaving
+            && p.gone
+                .get(&b.id)
+                .is_some_and(|(tenure, _)| b.incarnation <= *tenure);
         // Asking exclusively means "only if nobody holds it": the lease has
         // not lapsed, so somebody does.
         let occupied = b.exclusive && stored.is_some_and(|cur| cur != b.incarnation);
-        let superseded =
-            occupied || b.incarnation < watermark || stored.is_some_and(|cur| cur > b.incarnation);
+        let superseded = occupied
+            || straggler
+            || b.incarnation < watermark
+            || stored.is_some_and(|cur| cur > b.incarnation);
 
         let accepted = !superseded;
         if superseded {
@@ -228,6 +251,13 @@ impl Registry {
                 p.roster ^= r.member.roster_hash();
                 p.bump(b.id);
             }
+            // Remembered for one lease: several times longer than any beat
+            // still in flight, since a beat gives up at three quarters of an
+            // interval and an interval is a quarter of the lease. The sweeper
+            // drops it afterwards, so a pool that churns for a week does not
+            // keep every id that ever left.
+            p.gone
+                .insert(b.id, (b.incarnation, Instant::now() + self.ttl));
         } else if stored == Some(b.incarnation) {
             let changed = {
                 let r = p.members.get(&b.id).unwrap();
@@ -298,6 +328,9 @@ impl Registry {
         let mut pools = self.pools.write().unwrap();
         let mut dropped = 0;
         for p in pools.values_mut() {
+            // Departures stop mattering once the lease they had would have run
+            // out, and dropping them here is what keeps that memory bounded.
+            p.gone.retain(|_, (_, forget_at)| *forget_at > now);
             let dead: Vec<u64> = p
                 .members
                 .iter()
