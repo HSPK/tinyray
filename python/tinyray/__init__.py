@@ -391,6 +391,12 @@ class Member:
         self._mine()
         return self._c.stats()
 
+    @property
+    def last_error(self) -> str:
+        """Why the last beat failed, or "" if none has. Reading silence_ms
+        tells you contact is lost; this tells you what it looked like."""
+        return self._c.last_error()
+
     def leave(self) -> None:
         self._mine()
         if not self._left:
@@ -531,7 +537,8 @@ def join(
                 server.close()
             raise Unreachable(
                 f"no answer from the registry at {_endpoint()} after "
-                f"{FIRST_BEAT_S:g}s; {c.stats()['beats_failed']} attempts made"
+                f"{FIRST_BEAT_S:g}s and {c.stats()['beats_failed']} attempts: "
+                f"{c.last_error()}"
             )
     if exclusive and not c.accepted:
         # Seats are last-writer-wins by default, because a restarting rank has

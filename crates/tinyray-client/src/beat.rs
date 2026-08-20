@@ -47,6 +47,10 @@ pub struct Shared {
     pub accepted: AtomicBool,
     pub beats_ok: AtomicU64,
     pub beats_failed: AtomicU64,
+    /// Why the last beat failed. Every failure path used to discard its error,
+    /// so a refused connection, a timeout, a peer that only speaks HTTP/1.1
+    /// and a malformed reply were all reported the same way: silence.
+    pub last_error: Mutex<String>,
     pub interval_ms: AtomicU64,
     /// Monotonic ms of the last successful beat. Freezing a round on a stale
     /// roster is unsafe, so epoch() needs to know when we are flying blind.
@@ -157,26 +161,48 @@ fn beat_timeout(interval_ms: u64) -> Duration {
     Duration::from_millis(interval_ms.clamp(50, 30_000) * 3 / 4)
 }
 
-async fn post(http: &HttpClient, endpoint: &str, beat: &Beat, budget: Duration) -> Option<BeatAck> {
-    let body = Full::new(Bytes::from(serde_json::to_vec(beat).ok()?));
+async fn post(
+    http: &HttpClient,
+    endpoint: &str,
+    beat: &Beat,
+    budget: Duration,
+) -> Result<BeatAck, String> {
+    let body = Full::new(Bytes::from(
+        serde_json::to_vec(beat).map_err(|e| format!("cannot encode the beat: {e}"))?,
+    ));
     let req = hyper::Request::builder()
         .method("POST")
         .uri(format!("{endpoint}/v1/beat"))
         .header("content-type", "application/json")
         .body(body)
-        .ok()?;
-    let resp = tokio::time::timeout(budget, http.request(req)).await.ok()?.ok()?;
+        .map_err(|e| format!("cannot build the request: {e}"))?;
+    let resp = tokio::time::timeout(budget, http.request(req))
+        .await
+        .map_err(|_| format!("no reply within {}ms", budget.as_millis()))?
+        .map_err(|e| {
+            // Only once the socket is up is h2c a plausible culprit. Saying it
+            // on a refused connection or a name that will not resolve sends
+            // the reader hunting for a proxy that is not the problem.
+            if e.is_connect() {
+                format!("cannot reach it: {e}")
+            } else {
+                format!(
+                    "{e}; the connection came up but the exchange did not -- \
+                     this client speaks h2c only, so whatever answered has to too"
+                )
+            }
+        })?;
     if !resp.status().is_success() {
         // A 4xx is our fault and retrying will not fix it, but it is still not
         // an answer, so it counts as a failed beat rather than a hang.
-        return None;
+        return Err(format!("the registry answered HTTP {}", resp.status().as_u16()));
     }
     let bytes = tokio::time::timeout(budget, resp.into_body().collect())
         .await
-        .ok()?
-        .ok()?
+        .map_err(|_| format!("reply body stalled past {}ms", budget.as_millis()))?
+        .map_err(|e| format!("reply body broke off: {e}"))?
         .to_bytes();
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice(&bytes).map_err(|e| format!("the reply is not a BeatAck: {e}"))
 }
 
 pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
@@ -209,7 +235,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             let beat = shared.compose();
             let interval = shared.interval_ms.load(Ordering::Relaxed);
             match post(&http, &shared.endpoint, &beat, beat_timeout(interval)).await {
-                Some(ack) => {
+                Ok(ack) => {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                     let alive = shared.apply(&ack, &beat.watch);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
@@ -223,8 +249,9 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 // Losing the registry is survivable: lookups keep working from
                 // cache, and the roster regrows within one interval when it
                 // comes back. Nothing here needs to escalate.
-                None => {
+                Err(why) => {
                     shared.beats_failed.fetch_add(1, Ordering::Relaxed);
+                    *shared.last_error.lock().unwrap() = why;
                 }
             }
             let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
@@ -249,14 +276,18 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
         // join() and leave() are one-shot and a caller is waiting, so they get
         // a fixed budget rather than the loop's.
         match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
-            Some(ack) => {
+            Ok(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.apply(&ack, &beat.watch);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
                 s.mark_ok();
                 true
             }
-            None => false,
+            Err(why) => {
+                s.beats_failed.fetch_add(1, Ordering::Relaxed);
+                *s.last_error.lock().unwrap() = why;
+                false
+            }
         }
     })
 }

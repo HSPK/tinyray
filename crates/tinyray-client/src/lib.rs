@@ -68,6 +68,7 @@ impl Client {
             accepted: AtomicBool::new(true),
             beats_ok: AtomicU64::new(0),
             beats_failed: AtomicU64::new(0),
+            last_error: Mutex::new(String::new()),
             interval_ms: AtomicU64::new(1000),
             last_ok_ms: AtomicU64::new(0),
             seen_epoch: AtomicU64::new(0),
@@ -157,6 +158,11 @@ impl Client {
     #[getter]
     fn accepted(&self) -> bool {
         self.shared.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Why the last beat failed, or an empty string if none has.
+    fn last_error(&self) -> String {
+        self.shared.last_error.lock().unwrap().clone()
     }
 
     fn stats(&self) -> HashMap<String, u64> {
