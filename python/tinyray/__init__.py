@@ -307,14 +307,24 @@ class Member:
         self.incarnation = incarnation
         self._state: dict[str, Any] = {}
         self._left = False
+        self._pid = os.getpid()
+
+    def _mine(self) -> None:
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                "this Member belongs to another process; fork() left its "
+                "heartbeat behind. Call tinyray.join(...) again in the child."
+            )
 
     def ready(self, **state: Any) -> Member:
         """Hang out a sign. Sends nothing now; the next heartbeat carries it."""
+        self._mine()
         self._state.update(state)
         self._c.set_state(json.dumps(self._state), True)
         return self
 
     def unready(self) -> Member:
+        self._mine()
         self._c.set_state(json.dumps(self._state), False)
         return self
 
@@ -338,9 +348,11 @@ class Member:
         return self._c.silence_ms
 
     def stats(self) -> dict[str, int]:
+        self._mine()
         return self._c.stats()
 
     def leave(self) -> None:
+        self._mine()
         if not self._left:
             self._left = True
             global _client, _left
@@ -367,6 +379,20 @@ class Member:
 
 _client: _Client | None = None
 _left = False
+_owner_pid = os.getpid()
+
+
+def _after_fork() -> None:
+    """fork() keeps only the calling thread, so the child inherits a client
+    whose heartbeat is gone: it looks registered, answers from a frozen cache,
+    and the registry never hears from it again. Make that explicit instead."""
+    global _client, _left
+    _client = None
+    _left = False
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork)
 
 
 def join(
@@ -380,7 +406,7 @@ def join(
     exclusive: bool = False,
 ) -> Member:
     """Report in. One line per process."""
-    global _client, _left
+    global _client, _left, _owner_pid
     _left = False
     if _client is not None:
         raise RuntimeError(
@@ -444,6 +470,7 @@ def join(
             server.close()
         raise SeatTaken(f"seat {slot} of {pool!r} is already held")
     _client = c
+    _owner_pid = os.getpid()
     member = Member(c, pool, slot, incarnation, server)
     # A process that exits normally should say goodbye, so the seat frees up
     # immediately instead of waiting out the lease. SIGKILL still falls back
@@ -461,6 +488,11 @@ class AsyncPool(Pool):
 
 def _require_client() -> _Client:
     if _client is not None:
+        if os.getpid() != _owner_pid:
+            raise RuntimeError(
+                "this client belongs to another process; fork() left its "
+                "heartbeat behind. Call tinyray.join(...) again in the child."
+            )
         return _client
     # Never joined and already left look the same from here, and they need
     # opposite reactions, so say which one it is.

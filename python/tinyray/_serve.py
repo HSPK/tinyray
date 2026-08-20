@@ -81,6 +81,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, body: dict) -> None:
         raw = json.dumps(body).encode()
+        if len(raw) > MAX_BODY and "result" in body:
+            # The budget was only enforced on the way in, which is the wrong
+            # half: a reply is where "while I am here, take this too" creeps in.
+            # Same 413 as an oversized request -- to the caller it is one rule.
+            code = 413
+            raw = json.dumps(
+                {
+                    "error": f"reply is {len(raw)} bytes, over the {MAX_BODY} "
+                    f"limit; return a reference and let the caller fetch it"
+                }
+            ).encode()
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
