@@ -17,9 +17,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_candidate(argv: list[str]) -> None:
@@ -35,8 +34,7 @@ def run_candidate(argv: list[str]) -> None:
             # exclusive=: take seat 0 only if it is free. Without it seats are
             # last-writer-wins, which is what a restarting rank needs and the
             # opposite of what an election needs.
-            me = tinyray.join("controller", "stateful", slot=0, serves=Controller(),
-                              exclusive=True)
+            me = tinyray.join("controller", "stateful", slot=0, serves=Controller(), exclusive=True)
         except tinyray.SeatTaken:
             time.sleep(0.1)
             if time.monotonic() - started > 20:
@@ -54,8 +52,7 @@ def run_candidate(argv: list[str]) -> None:
                 print(f"[{name}] dying while leader", flush=True)
                 os._exit(0)  # no farewell: only the lease can notice
             time.sleep(0.05)
-        print(f"[{name}] {'lost the seat' if not me.accepted else 'stepping down'}",
-              flush=True)
+        print(f"[{name}] {'lost the seat' if not me.accepted else 'stepping down'}", flush=True)
         me.leave()
         return
 

@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import time
 
-import pytest
-
 import tinyray
 
 
@@ -53,9 +51,11 @@ def test_priming_a_pool_keeps_the_first_async_lookup_off_the_loop(registry):
                 lambda: [tinyray.apool(f"warm{i}").all() for i in range(4)]
             )
 
-            assert cold_gap > 0.05, f"没预热却只停顿了 {cold_gap*1000:.0f}ms，这个测试失去了判别力"
+            assert cold_gap > 0.05, (
+                f"没预热却只停顿了 {cold_gap * 1000:.0f}ms，这个测试失去了判别力"
+            )
             assert warm_gap < cold_gap / 3, (
-                f"预热后仍停顿 {warm_gap*1000:.0f}ms，对比没预热的 {cold_gap*1000:.0f}ms"
+                f"预热后仍停顿 {warm_gap * 1000:.0f}ms，对比没预热的 {cold_gap * 1000:.0f}ms"
             )
             assert warm_spent < cold_spent / 3
 

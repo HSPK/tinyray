@@ -14,9 +14,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_service(_: list[str]) -> None:
@@ -56,8 +55,13 @@ def run_client(_: list[str]) -> None:
         # 2. It never arrived. Safe to retry if the operation can be repeated.
         gone = tinyray.Handle(
             "svc",
-            {"id": 0, "slot": 0, "incarnation": svc.incarnation, "url": "http://127.0.0.1:1",
-             "ready": True},
+            {
+                "id": 0,
+                "slot": 0,
+                "incarnation": svc.incarnation,
+                "url": "http://127.0.0.1:1",
+                "ready": True,
+            },
             ("ok",),
         )
         try:
@@ -68,8 +72,7 @@ def run_client(_: list[str]) -> None:
         # 3. It arrived, but a later tenure owns that seat. Look it up again.
         stale = tinyray.Handle(
             "svc",
-            {"id": 0, "slot": 0, "incarnation": svc.incarnation - 1, "url": svc.url,
-             "ready": True},
+            {"id": 0, "slot": 0, "incarnation": svc.incarnation - 1, "url": svc.url, "ready": True},
             ("ok",),
         )
         try:
@@ -93,8 +96,14 @@ def run_client(_: list[str]) -> None:
         except TypeError as exc:
             results["TypeError"] = str(exc)[:48]
 
-        for kind in ("RemoteError", "Unreachable", "Fenced", "timeout",
-                     "AttributeError", "TypeError"):
+        for kind in (
+            "RemoteError",
+            "Unreachable",
+            "Fenced",
+            "timeout",
+            "AttributeError",
+            "TypeError",
+        ):
             print(f"[client] {kind:<15} {results[kind]}", flush=True)
 
         print("[client] retry policy:", flush=True)

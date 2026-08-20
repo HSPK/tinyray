@@ -1,6 +1,12 @@
 //! Python bindings. Everything crossing this boundary is JSON, which keeps the
 //! FFI surface tiny; the members Python actually looks at are small.
 
+// The pyo3 macros generate an error conversion that clippy attributes to our
+// return types. Item-level allows do not reach macro-expanded code, so this
+// has to sit on the crate. The only `.into()` calls we write ourselves are the
+// String keys in stats(), which this cannot hide.
+#![allow(clippy::useless_conversion)]
+
 mod beat;
 
 use beat::{beat_once, spawn, CachedPool, Shared};
@@ -76,7 +82,10 @@ impl Client {
             started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
         });
-        Ok(Self { shared, rt: Mutex::new(None) })
+        Ok(Self {
+            shared,
+            rt: Mutex::new(None),
+        })
     }
 
     /// Blocks for one beat so the caller is registered on return, then hands
@@ -107,8 +116,8 @@ impl Client {
     }
 
     fn set_state(&self, state_json: &str, ready: bool) -> PyResult<()> {
-        let v: serde_json::Value = serde_json::from_str(state_json)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(state_json).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         *self.shared.state.lock().unwrap() = v;
         self.shared.ready.store(ready, Ordering::Relaxed);
         self.shared.wake.notify_one();
@@ -136,7 +145,9 @@ impl Client {
     /// Version and roster fingerprint of a cached pool, or None if unseen.
     fn pool_info(&self, pool: &str) -> Option<(u64, u64, Option<u64>, Vec<String>)> {
         let cache = self.shared.cache.read().unwrap();
-        cache.get(pool).map(|c| (c.version, c.roster, c.size, c.methods.clone()))
+        cache
+            .get(pool)
+            .map(|c| (c.version, c.roster, c.size, c.methods.clone()))
     }
 
     fn leave(&self, py: Python<'_>) {
@@ -173,9 +184,18 @@ impl Client {
 
     fn stats(&self) -> HashMap<String, u64> {
         HashMap::from([
-            ("beats_ok".into(), self.shared.beats_ok.load(Ordering::Relaxed)),
-            ("beats_failed".into(), self.shared.beats_failed.load(Ordering::Relaxed)),
-            ("interval_ms".into(), self.shared.interval_ms.load(Ordering::Relaxed)),
+            (
+                "beats_ok".into(),
+                self.shared.beats_ok.load(Ordering::Relaxed),
+            ),
+            (
+                "beats_failed".into(),
+                self.shared.beats_failed.load(Ordering::Relaxed),
+            ),
+            (
+                "interval_ms".into(),
+                self.shared.interval_ms.load(Ordering::Relaxed),
+            ),
             ("silence_ms".into(), self.shared.silence_ms()),
         ])
     }
@@ -193,6 +213,9 @@ fn serve_registry(py: Python<'_>, listen: &str, ttl_ms: u64) -> PyResult<()> {
 
 #[pymodule]
 fn _tinyray(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Lets a wheel say which core it was built against, so a stale extension
+    // beside fresh Python code is visible instead of merely strange.
+    m.add("version", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Client>()?;
     m.add_function(wrap_pyfunction!(serve_registry, m)?)?;
     Ok(())

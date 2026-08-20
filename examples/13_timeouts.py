@@ -16,9 +16,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_service(_: list[str]) -> None:
@@ -45,15 +44,20 @@ def run_client(_: list[str]) -> None:
         me.ready()
         svc = tinyray.pool("svc").wait(count=1, timeout=20)[0]
 
-        print(f"[client] default budget is {tinyray._rpc.DEFAULT_TIMEOUT}s "
-              f"(the measured control-plane band is 2-30s)", flush=True)
+        print(
+            f"[client] default budget is {tinyray._rpc.DEFAULT_TIMEOUT}s "
+            f"(the measured control-plane band is 2-30s)",
+            flush=True,
+        )
 
         t0 = time.monotonic()
         try:
             svc.takes.timeout(0.2)(2.0)
         except tinyray.Unreachable:
-            print(f"[client] a 0.2s budget gave up after "
-                  f"{(time.monotonic() - t0) * 1000:.0f} ms", flush=True)
+            print(
+                f"[client] a 0.2s budget gave up after {(time.monotonic() - t0) * 1000:.0f} ms",
+                flush=True,
+            )
 
         # The modifier is per call, not sticky: the next one is back to default.
         assert svc.takes(0.05) == "slept 0.05"

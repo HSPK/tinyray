@@ -1,11 +1,11 @@
 """fork() 和响应体积：两个静默失败，都不会自己喊疼。"""
+
 import os
 import subprocess
 import sys
 import textwrap
 
 import pytest
-
 import tinyray
 
 

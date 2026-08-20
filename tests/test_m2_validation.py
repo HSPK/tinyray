@@ -11,7 +11,6 @@ import sys
 import textwrap
 
 import pytest
-
 import tinyray
 
 SERVER = textwrap.dedent(

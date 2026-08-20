@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::sync::Notify;
 use tinyray_proto::{Beat, BeatAck, Member};
+use tokio::sync::Notify;
 
 #[derive(Default)]
 pub struct CachedPool {
@@ -69,7 +69,8 @@ pub struct Shared {
 
 impl Shared {
     pub fn mark_ok(&self) {
-        self.last_ok_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last_ok_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Milliseconds since the last successful beat.
@@ -201,7 +202,10 @@ async fn post(
     if !resp.status().is_success() {
         // A 4xx is our fault and retrying will not fix it, but it is still not
         // an answer, so it counts as a failed beat rather than a hang.
-        return Err(format!("the registry answered HTTP {}", resp.status().as_u16()));
+        return Err(format!(
+            "the registry answered HTTP {}",
+            resp.status().as_u16()
+        ));
     }
     let bytes = tokio::time::timeout(budget, resp.into_body().collect())
         .await
@@ -273,11 +277,10 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
 pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
     let s = shared.clone();
     rt.block_on(async move {
-        let http: HttpClient =
-            Client::builder(TokioExecutor::new())
-                .timer(TokioTimer::new())
-                .http2_only(true)
-                .build_http();
+        let http: HttpClient = Client::builder(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .http2_only(true)
+            .build_http();
         let beat = s.compose();
         // join() and leave() are one-shot and a caller is waiting, so they get
         // a fixed budget rather than the loop's.

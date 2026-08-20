@@ -119,6 +119,11 @@ class BoundMethod:
 class AsyncHandleMixin:
     """Same handle, awaitable methods."""
 
+    # Declared because __getattr__ below answers for every other name, which
+    # otherwise makes these look like BoundMethods too.
+    _methods: tuple[str, ...]
+    identity: str
+
     def __getattr__(self, name: str) -> BoundMethod:
         if name.startswith("_") or name not in self._methods:
             raise AttributeError(

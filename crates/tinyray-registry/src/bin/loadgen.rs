@@ -63,7 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // pool is watched by few: everyone watching everyone is O(N^2).
             // Only a few members watch: a big pool watched by everyone is
             // O(N^2) traffic, which is a design constraint, not a setting.
-            let watch = if i < watchers { vec!["load".to_string()] } else { vec![] };
+            let watch = if i < watchers {
+                vec!["load".to_string()]
+            } else {
+                vec![]
+            };
             let mut seen: HashMap<String, u64> = HashMap::new();
             let mut last_count = 0usize;
             while Instant::now() < deadline {
@@ -102,7 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
                             continue;
                         };
-                        let Ok(ack) = serde_json::from_slice::<BeatAck>(&collected.to_bytes()) else {
+                        let Ok(ack) = serde_json::from_slice::<BeatAck>(&collected.to_bytes())
+                        else {
                             failed.fetch_add(1, Ordering::Relaxed);
                             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
                             continue;
@@ -139,7 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lat = lat_us.lock().unwrap().clone();
     lat.sort_unstable();
     let q = |p: f64| -> u64 {
-        if lat.is_empty() { 0 } else { lat[((lat.len() as f64 - 1.0) * p) as usize] }
+        if lat.is_empty() {
+            0
+        } else {
+            lat[((lat.len() as f64 - 1.0) * p) as usize]
+        }
     };
     println!(
         "{{\"members\":{},\"watcher_saw\":{},\"beats_ok\":{},\"beats_failed\":{},\"ops_per_s\":{:.0},\"p50_us\":{},\"p99_us\":{},\"max_us\":{}}}",

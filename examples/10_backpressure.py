@@ -14,9 +14,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 CAPACITY = 8
 PRODUCERS = 3
@@ -46,8 +45,12 @@ def run_queue(_: list[str]) -> None:
             return self.items.pop(0) if self.items else None
 
         def stats(self) -> dict:
-            return {"accepted": self.accepted, "refused": self.refused,
-                    "depth": len(self.items), "done": self.done}
+            return {
+                "accepted": self.accepted,
+                "refused": self.refused,
+                "depth": len(self.items),
+                "done": self.done,
+            }
 
     svc = Queue()
     with tinyray.join("queue", "stateful", slot=0, serves=svc) as me:
@@ -62,8 +65,11 @@ def run_queue(_: list[str]) -> None:
             time.sleep(0.004)  # the consumer is slower than the producers
             svc.done += 1
         s = svc.stats()
-        print(f"[queue] accepted={s['accepted']} refused={s['refused']} "
-              f"consumed={svc.done} final_depth={s['depth']}", flush=True)
+        print(
+            f"[queue] accepted={s['accepted']} refused={s['refused']} "
+            f"consumed={svc.done} final_depth={s['depth']}",
+            flush=True,
+        )
         assert s["refused"] > 0, "the producers never outran the consumer"
         assert s["depth"] <= CAPACITY, "the bound did not hold"
         me.ready(finished=True)

@@ -26,7 +26,9 @@ pub fn run(listen: &str, ttl_ms: u64, on_ready: impl FnOnce(String)) -> std::io:
             ),
         ));
     }
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         let reg = Arc::new(state::Registry::new(Duration::from_millis(ttl_ms)));
 

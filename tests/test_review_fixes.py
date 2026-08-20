@@ -6,14 +6,13 @@ import asyncio
 import json
 import socket
 import subprocess
-import threading
 import sys
 import textwrap
+import threading
 import time
 import urllib.request
 
 import pytest
-
 import tinyray
 
 
@@ -124,7 +123,9 @@ def test_tenure_differs_for_two_processes_in_the_same_millisecond():
         print(len(vals))
         """
     )
-    bare_unique = int(subprocess.run([sys.executable, "-c", bare], capture_output=True, text=True).stdout)
+    bare_unique = int(
+        subprocess.run([sys.executable, "-c", bare], capture_output=True, text=True).stdout
+    )
     assert bare_unique < unique / 10, "the timestamp alone was suspiciously unique"
 
 
@@ -201,10 +202,11 @@ def test_a_watchdog_thread_survives_shutdown(registry):
         ep = tinyray.pool("trainer").epoch(timeout=10)
         stop = threading.Event()
 
-        def watchdog() -> None:
+        def watchdog(stop: threading.Event = stop, ep: tinyray.Epoch = ep) -> None:
+            # 绑成默认参数：闭包捕获循环变量，下一轮会把它们换掉。
             while not stop.is_set():
                 try:
-                    ep.valid
+                    _ = ep.valid  # 读它就是在查注册中心，这正是要压的那条路
                 except BaseException as exc:  # noqa: BLE001 - any failure counts
                     errors.append(repr(exc))
                     return

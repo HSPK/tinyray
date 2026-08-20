@@ -41,7 +41,9 @@ class _Wire:
         )
         body.update(kw)
         j = self.cli.post(
-            self.url, content=json.dumps(body).encode(), headers={"content-type": "application/json"}
+            self.url,
+            content=json.dumps(body).encode(),
+            headers={"content-type": "application/json"},
         ).json()
         d = j.get("pools", {}).get("t")
         if d:

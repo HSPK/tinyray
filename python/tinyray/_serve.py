@@ -12,8 +12,9 @@ import json
 import threading
 import traceback
 import typing
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any
 
 import msgspec
 
@@ -73,13 +74,27 @@ def _coerce(fn: Callable[..., Any], payload: Any) -> tuple[list, dict]:
     return args, kwargs
 
 
+class _Server(ThreadingHTTPServer):
+    """Carries what the handler needs. Declared rather than attached on the
+    fly, so a rename is a type error instead of an AttributeError at request
+    time."""
+
+    daemon_threads = True
+    dispatch: dict[str, Callable[..., Any]]
+    identity: str
+    still_ours: Callable[[], bool]
+    loop: asyncio.AbstractEventLoop | None
+
+
 class _Handler(BaseHTTPRequestHandler):
+    server: _Server
     protocol_version = "HTTP/1.1"  # keep-alive; without it every call burns a socket
     server_version = "tinyray/0.1"
     # The status line, the headers and the body are three separate writes.
     # With Nagle on, the last one waits for the peer's delayed ACK and every
     # call costs an extra 40ms.
     disable_nagle_algorithm = True
+    _headers_buffer: list[bytes]
 
     def log_message(self, *args: Any) -> None:  # keep the test output readable
         pass
@@ -123,7 +138,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/_methods":
-            self._send(200, {"methods": sorted(self.server.dispatch), "identity": self.server.identity})
+            self._send(
+                200, {"methods": sorted(self.server.dispatch), "identity": self.server.identity}
+            )
         else:
             self._send(404, {})
 
@@ -193,7 +210,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             result = fn(*args, **kwargs)
-            if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
                 loop = self.server.loop
                 if loop is None:
                     result = asyncio.run(result)
@@ -227,12 +244,11 @@ class MethodServer:
             loop = None
         # Port 0: the kernel picks, and the actual one goes into the record.
         # One less configuration knob, and no port collisions.
-        self._srv = ThreadingHTTPServer((host, 0), _Handler)
+        self._srv = _Server((host, 0), _Handler)
         self._srv.dispatch = self.dispatch
         self._srv.identity = identity
         self._srv.still_ours = lambda: self.still_ours()
         self._srv.loop = loop
-        self._srv.daemon_threads = True
         self.port = self._srv.server_address[1]
         self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
         self._thread.start()

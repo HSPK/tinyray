@@ -11,8 +11,8 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Sequence
 
 TINYRAY = Path(sys.executable).parent / "tinyray"
 

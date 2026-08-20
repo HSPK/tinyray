@@ -14,7 +14,6 @@ import threading
 import time
 
 import pytest
-
 import tinyray
 
 SERVER = textwrap.dedent(

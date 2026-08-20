@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 import textwrap
@@ -11,7 +10,6 @@ import threading
 import time
 
 import pytest
-
 import tinyray
 from conftest import BIN, free_port
 

@@ -10,7 +10,6 @@ import time
 import urllib.request
 
 import pytest
-
 import tinyray
 
 SERVER = textwrap.dedent(

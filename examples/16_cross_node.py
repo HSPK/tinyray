@@ -17,9 +17,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_worker(argv: list[str]) -> None:
@@ -50,8 +49,10 @@ def run_client(_: list[str]) -> None:
 
         # What the default resolves to, and why.
         auto = tinyray._advertise()
-        print(f"[client] with no TINYRAY_ADVERTISE the address comes from the "
-              f"routing table: {auto}", flush=True)
+        print(
+            f"[client] with no TINYRAY_ADVERTISE the address comes from the routing table: {auto}",
+            flush=True,
+        )
         with socket.socket() as s:
             s.bind((auto, 0))  # it really is one of ours
         print("[client] and it is genuinely a local address", flush=True)
@@ -60,8 +61,7 @@ def run_client(_: list[str]) -> None:
         os.environ["TINYRAY_ADVERTISE"] = "10.0.0.42"
         assert tinyray._advertise() == "10.0.0.42"
         del os.environ["TINYRAY_ADVERTISE"]
-        print("[client] TINYRAY_ADVERTISE overrides it for NAT or containers",
-              flush=True)
+        print("[client] TINYRAY_ADVERTISE overrides it for NAT or containers", flush=True)
 
 
 def driver() -> int:

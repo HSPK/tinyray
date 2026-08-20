@@ -15,9 +15,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 SHARDS = 4
 KEYS = 200
@@ -73,7 +72,9 @@ def run_client(_: list[str]) -> None:
             key = f"key-{i}"
             kv.slot(shard_of(key)).put(key=key, value=f"v{i}")
         # Reads land on the same seat, so every key comes back.
-        misses = sum(1 for i in range(KEYS) if kv.slot(shard_of(f"key-{i}")).get(key=f"key-{i}") is None)
+        misses = sum(
+            1 for i in range(KEYS) if kv.slot(shard_of(f"key-{i}")).get(key=f"key-{i}") is None
+        )
         print(f"[client] wrote {KEYS} keys, {misses} unreadable", flush=True)
         assert misses == 0
 

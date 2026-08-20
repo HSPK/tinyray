@@ -10,11 +10,12 @@ import time
 
 import httpx
 import pytest
-
 import tinyray
 
+
 # 直接构造任期号：毫秒左移 20 位，低位是打平用的随机数
-INC = lambda ms: (ms << 20) | 1
+def INC(ms: int) -> int:
+    return (ms << 20) | 1
 
 
 def _beat(registry, **kw):

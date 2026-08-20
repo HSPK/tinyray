@@ -23,9 +23,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 HOLD_SECONDS = 6.0
 BUSY_THREADS = 16
@@ -77,8 +76,11 @@ def run_trainer(_: list[str]) -> None:
         beats_before = me.stats()["beats_ok"]
         gaps.clear()
 
-        print(f"[trainer] lease {lease_ms} ms; hogging the GIL for {HOLD_SECONDS}s "
-              f"with {BUSY_THREADS} busy threads and one long C call", flush=True)
+        print(
+            f"[trainer] lease {lease_ms} ms; hogging the GIL for {HOLD_SECONDS}s "
+            f"with {BUSY_THREADS} busy threads and one long C call",
+            flush=True,
+        )
         hogs = hog_the_gil(stop)
         time.sleep(HOLD_SECONDS)
         stop.set()
@@ -91,11 +93,11 @@ def run_trainer(_: list[str]) -> None:
 
         print(f"[trainer] native beats sent     : {native} of about {expected:.0f}", flush=True)
         print(f"[trainer] failed beats          : {me.stats()['beats_failed']}", flush=True)
-        print(f"[trainer] worst python tick gap : {worst_python:.0f} ms (asked for 250)",
-              flush=True)
+        print(
+            f"[trainer] worst python tick gap : {worst_python:.0f} ms (asked for 250)", flush=True
+        )
         print(f"[trainer] still holds its seat  : {me.accepted}", flush=True)
-        print(f"[trainer] still in the roster   : {len(tinyray.pool('trainer').all())}",
-              flush=True)
+        print(f"[trainer] still in the roster   : {len(tinyray.pool('trainer').all())}", flush=True)
 
         assert native >= expected * 0.5, "the native heartbeat stalled behind the GIL"
         assert me.stats()["beats_failed"] == 0
@@ -105,8 +107,11 @@ def run_trainer(_: list[str]) -> None:
             f"the python thread never slipped past the {lease_ms} ms lease, so this "
             f"machine did not reproduce the hazard"
         )
-        print(f"[trainer] a python heartbeat slipped {worst_python:.0f} ms > {lease_ms} ms "
-              f"lease and would have been declared dead", flush=True)
+        print(
+            f"[trainer] a python heartbeat slipped {worst_python:.0f} ms > {lease_ms} ms "
+            f"lease and would have been declared dead",
+            flush=True,
+        )
 
 
 def driver() -> int:

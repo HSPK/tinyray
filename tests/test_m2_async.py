@@ -9,7 +9,6 @@ import sys
 import textwrap
 
 import pytest
-
 import tinyray
 
 ASYNC_SERVER = textwrap.dedent(
@@ -101,7 +100,13 @@ def test_async_timeout_is_bounded(async_peer):
         h = tinyray.apool("acollector").slot(0)
         bad = tinyray.AsyncHandle(
             "acollector",
-            {"id": 0, "slot": 0, "incarnation": h.incarnation, "url": "http://127.0.0.1:1", "ready": True},
+            {
+                "id": 0,
+                "slot": 0,
+                "incarnation": h.incarnation,
+                "url": "http://127.0.0.1:1",
+                "ready": True,
+            },
             ("assign",),
         )
         with pytest.raises(tinyray.Unreachable):

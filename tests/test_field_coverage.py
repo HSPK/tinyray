@@ -6,11 +6,9 @@ import json
 import subprocess
 import sys
 import textwrap
-import time
 import urllib.request
 
 import pytest
-
 import tinyray
 
 
@@ -86,8 +84,9 @@ def test_leaving_frees_the_record_at_once(registry):
 
 def test_exclusive_refuses_an_occupied_seat(registry):
     beat(registry.endpoint, pool="x", id=0, slot=0, policy="stateful", incarnation=10)
-    taken = beat(registry.endpoint, pool="x", id=0, slot=0, policy="stateful",
-                 incarnation=11, exclusive=True)
+    taken = beat(
+        registry.endpoint, pool="x", id=0, slot=0, policy="stateful", incarnation=11, exclusive=True
+    )
     assert taken["accepted"] is False
 
 
@@ -111,13 +110,13 @@ def test_seen_turns_a_snapshot_into_a_delta(registry):
     first = beat(registry.endpoint, pool="d", id=2, watch=["d"])["pools"]["d"]
     assert first["full"] is True and len(first["changed"]) == 2
 
-    caught_up = beat(registry.endpoint, pool="d", id=2, watch=["d"],
-                     seen={"d": first["version"]})
+    caught_up = beat(registry.endpoint, pool="d", id=2, watch=["d"], seen={"d": first["version"]})
     assert "d" not in caught_up["pools"], "nothing changed, so nothing should be sent"
 
     beat(registry.endpoint, pool="d", id=3)
-    delta = beat(registry.endpoint, pool="d", id=2, watch=["d"],
-                 seen={"d": first["version"]})["pools"]["d"]
+    delta = beat(registry.endpoint, pool="d", id=2, watch=["d"], seen={"d": first["version"]})[
+        "pools"
+    ]["d"]
     assert delta["full"] is False
     assert [x["id"] for x in delta["changed"]] == [3]
 
@@ -138,8 +137,9 @@ def test_removed_carries_departures(registry):
     beat(registry.endpoint, pool="r", id=1)
     first = beat(registry.endpoint, pool="r", id=2, watch=["r"])["pools"]["r"]
     beat(registry.endpoint, pool="r", id=1, leaving=True)
-    delta = beat(registry.endpoint, pool="r", id=2, watch=["r"],
-                 seen={"r": first["version"]})["pools"]["r"]
+    delta = beat(registry.endpoint, pool="r", id=2, watch=["r"], seen={"r": first["version"]})[
+        "pools"
+    ]["r"]
     assert delta["removed"] == [1]
 
 
@@ -147,14 +147,12 @@ def test_version_and_roster_answer_different_questions(registry):
     beat(registry.endpoint, pool="n", id=1, state={"step": 1})
     a = beat(registry.endpoint, pool="n", id=2, watch=["n"])["pools"]["n"]
     beat(registry.endpoint, pool="n", id=1, state={"step": 2})  # same person, new state
-    b = beat(registry.endpoint, pool="n", id=2, watch=["n"],
-             seen={"n": a["version"]})["pools"]["n"]
+    b = beat(registry.endpoint, pool="n", id=2, watch=["n"], seen={"n": a["version"]})["pools"]["n"]
     assert b["version"] > a["version"], "peers must learn about the new state"
     assert b["roster"] == a["roster"], "the same people are still here"
 
     beat(registry.endpoint, pool="n", id=3)  # a new person
-    c = beat(registry.endpoint, pool="n", id=2, watch=["n"],
-             seen={"n": b["version"]})["pools"]["n"]
+    c = beat(registry.endpoint, pool="n", id=2, watch=["n"], seen={"n": b["version"]})["pools"]["n"]
     assert c["roster"] != b["roster"]
 
 
@@ -167,16 +165,18 @@ def test_full_says_to_drop_what_you_had(registry):
 
     # Still inside the log: a delta is enough.
     beat(registry.endpoint, pool="F", id=3)
-    near = beat(registry.endpoint, pool="F", id=2, watch=["F"],
-                seen={"F": fresh["version"]})["pools"]["F"]
+    near = beat(registry.endpoint, pool="F", id=2, watch=["F"], seen={"F": fresh["version"]})[
+        "pools"
+    ]["F"]
     assert near["full"] is False
 
     # Past the end of it: the registry gives up on catching us up piecemeal.
     # LOG_CAP is 4096 entries, and each state change is one entry.
     for i in range(4200):
         beat(registry.endpoint, pool="F", id=1, state={"i": i})
-    far = beat(registry.endpoint, pool="F", id=2, watch=["F"],
-               seen={"F": fresh["version"]})["pools"]["F"]
+    far = beat(registry.endpoint, pool="F", id=2, watch=["F"], seen={"F": fresh["version"]})[
+        "pools"
+    ]["F"]
     assert far["full"] is True
     assert len(far["changed"]) == 3
 

@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, free_port, role_main  # noqa: E402
+from _harness import free_port, role_main  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 LOADGEN = ROOT / "target" / "release" / "loadgen"
@@ -45,11 +45,25 @@ def measure(members: int, watchers: int, seconds: int = 8) -> tuple[float, int]:
     procs, per = 4, max(members // 4, 1)
     load = [
         subprocess.Popen(
-            [str(LOADGEN), "--endpoint", f"127.0.0.1:{port}", "--members", str(per),
-             "--seconds", str(seconds), "--interval-ms", "5000",
-             "--watchers", str(max(watchers // procs, 0)), "--conns", "8",
-             "--offset", str(i * 300_000)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            [
+                str(LOADGEN),
+                "--endpoint",
+                f"127.0.0.1:{port}",
+                "--members",
+                str(per),
+                "--seconds",
+                str(seconds),
+                "--interval-ms",
+                "5000",
+                "--watchers",
+                str(max(watchers // procs, 0)),
+                "--conns",
+                "8",
+                "--offset",
+                str(i * 300_000),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         for i in range(procs)
     ]
@@ -76,23 +90,27 @@ def driver() -> int:
         mb, seen = measure(members, watchers)
         per = mb * 1024 * 1024 / max(seen, 1)
         results.append((members, watchers, mb, per))
-        print(f"{seen:>9} {watchers:>9} {seen * max(watchers, 1):>10} "
-              f"{mb:>12.0f} {per:>10.0f}", flush=True)
+        print(
+            f"{seen:>9} {watchers:>9} {seen * max(watchers, 1):>10} {mb:>12.0f} {per:>10.0f}",
+            flush=True,
+        )
 
     unwatched = [r for r in results if r[1] == 0]
     watched = [r for r in results if r[1] > 0]
     print(flush=True)
-    print(f"storage alone is about {sum(r[3] for r in unwatched) / len(unwatched):.0f} "
-          f"bytes a member", flush=True)
-    print(f"with four subscribers it is about "
-          f"{sum(r[3] for r in watched) / len(watched):.0f}", flush=True)
-    print("the difference is the full roster each new subscriber is sent once",
-          flush=True)
+    print(
+        f"storage alone is about {sum(r[3] for r in unwatched) / len(unwatched):.0f} "
+        f"bytes a member",
+        flush=True,
+    )
+    print(
+        f"with four subscribers it is about {sum(r[3] for r in watched) / len(watched):.0f}",
+        flush=True,
+    )
+    print("the difference is the full roster each new subscriber is sent once", flush=True)
     print(flush=True)
-    print("rule of thumb: members x subscribers past ~100,000 deserves a look,",
-          flush=True)
-    print("and the fix is usually to reverse who subscribes rather than add memory.",
-          flush=True)
+    print("rule of thumb: members x subscribers past ~100,000 deserves a look,", flush=True)
+    print("and the fix is usually to reverse who subscribes rather than add memory.", flush=True)
     assert watched[-1][3] > unwatched[-1][3], "subscribers should cost something"
     return 0
 

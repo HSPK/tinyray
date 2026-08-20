@@ -271,7 +271,7 @@ def main() -> int:
     ]
     t0 = time.monotonic()
     rc = 0
-    for p, args in zip(procs, plan):
+    for p, args in zip(procs, plan, strict=True):
         code = p.wait(timeout=120)
         # The deliberately killed agent is expected to exit non-zero.
         if code != 0 and not (args[0] == "agent" and args[3] != "0"):

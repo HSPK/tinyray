@@ -36,9 +36,15 @@ def main() -> int:
 
     port = free_port()
     reg = subprocess.Popen(
-        [str(Path(sys.executable).parent / "tinyray"), "--listen", f"127.0.0.1:{port}",
-         "--ttl-ms", "2000"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [
+            str(Path(sys.executable).parent / "tinyray"),
+            "--listen",
+            f"127.0.0.1:{port}",
+            "--ttl-ms",
+            "2000",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     env = dict(os.environ, TINYRAY_REGISTRY=f"127.0.0.1:{port}")
     time.sleep(0.8)

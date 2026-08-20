@@ -15,9 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 @dataclass
@@ -38,8 +37,12 @@ def run_judge(_: list[str]) -> None:
     class Judge:
         def score(self, task: Task, strict: bool = False) -> dict:
             reward = task.weight * (0.5 if strict else 1.0)
-            return {"task_id": task.task_id, "reward": reward,
-                    "accepted": reward > 0.3, "tags": task.tags}
+            return {
+                "task_id": task.task_id,
+                "reward": reward,
+                "accepted": reward > 0.3,
+                "tags": task.tags,
+            }
 
         def batch(self, tasks: list[Task]) -> int:
             return len(tasks)
@@ -68,8 +71,10 @@ def run_client(_: list[str]) -> None:
         print(f"[client] strict scoring -> reward {out['reward']}", flush=True)
 
         # Nested containers are checked too.
-        assert judge.batch(tasks=[{"task_id": f"t{i}", "weight": 0.1, "tags": []}
-                                  for i in range(5)]) == 5
+        assert (
+            judge.batch(tasks=[{"task_id": f"t{i}", "weight": 0.1, "tags": []} for i in range(5)])
+            == 5
+        )
         print("[client] a list of dataclasses arrived as a list of dataclasses", flush=True)
 
         for bad, why in (
@@ -86,8 +91,9 @@ def run_client(_: list[str]) -> None:
                 raise AssertionError(f"{why} was accepted")
 
         # Without an annotation nothing is checked -- opt in, not imposed.
-        print(f"[client] untyped method still takes anything: "
-              f"{judge.untyped({'a': 1})}", flush=True)
+        print(
+            f"[client] untyped method still takes anything: {judge.untyped({'a': 1})}", flush=True
+        )
 
 
 def driver() -> int:

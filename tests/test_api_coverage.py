@@ -10,7 +10,6 @@ import textwrap
 import time
 
 import pytest
-
 import tinyray
 
 SERVER = textwrap.dedent(
@@ -206,11 +205,23 @@ def test_every_exception_is_reachable(svc):
     with pytest.raises(tinyray.NotFound):
         tinyray.pool("svc").slot(9)
     with pytest.raises(tinyray.Unreachable):
-        tinyray.Handle("svc", {"id": 0, "slot": 0, "incarnation": h.incarnation,
-                               "url": "http://127.0.0.1:1", "ready": True}, ("echo",)).echo(1)
+        tinyray.Handle(
+            "svc",
+            {
+                "id": 0,
+                "slot": 0,
+                "incarnation": h.incarnation,
+                "url": "http://127.0.0.1:1",
+                "ready": True,
+            },
+            ("echo",),
+        ).echo(1)
     with pytest.raises(tinyray.Fenced):
-        tinyray.Handle("svc", {"id": 0, "slot": 0, "incarnation": h.incarnation - 1,
-                               "url": h.url, "ready": True}, ("echo",)).echo(1)
+        tinyray.Handle(
+            "svc",
+            {"id": 0, "slot": 0, "incarnation": h.incarnation - 1, "url": h.url, "ready": True},
+            ("echo",),
+        ).echo(1)
     # SeatTaken needs a process that has not joined yet; it is covered on its
     # own in test_seats.py.
     assert issubclass(tinyray.SeatTaken, tinyray.TinyrayError)

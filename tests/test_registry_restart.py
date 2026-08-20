@@ -17,7 +17,6 @@ import time
 import urllib.request
 
 import tinyray
-from conftest import BIN
 
 BUMP = textwrap.dedent(
     """
@@ -101,9 +100,7 @@ def test_a_restart_does_not_freeze_the_cache(registry):
                 break
             time.sleep(0.1)
         else:
-            with urllib.request.urlopen(
-                f"http://{registry.endpoint}/v1/pools", timeout=5
-            ) as r:
+            with urllib.request.urlopen(f"http://{registry.endpoint}/v1/pools", timeout=5) as r:
                 server_side = json.loads(r.read()).get("w")
             raise AssertionError(
                 f"never saw the newcomer; registry has {server_side}, client is "
@@ -118,9 +115,11 @@ def test_a_restart_does_not_freeze_the_cache(registry):
 def test_membership_regrows_after_a_restart(registry):
     """The plain case: soft state means nothing has to be recovered."""
     peers = []
-    for i in range(3):
+    for _ in range(3):
         p = subprocess.Popen(
-            [sys.executable, "-c", NEWCOMER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            [sys.executable, "-c", NEWCOMER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             text=True,
         )
         assert p.stdout.readline().strip() == "READY"

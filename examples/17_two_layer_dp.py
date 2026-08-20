@@ -15,9 +15,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 GROUPS = 3
 PER_GROUP = 2
@@ -70,8 +69,7 @@ def run_leader(argv: list[str]) -> None:
             seen_min = min(seen_min, len(groups.all()))
             time.sleep(0.05)
         if group == 0:
-            print(f"[leader 0] fewest groups seen at once: {seen_min} of {GROUPS}",
-                  flush=True)
+            print(f"[leader 0] fewest groups seen at once: {seen_min} of {GROUPS}", flush=True)
             print("[leader 0] losing a rank ended one group, not the job", flush=True)
 
 

@@ -64,7 +64,7 @@ class FaultyProxy:
         while not self._stop.is_set():
             try:
                 client, _ = self._srv.accept()
-            except (socket.timeout, OSError):
+            except (TimeoutError, OSError):
                 continue
             with self._lock:
                 self.opened += 1

@@ -8,15 +8,16 @@ tensors.
 from __future__ import annotations
 
 import atexit
+import importlib.metadata as _metadata
 import json
 import os
 import random
 import socket
 import time
+from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
 from . import _rpc
-from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
 from ._errors import (
     Fenced,
     NotFound,
@@ -27,10 +28,20 @@ from ._errors import (
     TinyrayError,
     Unreachable,
 )
+from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
 from ._serve import MethodServer as _MethodServer
 from ._tinyray import Client as _Client
 
+if _TYPE_CHECKING:
+    from ._rpc import BoundMethod
+
+try:
+    __version__ = _metadata.version("tinyray")
+except _metadata.PackageNotFoundError:  # running from a source tree
+    __version__ = "0.0.0+unknown"
+
 __all__ = [
+    "__version__",
     "join",
     "pool",
     "Member",
@@ -141,10 +152,10 @@ class Handle:
         return f"<Handle {self.label} {self.url}>"
 
     def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, Handle)
-            and (self.pool, self.id, self.incarnation)
-            == (other.pool, other.id, other.incarnation)
+        return isinstance(other, Handle) and (self.pool, self.id, self.incarnation) == (
+            other.pool,
+            other.id,
+            other.incarnation,
         )
 
     def __hash__(self) -> int:
@@ -288,11 +299,19 @@ class Pool:
                     f"cannot open a round of {self._name!r}: no contact with the "
                     f"registry for {self._c.silence_ms}ms"
                 )
-            target = min if min is not None else (info[2] if info else None)
+            if info is None:
+                # No answer about this pool yet, so there is no fingerprint to
+                # freeze. min=0 used to reach the line below and crash on it.
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"waited {timeout}s to open a round of {self._name!r}: "
+                        f"the registry has said nothing about it"
+                    )
+                time.sleep(0.02)
+                continue
+            target = min if min is not None else info[2]
             if target is None:
-                raise PolicyError(
-                    f"{self._name!r} declares no size; pass min= or join with size="
-                )
+                raise PolicyError(f"{self._name!r} declares no size; pass min= or join with size=")
             members = self._members({}, require_ready=True)
             if len(members) >= target:
                 return Epoch(self._name, self._c, members, info[1])

@@ -38,7 +38,10 @@ async fn handle(
                 Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, b"{}".to_vec()),
             };
             match serde_json::from_slice(&bytes) {
-                Ok(beat) => reply(StatusCode::OK, serde_json::to_vec(&reg.beat(&beat)).unwrap()),
+                Ok(beat) => reply(
+                    StatusCode::OK,
+                    serde_json::to_vec(&reg.beat(&beat)).unwrap(),
+                ),
                 Err(e) => reply(
                     StatusCode::BAD_REQUEST,
                     serde_json::to_vec(&serde_json::json!({"error": e.to_string()})).unwrap(),
@@ -50,7 +53,10 @@ async fn handle(
                 .snapshot()
                 .into_iter()
                 .map(|(k, (v, r, n))| {
-                    (k, serde_json::json!({"version": v, "roster": r, "members": n}))
+                    (
+                        k,
+                        serde_json::json!({"version": v, "roster": r, "members": n}),
+                    )
                 })
                 .collect();
             reply(StatusCode::OK, serde_json::to_vec(&snap).unwrap())

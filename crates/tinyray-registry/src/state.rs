@@ -41,14 +41,14 @@ fn disagreement(p: &Pool, b: &Beat) -> Option<String> {
             b.pool, p.policy, b.policy
         ));
     }
-    if b.size.is_some() && p.size != b.size {
-        let held = p.size.map_or("no size".to_string(), |n| n.to_string());
-        return Some(format!(
-            "pool {:?} was opened with size {}, this member says {}",
-            b.pool,
-            held,
-            b.size.unwrap()
-        ));
+    if let Some(want) = b.size {
+        if p.size != Some(want) {
+            let held = p.size.map_or("no size".to_string(), |n| n.to_string());
+            return Some(format!(
+                "pool {:?} was opened with size {}, this member says {}",
+                b.pool, held, want
+            ));
+        }
     }
     None
 }
@@ -107,8 +107,12 @@ impl Pool {
             Some(v) if v == self.version => return d,
             // Known position still covered by the log: send only what moved.
             Some(v) if v + 1 >= oldest => {
-                let mut ids: Vec<u64> =
-                    self.log.iter().filter(|(lv, _)| *lv > v).map(|(_, id)| *id).collect();
+                let mut ids: Vec<u64> = self
+                    .log
+                    .iter()
+                    .filter(|(lv, _)| *lv > v)
+                    .map(|(_, id)| *id)
+                    .collect();
                 ids.sort_unstable();
                 ids.dedup();
                 for id in ids {
@@ -143,7 +147,11 @@ impl Registry {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1)
             | 1;
-        Self { pools: RwLock::new(HashMap::new()), ttl, epoch }
+        Self {
+            pools: RwLock::new(HashMap::new()),
+            ttl,
+            epoch,
+        }
     }
 
     /// Rejects a beat that could damage state rather than merely being wrong.
@@ -207,9 +215,8 @@ impl Registry {
         // Asking exclusively means "only if nobody holds it": the lease has
         // not lapsed, so somebody does.
         let occupied = b.exclusive && stored.is_some_and(|cur| cur != b.incarnation);
-        let superseded = occupied
-            || b.incarnation < watermark
-            || stored.is_some_and(|cur| cur > b.incarnation);
+        let superseded =
+            occupied || b.incarnation < watermark || stored.is_some_and(|cur| cur > b.incarnation);
 
         let accepted = !superseded;
         if superseded {
@@ -248,7 +255,13 @@ impl Registry {
                 ready: b.ready,
             };
             p.roster ^= m.roster_hash();
-            p.members.insert(b.id, Record { member: m, expires_at: Instant::now() + self.ttl });
+            p.members.insert(
+                b.id,
+                Record {
+                    member: m,
+                    expires_at: Instant::now() + self.ttl,
+                },
+            );
             p.bump(b.id);
         }
         if b.slot.is_some() && b.incarnation > watermark && !superseded {
@@ -260,7 +273,11 @@ impl Registry {
             if let Some(wp) = pools.get(name) {
                 let d = wp.delta(b.seen.get(name).copied());
                 // Nothing new: leave it out entirely rather than send an empty body.
-                if d.full || !d.changed.is_empty() || !d.removed.is_empty() || b.seen.get(name).is_none() {
+                if d.full
+                    || !d.changed.is_empty()
+                    || !d.removed.is_empty()
+                    || !b.seen.contains_key(name)
+                {
                     out.insert(name.clone(), d);
                 }
             }
@@ -307,4 +324,3 @@ impl Registry {
             .collect()
     }
 }
-

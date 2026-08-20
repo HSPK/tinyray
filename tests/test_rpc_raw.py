@@ -6,11 +6,9 @@ import socket
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 
 import pytest
-
 import tinyray
 
 SERVER = textwrap.dedent(

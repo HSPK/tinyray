@@ -1,6 +1,6 @@
 """The smallest thing that works: one process offers a method, another calls it.
 
-    python examples/01_hello_world.py
+python examples/01_hello_world.py
 """
 
 from __future__ import annotations
@@ -10,9 +10,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_greeter(_: list[str]) -> None:

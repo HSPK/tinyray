@@ -6,7 +6,6 @@ import json
 
 import httpx
 import pytest
-
 import tinyray
 
 

@@ -10,8 +10,6 @@ import textwrap
 import threading
 import time
 
-import pytest
-
 import tinyray
 from conftest import free_port
 

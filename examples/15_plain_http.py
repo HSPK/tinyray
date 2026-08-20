@@ -17,9 +17,8 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_service(_: list[str]) -> None:
@@ -53,8 +52,15 @@ def run_client(argv: list[str]) -> None:
         print(f"       {curl(f'{url}/_methods')}", flush=True)
 
         print("[curl] call a method by hand:", flush=True)
-        out = curl("-X", "POST", f"{url}/call/assign", "-H", "content-type: application/json",
-                   "-d", '{"args": [], "kwargs": {"task": "t-7", "retries": 2}}')
+        out = curl(
+            "-X",
+            "POST",
+            f"{url}/call/assign",
+            "-H",
+            "content-type: application/json",
+            "-d",
+            '{"args": [], "kwargs": {"task": "t-7", "retries": 2}}',
+        )
         print(f"       {out}", flush=True)
         assert json.loads(out)["result"]["took"] == "t-7"
 
@@ -68,7 +74,9 @@ def run_client(argv: list[str]) -> None:
 
         # urllib works as well: nothing about this needs the tinyray client.
         req = urllib.request.Request(
-            f"{url}/call/depth", data=b"{}", method="POST",
+            f"{url}/call/depth",
+            data=b"{}",
+            method="POST",
             headers={"content-type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -83,8 +91,10 @@ def run_client(argv: list[str]) -> None:
 def driver() -> int:
     with Fleet() as fleet:
         svc = subprocess.Popen(
-            [sys.executable, __file__, "service"], env=fleet.env,
-            stdout=subprocess.PIPE, text=True,
+            [sys.executable, __file__, "service"],
+            env=fleet.env,
+            stdout=subprocess.PIPE,
+            text=True,
         )
         fleet.procs.append(("service", svc))
         url = svc.stdout.readline().split()[1]

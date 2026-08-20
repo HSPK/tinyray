@@ -13,15 +13,13 @@ supervisor's decision, and it is a different decision for each pool:
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_env(argv: list[str]) -> None:
@@ -65,8 +63,8 @@ def run_trainer(argv: list[str]) -> None:
 
 def driver() -> int:
     with Fleet(ttl_ms=1500) as fleet:
-        env = fleet.spawn(__file__, "env", "e0", 2.0, label="env0")
-        eng = fleet.spawn(__file__, "engine", "g0", 2.5, label="engine0")
+        fleet.spawn(__file__, "env", "e0", 2.0, label="env0")
+        fleet.spawn(__file__, "engine", "g0", 2.5, label="engine0")
         fleet.spawn(__file__, "trainer", 0, 0, label="trainer0")
         fleet.spawn(__file__, "trainer", 1, 3.0, label="trainer1")
 
@@ -89,30 +87,42 @@ def driver() -> int:
                 replaced += 1
             if not seen.get("engine") and not pools["engine"].all():
                 seen["engine"] = True
-                print("[supervisor] engine gone -> replace it, but it stays out of "
-                      "rotation until it reports a model version", flush=True)
+                print(
+                    "[supervisor] engine gone -> replace it, but it stays out of "
+                    "rotation until it reports a model version",
+                    flush=True,
+                )
                 fleet.spawn(__file__, "engine", "g1", 0, label="engine1")
                 replaced += 1
             if not seen.get("trainer") and len(pools["trainer"].all()) < 2:
                 seen["trainer"] = True
-                print("[supervisor] trainer gone -> the round is void; restart the "
-                      "group, not the member", flush=True)
+                print(
+                    "[supervisor] trainer gone -> the round is void; restart the "
+                    "group, not the member",
+                    flush=True,
+                )
             if len(seen) == 3:
                 break
             time.sleep(0.05)
 
         assert len(seen) == 3, f"only saw {sorted(seen)}"
-        print(f"[supervisor] replaced {replaced} members individually, "
-              f"and declared 1 round void", flush=True)
+        print(
+            f"[supervisor] replaced {replaced} members individually, and declared 1 round void",
+            flush=True,
+        )
 
         # The replacements come back, and the engine only becomes eligible once
         # it has weights -- present is not the same as usable.
         pools["env"].wait(count=1, timeout=15)
         engine = pools["engine"].wait(count=1, timeout=15, model_version=5)[0]
-        print(f"[supervisor] env is back; engine {engine.label} is back and now "
-              f"reports model_version=5", flush=True)
-        print("[supervisor] the trainer group is not something you patch member "
-              "by member", flush=True)
+        print(
+            f"[supervisor] env is back; engine {engine.label} is back and now "
+            f"reports model_version=5",
+            flush=True,
+        )
+        print(
+            "[supervisor] the trainer group is not something you patch member by member", flush=True
+        )
         me.leave()
         return fleet.wait_all(timeout=60, expect_nonzero=("env0", "engine0", "trainer1"))
 

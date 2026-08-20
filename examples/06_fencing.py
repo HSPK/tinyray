@@ -15,9 +15,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 
 def run_worker(argv: list[str]) -> None:
@@ -38,8 +37,10 @@ def run_worker(argv: list[str]) -> None:
         deadline = time.monotonic() + 14
         while time.monotonic() < deadline:
             if not announced and not me.accepted:
-                print(f"[{generation}] the seat moved on without me, "
-                      f"still listening though", flush=True)
+                print(
+                    f"[{generation}] the seat moved on without me, still listening though",
+                    flush=True,
+                )
                 announced = True
             time.sleep(0.05)
 

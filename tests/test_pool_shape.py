@@ -8,7 +8,6 @@ import textwrap
 import time
 
 import pytest
-
 import tinyray
 
 HOLD = textwrap.dedent(

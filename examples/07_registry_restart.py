@@ -14,9 +14,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 PEERS = 3
 
@@ -45,8 +44,11 @@ def run_observer(_: list[str]) -> None:
         time.sleep(5)
 
         after = peers.all()
-        print(f"[observer] registry down: still sees {len(after)} peers, "
-              f"beats_failed={me.stats()['beats_failed']}", flush=True)
+        print(
+            f"[observer] registry down: still sees {len(after)} peers, "
+            f"beats_failed={me.stats()['beats_failed']}",
+            flush=True,
+        )
         assert len(after) == PEERS, "the cache expired along with the registry"
         # And they are still reachable: calls never went through the registry.
         replies = sorted(h.ping() for h in after)
@@ -60,8 +62,10 @@ def run_observer(_: list[str]) -> None:
             if me.stats()["beats_ok"] > 1 and me.silence_ms < 2000:
                 break
             time.sleep(0.1)
-        print(f"[observer] registry back: {len(peers.all())} peers, "
-              f"silence_ms={me.silence_ms}", flush=True)
+        print(
+            f"[observer] registry back: {len(peers.all())} peers, silence_ms={me.silence_ms}",
+            flush=True,
+        )
         assert len(peers.all()) == PEERS, "the roster did not regrow"
 
 

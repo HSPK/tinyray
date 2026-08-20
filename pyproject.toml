@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tinyray"
-version = "0.1.0"
+version = "0.3.0"
 description = "A phone book and a roll call for heterogeneous ML fleets"
 requires-python = ">=3.10"
 dependencies = ["msgspec>=0.18", "httpx>=0.27"]
@@ -24,7 +24,21 @@ features = ["pyo3/extension-module"]
 [tool.ruff]
 line-length = 100
 
+# Say which rules we mean. Ruff's defaults widen between releases and CI
+# installs it unpinned, so inheriting them lets a tool upgrade turn the build
+# red on its own schedule.
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["examples: runs the example programs end to end; minutes, not seconds"]
 addopts = "-m 'not examples'"
+
+# Bare `mypy` in CI needs to know what to look at. Only the package: the tests
+# and examples deliberately reach into private attributes to check internals.
+[tool.mypy]
+files = ["python/tinyray"]
+python_version = "3.10"
+warn_unused_ignores = true
+warn_redundant_casts = true

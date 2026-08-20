@@ -16,9 +16,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 TASKS = 30
 
@@ -79,13 +78,14 @@ def run_driver(_: list[str]) -> None:
             for h in handles:
                 on_its_own_loop = any(r["loop"] == h.state["loop"] for r in results)
                 assert on_its_own_loop, "a coroutine ran on a loop we invented"
-            print(f"[driver] {TASKS} concurrent rollouts, all on the collectors' "
-                  f"own loops", flush=True)
+            print(
+                f"[driver] {TASKS} concurrent rollouts, all on the collectors' own loops",
+                flush=True,
+            )
 
             # A synchronous caller talks to the same async methods.
             sync = tinyray.pool("collector").pick()
-            print(f"[driver] blocking call works too: {sync.rollout('sync')['text']}",
-                  flush=True)
+            print(f"[driver] blocking call works too: {sync.rollout('sync')['text']}", flush=True)
             me.ready(done=True)
             await asyncio.sleep(0.4)
 

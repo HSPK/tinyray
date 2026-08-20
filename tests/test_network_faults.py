@@ -14,7 +14,6 @@ import textwrap
 import time
 
 import pytest
-
 from faulty_net import FaultyProxy
 
 JOIN_AND_REPORT = textwrap.dedent(

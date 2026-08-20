@@ -134,8 +134,11 @@ def show_the_limit_is_real(spool: str) -> None:
         worker = tinyray.pool("dataworker").wait(count=1, timeout=30)[0]
         note = worker.next_batch(step=999)
         os.unlink(note["path"])
-        print(f"[probe] handover note is {len(str(note))} bytes for a "
-              f"{note['bytes'] // (1 << 20)} MB batch", flush=True)
+        print(
+            f"[probe] handover note is {len(str(note))} bytes for a "
+            f"{note['bytes'] // (1 << 20)} MB batch",
+            flush=True,
+        )
         try:
             worker.next_batch(step="x" * (2 << 20))
         except ValueError as exc:

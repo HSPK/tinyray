@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import textwrap
 import time
 
 import pytest
-
 import tinyray
 
 DRIVER = textwrap.dedent(
     """
     import json, os, sys, time
     import tinyray
-    pool_name, policy, count, hold_s = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+    pool_name, policy = sys.argv[1], sys.argv[2]
+    count, hold_s = int(sys.argv[3]), float(sys.argv[4])
     me = tinyray.join(pool_name, policy)
     me.ready(worker=os.getpid())
     print("READY", flush=True)

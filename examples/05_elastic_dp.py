@@ -15,9 +15,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import Fleet, role_main  # noqa: E402
-
 import tinyray  # noqa: E402
+from _harness import Fleet, role_main  # noqa: E402
 
 WORLD = 4
 MIN_WORLD = 3
@@ -39,8 +38,10 @@ def run_rank(argv: list[str]) -> None:
             # Rebuilds are the opposite: the group was whole and lost somebody,
             # so min= is exactly right.
             trainers = tinyray.pool("trainer")
-            ep = trainers.epoch(timeout=30) if rounds == 0 else trainers.epoch(
-                min=MIN_WORLD, timeout=30
+            ep = (
+                trainers.epoch(timeout=30)
+                if rounds == 0
+                else trainers.epoch(min=MIN_WORLD, timeout=30)
             )
             rounds += 1
             members = sorted(h.slot for h in ep)

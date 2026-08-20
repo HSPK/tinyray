@@ -32,4 +32,6 @@ def test_example_runs_clean(path: pathlib.Path):
     out = subprocess.run(
         [sys.executable, str(path)], cwd=ROOT, capture_output=True, text=True, timeout=300
     )
-    assert out.returncode == 0, f"{path.name} 退出码 {out.returncode}\n{out.stdout[-800:]}\n{out.stderr[-800:]}"
+    assert out.returncode == 0, (
+        f"{path.name} 退出码 {out.returncode}\n{out.stdout[-800:]}\n{out.stderr[-800:]}"
+    )

@@ -9,7 +9,6 @@ import threading
 import time
 
 import pytest
-
 import tinyray
 
 RANK = textwrap.dedent(

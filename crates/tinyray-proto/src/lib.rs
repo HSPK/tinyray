@@ -29,7 +29,12 @@ impl Member {
     /// so adding fields to `Member` can never corrupt it.
     pub fn roster_hash(&self) -> u64 {
         let mut h = 1469598103934665603u64;
-        for b in self.id.to_le_bytes().iter().chain(self.incarnation.to_le_bytes().iter()) {
+        for b in self
+            .id
+            .to_le_bytes()
+            .iter()
+            .chain(self.incarnation.to_le_bytes().iter())
+        {
             h ^= *b as u64;
             h = h.wrapping_mul(1099511628211);
         }
