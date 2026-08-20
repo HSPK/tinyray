@@ -237,3 +237,104 @@ def test_a_rebuild_after_a_loss_is_what_min_is_for(registry):
     finally:
         peers.stop()
         me.leave()
+
+
+LAZY_RANK = textwrap.dedent(
+    """
+    import sys, tinyray
+    rank, world = int(sys.argv[1]), int(sys.argv[2])
+    with tinyray.join("trainer", "collective", slot=rank, size=world) as me:
+        print("JOINED", flush=True)
+        sys.stdin.readline()
+        me.ready()
+        print("READY", flush=True)
+        sys.stdin.readline()
+    """
+)
+
+
+def _fnv(seat: int, tenure: int) -> int:
+    """独立重算，跟 test_roster_fingerprint 一样故意抄一份。"""
+    h = 1469598103934665603
+    for b in seat.to_bytes(8, "little") + tenure.to_bytes(8, "little"):
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _fingerprint_of(members) -> int:
+    acc = 0
+    for h in members:
+        acc ^= _fnv(h.id, h.incarnation)
+    return acc
+
+
+def test_a_frozen_round_is_described_by_the_fingerprint_it_carries(registry):
+    """指纹是各 rank 之间唯一的共识凭据，所以它必须正好描述被冻结的那份名单。
+
+    指纹由注册中心按「座位+任期」算，占位者在场就算数，ready 与否不影响它 ——
+    这是有意的（ready 是"能不能用"，不是"是不是同一批人"）。但 epoch() 冻结的
+    名单是按 ready 过滤的。于是出现一个注册中心看不见、客户端也不报警的缺口：
+    有人已入座但还没 ready 时，两个 rank 可以冻出**同一个指纹、不同的名单**，
+    而且两边的 valid 都是 True。
+
+    上面 test_min_can_open_divergent_rounds 记录的分歧风险，靠的正是
+    `full.roster != early.roster` 这张网 —— 而占位者不变、只有 ready 变化时，
+    这张网是漏的。
+
+    修复前实测：3 个占位者、2 个 ready，epoch(min=2) 返回 2 人的名单，却带着
+    描述 3 个人的指纹。
+
+    这条不要求 epoch() 一定能开出一轮 —— 等不到就超时是诚实的答案。它要求的是
+    ：凡是开出来的一轮，它带的指纹必须就是它那份名单算出来的。
+    """
+    world = 3
+    me = tinyray.join("trainer", "collective", slot=0, size=world)
+    me.ready()
+    peers = Ranks(1, world, first=1)  # slot 1: 入座并 ready
+    lazy = subprocess.Popen(
+        [sys.executable, "-c", LAZY_RANK, "2", str(world)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert lazy.stdout.readline().strip() == "JOINED"
+
+        # 等到三个人都在册（指纹已经把第三个人算进去），但只有两个 ready。
+        pool = tinyray.pool("trainer")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if len(pool._members({}, require_ready=False)) == world:
+                break
+            time.sleep(0.05)
+        assert len(pool._members({}, require_ready=False)) == world, "第三个 rank 没有入座"
+        assert len(pool.all()) == world - 1, "第三个 rank 不该是 ready 的"
+
+        try:
+            early = pool.epoch(min=2, timeout=3)
+        except TimeoutError:
+            early = None  # 开不出一轮是可以接受的答案
+        assert early is None or early.roster == _fingerprint_of(early.members), (
+            f"冻结的一轮带着 {early.roster}，但它自己的 {len(early.members)} 人算出来是 "
+            f"{_fingerprint_of(early.members)}；同一个指纹配得上不同的名单，"
+            f"各 rank 就会在都认为一致的情况下建出不同的通信组"
+        )
+
+        # 第三个人 ready 之后，必须能开出一轮，而且同样自洽。
+        lazy.stdin.write("\n")
+        lazy.stdin.flush()
+        assert lazy.stdout.readline().strip() == "READY"
+        pool.wait(count=world, timeout=20)
+
+        full = pool.epoch(timeout=20)
+        assert len(full) == world
+        assert full.roster == _fingerprint_of(full.members), "齐员之后的一轮也对不上"
+    finally:
+        try:
+            lazy.stdin.write("\n")
+            lazy.stdin.flush()
+            lazy.wait(timeout=5)
+        except Exception:
+            lazy.kill()
+        peers.stop()
+        me.leave()

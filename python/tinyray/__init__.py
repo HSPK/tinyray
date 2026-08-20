@@ -21,6 +21,7 @@ from . import _rpc
 from ._errors import (
     Fenced,
     NotFound,
+    OversizeWarning,
     PolicyError,
     RemoteError,
     SeatTaken,
@@ -54,6 +55,7 @@ __all__ = [
     "SeatTaken",
     "NotFound",
     "PolicyError",
+    "OversizeWarning",
     "TinyrayError",
     "Unreachable",
     "Fenced",
@@ -285,13 +287,28 @@ class Pool:
     def epoch(self, min: int | None = None, timeout: float = 60.0) -> Epoch:
         """Wait for the round to be complete, then freeze it.
 
-        Every rank that freezes the same fingerprint saw the same occupants,
-        because the fingerprint is computed by the registry from seats and
-        tenures alone.
+        Every rank that freezes the same fingerprint holds the same list,
+        because a round is only handed over carrying the fingerprint its own
+        list adds up to.
+
+        That last clause is load-bearing. The registry computes the fingerprint
+        from seats and tenures, so readiness deliberately does not move it --
+        but the list frozen here is filtered by readiness. While someone has
+        taken a seat and not yet declared itself ready, those two disagree, and
+        two ranks freezing either side of that moment used to get the *same*
+        fingerprint with *different* lists, both reporting valid. Measured:
+        three occupants, two ready, a round of two carrying the fingerprint of
+        three. Different lists is a deadlock, and an equal fingerprint is
+        exactly what stops anyone noticing.
+
+        Reading the list and the fingerprint together also closes a narrower
+        hole: they used to be two calls with the beat loop free to land between
+        them, so the fingerprint could describe occupants the list never saw.
         """
         deadline = time.monotonic() + timeout
+        self._settle()
+        found, mismatched = 0, False
         while True:
-            info = self._c.pool_info(self._name)
             # A stale roster is not safe to build a collective on: ranks could
             # disagree. Refuse rather than freeze something we cannot trust.
             if self._c.silence_ms > self._lease_ms():
@@ -299,6 +316,7 @@ class Pool:
                     f"cannot open a round of {self._name!r}: no contact with the "
                     f"registry for {self._c.silence_ms}ms"
                 )
+            info = self._c.pool_info(self._name)
             if info is None:
                 # No answer about this pool yet, so there is no fingerprint to
                 # freeze. min=0 used to reach the line below and crash on it.
@@ -312,13 +330,25 @@ class Pool:
             target = min if min is not None else info[2]
             if target is None:
                 raise PolicyError(f"{self._name!r} declares no size; pass min= or join with size=")
-            members = self._members({}, require_ready=True)
-            if len(members) >= target:
-                return Epoch(self._name, self._c, members, info[1])
+            got = self._c.frozen(self._name, True)
+            if got is not None:
+                raw, ours, whole = got
+                members = [self._handle_cls(self._name, m, tuple(info[3])) for m in json.loads(raw)]
+                found, mismatched = len(members), ours != whole
+                if found >= target and not mismatched:
+                    return Epoch(self._name, self._c, members, whole)
             if time.monotonic() >= deadline:
+                if mismatched and found >= target:
+                    raise TimeoutError(
+                        f"waited {timeout}s to open a round of {self._name!r}: "
+                        f"{found} member(s) ready, but the pool holds a seat whose "
+                        f"occupant has not declared itself ready, so the fingerprint "
+                        f"would not describe the list -- wait for it rather than "
+                        f"freeze a round no other rank can be held to"
+                    )
                 raise TimeoutError(
                     f"waited {timeout}s to open a round of {self._name!r}: "
-                    f"{len(members)} of {target} present"
+                    f"{found} of {target} present"
                 )
             time.sleep(0.02)
 
@@ -479,8 +509,16 @@ _owner_pid = os.getpid()
 def _after_fork() -> None:
     """fork() keeps only the calling thread, so the child inherits a client
     whose heartbeat is gone: it looks registered, answers from a frozen cache,
-    and the registry never hears from it again. Make that explicit instead."""
+    and the registry never hears from it again. Make that explicit instead.
+
+    The inherited runtime also has to be let go of rather than dropped. Its
+    worker threads did not survive the fork, and shutting it down waits for
+    them: measured as a child that hangs forever at ordinary exit, in native
+    code with no Python frame to show why, taking the parent's waitpid with it.
+    """
     global _client, _left
+    if _client is not None:
+        _client.abandon()
     _client = None
     _left = False
 

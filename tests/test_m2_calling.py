@@ -125,9 +125,18 @@ def test_stale_tenure_is_fenced_not_silently_accepted(peer):
         stale.assign("x")
 
 
-def test_the_byte_budget_is_enforced_not_documented(peer):
-    with pytest.raises(ValueError, match="over the"):
-        peer.echo_big("x" * (1 << 21))
+def test_the_byte_budget_warns_rather_than_refuses(peer):
+    """1 MB 是提示线不是闸门：超了要出声，但不能把调用打断。
+
+    还要指对地方。警告一开始是在 _prepare 里发的，那比 invoke 深一层，
+    stacklevel 就差了一格 —— 指到 _rpc.py 自己身上，而不是应用写的那一行。
+    "有没有警告"验不出这个，所以这里连位置一起钉住。
+    """
+    with pytest.warns(tinyray.OversizeWarning, match="past the") as seen:
+        assert peer.echo_big("x" * (1 << 21)) == (1 << 21)
+    assert seen[0].filename == __file__, (
+        f"警告指向 {seen[0].filename}:{seen[0].lineno}，应该指向调用它的那一行"
+    )
     assert peer.echo_big("x" * 1000) == 1000
 
 

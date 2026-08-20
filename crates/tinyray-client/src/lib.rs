@@ -157,6 +157,24 @@ impl Client {
         Ok(serde_json::to_string(&members).unwrap())
     }
 
+    /// The members of `pool` matching `require_ready`, the fingerprint they
+    /// add up to, and the fingerprint the registry holds for the whole pool --
+    /// all read under one lock.
+    ///
+    /// epoch() has to compare the last two, and taking them through separate
+    /// calls let the beat loop land in between, so the list could come from
+    /// one set of occupants and the fingerprint from another. Computing the
+    /// members' own fingerprint here rather than in Python also keeps one
+    /// implementation of the hash: a second one would drift silently.
+    #[pyo3(signature = (pool, require_ready=true))]
+    fn frozen(&self, pool: &str, require_ready: bool) -> Option<(String, u64, u64)> {
+        let cache = self.shared.cache.read().unwrap();
+        let c = cache.get(pool)?;
+        let members = pick_from(c, &serde_json::Value::Null, require_ready);
+        let mine = members.iter().fold(0u64, |acc, m| acc ^ m.roster_hash());
+        Some((serde_json::to_string(&members).unwrap(), mine, c.roster))
+    }
+
     /// Version and roster fingerprint of a cached pool, or None if unseen.
     fn pool_info(&self, pool: &str) -> Option<(u64, u64, Option<u64>, Vec<String>)> {
         let cache = self.shared.cache.read().unwrap();
@@ -172,6 +190,22 @@ impl Client {
             let s = self.shared.clone();
             py.allow_threads(|| beat_once(&rt, &s));
             rt.shutdown_background();
+        }
+    }
+
+    /// Let go of the runtime without shutting it down. Only a forked child
+    /// should call this.
+    ///
+    /// fork() keeps just the calling thread, so the runtime's workers do not
+    /// exist in the child -- but the inherited handle does, and dropping it at
+    /// interpreter shutdown waits for threads that will never answer.
+    /// Measured: the child hangs forever with no Python frame to show why, in
+    /// native code, and the parent's waitpid hangs with it. Leaking the handle
+    /// is the right trade here: it points into a copy-on-write image that is
+    /// about to be discarded, and there is nothing left alive to shut down.
+    fn abandon(&self) {
+        if let Some(rt) = self.rt.lock().unwrap().take() {
+            std::mem::forget(rt);
         }
     }
 

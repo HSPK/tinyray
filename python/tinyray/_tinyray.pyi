@@ -33,10 +33,15 @@ class Client:
     def pool_info(self, pool: str) -> tuple[int, int, int | None, list[str]] | None:
         """(version, roster, size, methods), or None if the pool is unseen."""
 
+    def frozen(self, pool: str, require_ready: bool = ...) -> tuple[str, int, int] | None:
+        """(members as JSON, their own fingerprint, the pool's), read together."""
+
     def stats(self) -> dict[str, int]: ...
     def last_error(self) -> str: ...
     def refused(self) -> str: ...
     def leave(self) -> None: ...
+    def abandon(self) -> None:
+        """Drop the runtime without shutting it down. Forked children only."""
 
 version: str
 

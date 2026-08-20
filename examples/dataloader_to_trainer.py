@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from pathlib import Path
 
 import tinyray
@@ -29,7 +30,7 @@ REGISTRY = Path(sys.executable).parent / "tinyray"
 WORLD = 4
 WORKERS = 4
 STEPS = 12
-BATCH_BYTES = 4 << 20  # 4 MB: four times over the control-plane limit
+BATCH_BYTES = 4 << 20  # 4 MB: four times the size the control plane is for
 
 
 # --------------------------------------------------------------------------
@@ -127,8 +128,13 @@ def run_trainer(rank: int, spool: str) -> None:
         time.sleep(0.6)
 
 
-def show_the_limit_is_real(spool: str) -> None:
-    """The rule is enforced by the machinery, not by a line in a document."""
+def show_the_nudge_is_real(spool: str) -> None:
+    """The rule comes from the machinery, not from a line in a document.
+
+    It nudges rather than refuses: the batch would go through. A payload that
+    crept from 900 KB to 1.1 MB should get slower and say so, not take the job
+    down -- but the saying so is what stops it becoming the habit.
+    """
     with tinyray.join("prober", "churn") as me:
         me.ready()
         worker = tinyray.pool("dataworker").wait(count=1, timeout=30)[0]
@@ -139,18 +145,19 @@ def show_the_limit_is_real(spool: str) -> None:
             f"{note['bytes'] // (1 << 20)} MB batch",
             flush=True,
         )
-        try:
+        with warnings.catch_warnings(record=True) as heard:
+            warnings.simplefilter("always", tinyray.OversizeWarning)
             worker.next_batch(step="x" * (2 << 20))
-        except ValueError as exc:
-            print(f"[probe] oversized payload refused: {str(exc)[:60]}...", flush=True)
-        else:
-            raise AssertionError("the payload limit did not fire")
+        if not heard:
+            raise AssertionError("the payload nudge did not fire")
+        said = str(heard[0].message)[:60]
+        print(f"[probe] oversized payload warned about: {said}...", flush=True)
 
 
 ROLES = {
     "dataworker": lambda a: run_dataworker(a[0], int(a[1]), a[2]),
     "trainer": lambda a: run_trainer(int(a[0]), a[1]),
-    "probe": lambda a: show_the_limit_is_real(a[0]),
+    "probe": lambda a: show_the_nudge_is_real(a[0]),
 }
 
 
