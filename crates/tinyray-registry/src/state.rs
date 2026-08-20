@@ -21,6 +21,16 @@ const MAX_INCARNATION: u64 = (4_000_000_000_000u64) << 20;
 /// Names are used as map keys and echoed back to every subscriber.
 const MAX_NAME: usize = 512;
 
+/// State is stored per member and pushed to every subscriber whenever it
+/// changes, so its size is multiplied by the audience. Measured with one
+/// member holding 6 MB and 20 subscribers: 120 MB moved in 0.9s, a 20x
+/// amplification that extrapolates to 6 GB per change at 1000 subscribers.
+/// The control plane carries facts about where things are, not the things.
+pub const MAX_STATE: usize = 16 << 10;
+
+/// Methods are stored once per pool and echoed to every subscriber too.
+const MAX_METHODS: usize = 256;
+
 struct Record {
     member: Member,
     expires_at: Instant,
@@ -116,10 +126,20 @@ impl Registry {
 
     /// Rejects a beat that could damage state rather than merely being wrong.
     fn admissible(b: &Beat) -> bool {
+        // Cheap enough on the hot path: a real state is a handful of short
+        // keys, and an oversized one is rejected before it is ever stored.
+        fn state_len(v: &serde_json::Value) -> usize {
+            serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX)
+        }
+
         b.pool.len() <= MAX_NAME
             && b.incarnation <= MAX_INCARNATION
             && b.watch.len() <= 64
             && b.watch.iter().all(|w| w.len() <= MAX_NAME)
+            && b.url.as_ref().is_none_or(|u| u.len() <= MAX_NAME)
+            && b.methods.len() <= MAX_METHODS
+            && b.methods.iter().all(|m| m.len() <= MAX_NAME)
+            && state_len(&b.state) <= MAX_STATE
     }
 
     pub fn beat(&self, b: &Beat) -> BeatAck {

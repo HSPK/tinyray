@@ -48,6 +48,7 @@ __all__ = [
     "Fenced",
     "RemoteError",
     "apool",
+    "MAX_STATE",
 ]
 
 POLICIES = ("churn", "serving", "stateful", "collective")
@@ -338,13 +339,32 @@ class Member:
     def ready(self, **state: Any) -> Member:
         """Hang out a sign. Sends nothing now; the next heartbeat carries it."""
         self._mine()
-        self._state.update(state)
-        self._c.set_state(json.dumps(self._state), True)
+        # Check before mutating: an over-budget call used to leave the blob in
+        # place, so every later ready() failed too and one bad call poisoned
+        # the member for good.
+        merged = {**self._state, **state}
+        raw = self._encode_state(merged)
+        self._state = merged
+        self._c.set_state(raw, True)
         return self
+
+    def _encode_state(self, state: dict[str, Any]) -> str:
+        raw = json.dumps(state)
+        # The registry would refuse this, but silently and in a background
+        # thread. Refusing here names the call that did it. The bound exists
+        # because state is copied to every subscriber: 6 MB became 120 MB
+        # across 20 of them.
+        if len(raw) > MAX_STATE:
+            raise ValueError(
+                f"state is {len(raw)} bytes, over the {MAX_STATE} limit; the "
+                f"registry copies it to every subscriber, so publish a "
+                f"reference and let peers fetch the payload themselves"
+            )
+        return raw
 
     def unready(self) -> Member:
         self._mine()
-        self._c.set_state(json.dumps(self._state), False)
+        self._c.set_state(self._encode_state(self._state), False)
         return self
 
     @property
@@ -399,6 +419,10 @@ class Member:
 # One beat plus slack: long enough for the registry's first answer, short
 # enough that a dead registry does not turn every lookup into a stall.
 _FIRST_ANSWER_S = 2.0
+
+# Matches MAX_STATE in the registry: a fact about where something is, not the
+# something. See tests/test_state_budget.py for the amplification measurement.
+MAX_STATE = 16 << 10
 
 _client: _Client | None = None
 _left = False

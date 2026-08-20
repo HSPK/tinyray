@@ -13,7 +13,11 @@ use tokio::net::TcpListener;
 
 use crate::state::Registry;
 
-const MAX_BODY: usize = 8 << 20;
+/// A beat is a few hundred bytes; the roomiest legal one -- 64 watched pools,
+/// 256 method names and a full-sized state -- is around 210 KB. Eight
+/// megabytes left room for a single member to hand the registry something it
+/// would then copy to every subscriber.
+const MAX_BODY: usize = 512 << 10;
 
 async fn handle(
     req: Request<hyper::body::Incoming>,
