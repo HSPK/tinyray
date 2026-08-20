@@ -17,6 +17,10 @@ def main(argv: list[str] | None = None) -> int:
         serve_registry(args.listen, args.ttl_ms)
     except KeyboardInterrupt:
         return 0
+    except (OSError, ValueError, RuntimeError) as e:
+        # A bad --listen or --ttl-ms is an operator typo, not a crash.
+        print(f"tinyray: {e}", file=sys.stderr)
+        return 2
     return 0
 
 
