@@ -69,6 +69,7 @@ impl Client {
             beats_ok: AtomicU64::new(0),
             beats_failed: AtomicU64::new(0),
             last_error: Mutex::new(String::new()),
+            refused: Mutex::new(String::new()),
             interval_ms: AtomicU64::new(1000),
             last_ok_ms: AtomicU64::new(0),
             seen_epoch: AtomicU64::new(0),
@@ -158,6 +159,11 @@ impl Client {
     #[getter]
     fn accepted(&self) -> bool {
         self.shared.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Why the registry refused this member, if it was about the pool's shape.
+    fn refused(&self) -> String {
+        self.shared.refused.lock().unwrap().clone()
     }
 
     /// Why the last beat failed, or an empty string if none has.

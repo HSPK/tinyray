@@ -393,8 +393,12 @@ class Member:
 
     @property
     def last_error(self) -> str:
-        """Why the last beat failed, or "" if none has. Reading silence_ms
-        tells you contact is lost; this tells you what it looked like."""
+        """The most recent beat failure, kept even after recovery.
+
+        Read it with silence_ms, not instead of it: silence_ms says whether
+        contact is healthy right now, this says what the last break looked
+        like. A short silence with a message in here means it recovered.
+        """
         return self._c.last_error()
 
     def leave(self) -> None:
@@ -553,6 +557,8 @@ def join(
         c.leave()
         if server is not None:
             server.close()
+        if c.refused():
+            raise PolicyError(c.refused())
         if exclusive:
             raise SeatTaken(f"seat {slot} of {pool!r} is already held")
         raise SeatTaken(

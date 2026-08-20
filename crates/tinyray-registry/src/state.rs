@@ -31,6 +31,28 @@ pub const MAX_STATE: usize = 16 << 10;
 /// Methods are stored once per pool and echoed to every subscriber too.
 const MAX_METHODS: usize = 256;
 
+/// What this beat says about the pool that the pool does not say about itself.
+/// Methods are left out on purpose: an empty list means "I do not serve", not
+/// "I disagree", and mixed pools where only some members serve are normal.
+fn disagreement(p: &Pool, b: &Beat) -> Option<String> {
+    if p.policy != b.policy {
+        return Some(format!(
+            "pool {:?} is running as {:?}, this member says {:?}",
+            b.pool, p.policy, b.policy
+        ));
+    }
+    if b.size.is_some() && p.size != b.size {
+        let held = p.size.map_or("no size".to_string(), |n| n.to_string());
+        return Some(format!(
+            "pool {:?} was opened with size {}, this member says {}",
+            b.pool,
+            held,
+            b.size.unwrap()
+        ));
+    }
+    None
+}
+
 struct Record {
     member: Member,
     expires_at: Instant,
@@ -148,14 +170,35 @@ impl Registry {
                 epoch: self.epoch,
                 ttl_ms: self.ttl.as_millis() as u64,
                 accepted: false,
+                refused: None,
                 pools: HashMap::new(),
             };
         }
         let mut pools = self.pools.write().unwrap();
         let p = pools.entry(b.pool.clone()).or_default();
-        if p.policy.is_empty() {
+        if p.members.is_empty() {
+            // The shape belongs to whoever is here now, not to whoever was
+            // here first. An empty pool that pinned its first size forever
+            // meant a job relaunched at a different world size silently kept
+            // the old one.
             p.policy = b.policy.clone();
             p.size = b.size;
+            p.methods = b.methods.clone();
+        } else if let Some(why) = disagreement(p, b) {
+            // Silently keeping the first arrival's word turns a config typo
+            // into a roll call that never completes: measured as every rank
+            // waiting out its timeout on "4 of 8 present", with no missing
+            // rank to find.
+            return BeatAck {
+                epoch: self.epoch,
+                ttl_ms: self.ttl.as_millis() as u64,
+                accepted: false,
+                refused: Some(why),
+                pools: HashMap::new(),
+            };
+        } else if p.methods.is_empty() && !b.methods.is_empty() {
+            // Only some members pass serves=; the first one through should not
+            // decide that the pool serves nothing.
             p.methods = b.methods.clone();
         }
 
@@ -222,7 +265,13 @@ impl Registry {
                 }
             }
         }
-        BeatAck { epoch: self.epoch, ttl_ms: self.ttl.as_millis() as u64, accepted, pools: out }
+        BeatAck {
+            epoch: self.epoch,
+            ttl_ms: self.ttl.as_millis() as u64,
+            accepted,
+            refused: None,
+            pools: out,
+        }
     }
 
     /// Drop members whose lease ran out. Runs on a timer, never on the request

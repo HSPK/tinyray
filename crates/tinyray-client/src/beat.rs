@@ -51,6 +51,9 @@ pub struct Shared {
     /// so a refused connection, a timeout, a peer that only speaks HTTP/1.1
     /// and a malformed reply were all reported the same way: silence.
     pub last_error: Mutex<String>,
+    /// Set when the registry refused because the pool's shape was disagreed
+    /// with, as opposed to the seat being held by a later tenure.
+    pub refused: Mutex<String>,
     pub interval_ms: AtomicU64,
     /// Monotonic ms of the last successful beat. Freezing a round on a stale
     /// roster is unsafe, so epoch() needs to know when we are flying blind.
@@ -113,6 +116,9 @@ impl Shared {
         }
         if !ack.accepted {
             self.accepted.store(false, Ordering::Relaxed);
+            if let Some(why) = &ack.refused {
+                *self.refused.lock().unwrap() = why.clone();
+            }
             return false;
         }
         let mut cache = self.cache.write().unwrap();

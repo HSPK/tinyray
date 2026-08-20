@@ -105,6 +105,11 @@ pub struct BeatAck {
     pub ttl_ms: u64,
     /// False means the seat was taken by a later incarnation. Give up.
     pub accepted: bool,
+    /// Set when the refusal was about the pool's shape rather than the seat,
+    /// so the caller can be told what it disagreed about instead of guessing
+    /// from a roll call that never completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
     #[serde(default)]
     pub pools: HashMap<String, PoolDelta>,
 }
