@@ -24,6 +24,32 @@ import msgspec
 BODY_TIMEOUT = 15.0
 
 
+class CallContext:
+    """Who is calling, as they described themselves.
+
+    Declared as a parameter annotation and it is filled in for you:
+
+        def pull_job(self, ctx: tinyray.CallContext) -> dict: ...
+
+    Self-declared, like every identity here -- a member picks its own tenure
+    too -- so this is not authentication and must not be used as one. What it
+    does buy is that the caller cannot forget to send it, or send the wrong
+    one, which is what happens when the same fact travels as an argument.
+    """
+
+    __slots__ = ("identity", "pool", "slot", "incarnation")
+
+    def __init__(self, identity: str):
+        self.identity = identity
+        self.pool, _, seat = identity.partition("/")
+        seat, _, tenure = seat.partition("#")
+        self.slot = int(seat) if seat.isdigit() else None
+        self.incarnation = int(tenure) if tenure.isdigit() else 0
+
+    def __repr__(self) -> str:
+        return f"<CallContext {self.identity or 'anonymous'}>"
+
+
 def scan(obj: Any) -> dict[str, Callable[..., Any]]:
     """Public methods, in declaration order. Leading underscore means private."""
     out: dict[str, Callable[..., Any]] = {}
@@ -43,7 +69,7 @@ def _hints(fn: Callable[..., Any]) -> dict[str, Any]:
         return {}
 
 
-def _coerce(fn: Callable[..., Any], payload: Any) -> tuple[list, dict]:
+def _coerce(fn: Callable[..., Any], payload: Any, caller: str = "") -> tuple[list, dict]:
     """Unpack {"args": [...], "kwargs": {...}} and check it against annotations."""
     if isinstance(payload, dict) and set(payload) <= {"args", "kwargs"}:
         args = list(payload.get("args") or [])
@@ -58,6 +84,9 @@ def _coerce(fn: Callable[..., Any], payload: Any) -> tuple[list, dict]:
     hints = _hints(fn)
     if not hints:
         return args, kwargs
+    for param, want in hints.items():
+        if want is CallContext:
+            kwargs[param] = CallContext(caller or "")
     try:
         names = [p for p in inspect.signature(fn).parameters]
     except (TypeError, ValueError):
@@ -67,7 +96,7 @@ def _coerce(fn: Callable[..., Any], payload: Any) -> tuple[list, dict]:
         if i < len(names) and names[i] in hints:
             args[i] = msgspec.convert(value, hints[names[i]], strict=False)
     for key, value in kwargs.items():
-        if key in hints:
+        if key in hints and hints[key] is not CallContext:
             kwargs[key] = msgspec.convert(value, hints[key], strict=False)
     return args, kwargs
 
@@ -82,6 +111,7 @@ class _Server(ThreadingHTTPServer):
     identity: str
     still_ours: Callable[[], bool]
     loop: asyncio.AbstractEventLoop | None
+    slots: threading.Semaphore | None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -206,8 +236,26 @@ class _Handler(BaseHTTPRequestHandler):
         fn = self.server.dispatch.get(name)
         if fn is None:
             return self._send(404, {"error": f"no method {name!r}"})
+
+        # A thread per connection with nothing bounding it: a hundred workers
+        # all pulling at once is a hundred threads, and the ones that lose the
+        # race still hold their slot while they wait. Saying no is bounded, and
+        # saying no *here* -- after the body, before the method -- is what
+        # makes it safe to retry: nothing ran.
+        slots = self.server.slots
+        if slots is not None and not slots.acquire(blocking=False):
+            return self._send(503, {"error": "at the concurrency limit"})
         try:
-            args, kwargs = _coerce(fn, json.loads(raw or b"{}"))
+            return self._dispatch(fn, name, raw)
+        finally:
+            if slots is not None:
+                slots.release()
+
+    def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> None:
+        try:
+            args, kwargs = _coerce(
+                fn, json.loads(raw or b"{}"), self.headers.get("x-tinyray-caller") or ""
+            )
         except json.JSONDecodeError as e:
             return self._send(400, {"error": str(e)})
         except msgspec.ValidationError as e:
@@ -242,7 +290,13 @@ class _Handler(BaseHTTPRequestHandler):
 class MethodServer:
     """One small server per process, started only when serves= is given."""
 
-    def __init__(self, obj: Any, identity: str, host: str = "0.0.0.0"):
+    def __init__(
+        self,
+        obj: Any,
+        identity: str,
+        host: str = "0.0.0.0",
+        max_concurrency: int | None = None,
+    ):
         self.still_ours: Callable[[], bool] = lambda: True
         self.dispatch = scan(obj)
         try:
@@ -256,6 +310,7 @@ class MethodServer:
         self._srv.identity = identity
         self._srv.still_ours = lambda: self.still_ours()
         self._srv.loop = loop
+        self._srv.slots = None if max_concurrency is None else threading.Semaphore(max_concurrency)
         self.port = self._srv.server_address[1]
         self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
         self._thread.start()

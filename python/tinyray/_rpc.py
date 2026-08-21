@@ -13,15 +13,47 @@ from typing import Any
 
 import httpx
 
-from ._errors import Fenced, OversizeWarning, RemoteError, Unreachable
+from ._errors import (
+    Fenced,
+    NotDelivered,
+    OutcomeUnknown,
+    OversizeWarning,
+    RemoteError,
+    Unreachable,
+)
 
 # Past this a call is warned about, not refused. The control plane carries
 # facts about where things are, not the things -- but a call is point to point,
 # so going over is slow for the two ends and nothing else, and refusing at a
 # threshold would turn a payload that grew from 900 KB to 1.1 MB into an
 # outage. There is deliberately no ceiling above it.
+# Nothing got onto the wire, or nothing reached the far side: the method did
+# not run, whatever else happened. Everything else that httpx raises leaves the
+# question open -- a read that timed out or a connection that broke mid-exchange
+# may well have been acted on -- and "may have run" is the case that needs a
+# request id, so the two must not share a class.
+_NEVER_LEFT = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+    httpx.LocalProtocolError,
+)
+
 SOFT_BODY = 1 << 20
 DEFAULT_TIMEOUT = 30.0  # the measured control-plane band is 2-30s
+
+# Set at join() time. Travels on every call so the far side can bind a lease to
+# the tenure that asked for it, instead of trusting an argument the caller had
+# to remember to fill in correctly.
+_identity = ""
+
+
+def set_identity(who: str) -> None:
+    global _identity
+    _identity = who
+
 
 _LIMITS = httpx.Limits(max_keepalive_connections=64, keepalive_expiry=60.0)
 _sync: httpx.Client | None = None
@@ -84,19 +116,39 @@ def _nudge(what: str, size: int, where: str | None) -> None:
 
 def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str, str]]:
     if handle.url is None:
-        raise Unreachable(f"{handle} advertises no address; it joined without serves=")
+        raise NotDelivered(f"{handle} advertises no address; it joined without serves=")
     body = json.dumps(payload).encode()
-    headers = {"content-type": "application/json", "x-tinyray-target": handle.identity}
+    headers = {
+        "content-type": "application/json",
+        "x-tinyray-target": handle.identity,
+        "x-tinyray-caller": _identity,
+    }
     return f"{handle.url}/call/{name}", body, headers
+
+
+def _transport_error(handle: Any, name: str, exc: Exception) -> Unreachable:
+    at = f"{handle.identity} at {handle.url}: {exc}"
+    if isinstance(exc, _NEVER_LEFT):
+        return NotDelivered(f"{name}() never reached {at}")
+    return OutcomeUnknown(f"{name}() may or may not have run on {at}")
 
 
 def _decode(status: int, raw: bytes, target: str) -> Any:
     if status == 409:
         raise Fenced(f"{target} is held by a later tenure now; look it up again")
+    if status == 503:
+        # Refused before dispatch, so nothing ran: retry here or elsewhere.
+        raise NotDelivered(f"{target} is at its concurrency limit")
+    if status == 411:
+        # The body was never read, so neither was the call.
+        raise NotDelivered(f"{target} refused the request framing: {raw[:120]!r}")
+    if status >= 500:
+        # The handler was already running when it came apart.
+        raise OutcomeUnknown(f"{target} answered HTTP {status} partway through")
     try:
         body = json.loads(raw or b"{}")
     except json.JSONDecodeError as e:
-        raise Unreachable(f"{target} returned an unparseable body: {e}") from e
+        raise OutcomeUnknown(f"{target} answered with a body that will not parse: {e}") from e
     if status == 404:
         raise AttributeError(body.get("error", "no such method"))
     if status == 422:
@@ -104,7 +156,7 @@ def _decode(status: int, raw: bytes, target: str) -> Any:
     if status == 413:
         raise ValueError(body.get("error", "payload too large"))
     if status != 200:
-        raise Unreachable(f"{target} returned HTTP {status}")
+        raise OutcomeUnknown(f"{target} returned HTTP {status}")
     err = body.get("error")
     if err:
         raise RemoteError(err["type"], err["message"], err.get("traceback", ""))
@@ -117,7 +169,7 @@ def invoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
     try:
         r = _sync_client().post(url, content=body, headers=headers, timeout=timeout)
     except httpx.HTTPError as e:
-        raise Unreachable(f"{handle.identity} at {handle.url}: {e}") from e
+        raise _transport_error(handle, name, e) from e
     # Nudged here rather than on the far side: a served process routinely has
     # its output sent to /dev/null, so a warning there is one nobody reads.
     _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
@@ -130,7 +182,7 @@ async def ainvoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
     try:
         r = await _async_client().post(url, content=body, headers=headers, timeout=timeout)
     except httpx.HTTPError as e:
-        raise Unreachable(f"{handle.identity} at {handle.url}: {e}") from e
+        raise _transport_error(handle, name, e) from e
     _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
     return _decode(r.status_code, r.content, handle.identity)
 

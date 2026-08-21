@@ -8,7 +8,32 @@ class TinyrayError(Exception):
 
 
 class Unreachable(TinyrayError):
-    """Never arrived. Retry if the operation can be repeated."""
+    """The call did not come back. Whether it ran is the subclass's business.
+
+    Kept as the base so `except Unreachable` still catches both, but code that
+    retries should catch the subclass instead: one of them is safe to repeat
+    as-is and the other is not, and for a long time they were the same class
+    with a docstring that told you to retry.
+    """
+
+
+class NotDelivered(Unreachable):
+    """It never reached the far side, so the method certainly did not run.
+
+    Safe to retry as it stands -- no request id, no idempotency key, nothing to
+    reconcile. A refused connection, a name that will not resolve and a callee
+    that answered "I am full" all land here.
+    """
+
+
+class OutcomeUnknown(Unreachable):
+    """It may have run. Nobody on this side can tell.
+
+    A read that timed out, a connection that broke mid-exchange, a callee that
+    died partway through. Retrying means possibly doing it twice, so carry the
+    same request id or make the operation idempotent. This is the only case
+    that needs one.
+    """
 
 
 class Fenced(TinyrayError):

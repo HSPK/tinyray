@@ -1,0 +1,192 @@
+"""身份、fencing、状态发布确认 —— 三件调用方本来要自己拼的事。
+
+它们的共同点是：需要的事实 TinyRay 都已经知道（谁在、任期号、心跳落没落地），
+只是没有交出去，于是业务层只好用参数传、用轮询查、用反查自己来凑。
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+
+import pytest
+import tinyray
+
+ECHO_CALLER = textwrap.dedent(
+    """
+    import sys, tinyray
+
+    class S:
+        def whoami(self, ctx: tinyray.CallContext) -> dict:
+            return {
+                "identity": ctx.identity,
+                "pool": ctx.pool,
+                "slot": ctx.slot,
+                "incarnation": ctx.incarnation,
+            }
+        def mixed(self, n: int, ctx: tinyray.CallContext) -> dict:
+            return {"n": n, "caller": ctx.identity}
+        def plain(self, n: int) -> int:
+            return n
+
+    with tinyray.join("svc", "stateful", slot=0, serves=S()) as me:
+        me.ready()
+        print("READY", flush=True)
+        sys.stdin.readline()
+    """
+)
+
+SEAT_THIEF = textwrap.dedent(
+    """
+    import sys, tinyray
+    with tinyray.join("held", "stateful", slot=0) as m:
+        m.ready()
+        print("READY", flush=True)
+        sys.stdin.readline()
+    """
+)
+
+
+def _stop(p: subprocess.Popen) -> None:
+    try:
+        p.stdin.write("\n")
+        p.stdin.flush()
+        p.wait(timeout=10)
+    except Exception:
+        p.kill()
+
+
+@pytest.fixture
+def peer(registry):
+    p = subprocess.Popen(
+        [sys.executable, "-c", ECHO_CALLER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert p.stdout.readline().strip() == "READY"
+    me = tinyray.join("caller", "stateful", slot=3)
+    me.ready()
+    tinyray.pool("svc").wait(count=1, timeout=15)
+    try:
+        yield me
+    finally:
+        _stop(p)
+        me.leave()
+
+
+def test_the_callee_is_told_who_called_without_being_passed_it(peer):
+    """业务接口过去要手工传 worker_id + incarnation —— 传错、忘传都没人拦。"""
+    got = tinyray.pool("svc").slot(0).whoami()
+    assert got["pool"] == "caller"
+    assert got["slot"] == 3
+    assert got["incarnation"] == peer.incarnation
+    assert got["identity"] == f"caller/3#{peer.incarnation}"
+
+
+def test_the_context_does_not_disturb_the_real_arguments(peer):
+    """注入不能挤掉调用方自己的参数，也不能影响没有声明它的方法。"""
+    h = tinyray.pool("svc").slot(0)
+    assert h.mixed(7)["n"] == 7
+    assert h.mixed(7)["caller"].startswith("caller/3#")
+    assert h.plain(5) == 5
+
+
+def test_set_ready_replaces_the_state_instead_of_layering_on_it(registry):
+    """ready() 是合并语义，所以过去发出去的 key 拿不回来。
+
+    权重切换要的是「整张图换掉」，不是在上一版之上再糊一层。
+    """
+    me = tinyray.join("pub", "churn")
+    try:
+        me.ready(version=1, stale=True)
+        assert me.state == {"version": 1, "stale": True}
+
+        me.ready(version=2)
+        assert me.state["stale"] is True, "合并语义就是这样，这里先钉住它"
+
+        me.set_ready({"version": 3})
+        assert me.state == {"version": 3}, "整体替换之后不该还留着 stale"
+    finally:
+        me.leave()
+
+
+def test_flush_waits_until_the_registry_has_it(registry):
+    """发布之后再反查自己，是因为没有别的办法说「它看见了吗」。"""
+    me = tinyray.join("pub", "churn")
+    watcher = tinyray.pool("pub")
+    try:
+        me.set_ready({"weights": "v9"})
+        me.flush(timeout=20)
+        # flush 返回即代表注册中心已经收下，所以这里不需要再等。
+        mine = watcher.snapshot().get(me.identity)
+        assert mine is not None, "flush 之后自己必须在册"
+        assert mine.state["weights"] == "v9", "flush 返回了，状态却还没到"
+    finally:
+        me.leave()
+
+
+def test_a_member_learns_it_was_replaced_without_being_asked(registry):
+    """RPC 被拒只挡住了走 TinyRay 的那部分。
+
+    旧 Worker 手里还有 GPU、推理服务和自己的 socket，它得被告知才能停掉那些。
+    """
+    me = tinyray.join("held", "stateful", slot=0)
+    me.ready()
+    fenced = threading.Event()
+
+    def watch() -> None:
+        if me.wait_fenced(timeout=30):
+            fenced.set()
+
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+
+    thief = subprocess.Popen(
+        [sys.executable, "-c", SEAT_THIEF],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert thief.stdout.readline().strip() == "READY"
+        assert fenced.wait(timeout=30), "座位被抢了，旧成员却没被告知"
+        assert not me.accepted
+    finally:
+        _stop(thief)
+        t.join(timeout=5)
+        try:
+            me.leave()
+        except Exception:
+            pass
+
+
+def test_wait_fenced_says_no_rather_than_hanging(registry):
+    """没被顶替就该有界地返回 False，不是永远等下去。"""
+    me = tinyray.join("held", "stateful", slot=0)
+    me.ready()
+    try:
+        t0 = time.monotonic()
+        assert me.wait_fenced(timeout=1.0) is False
+        assert time.monotonic() - t0 < 5
+    finally:
+        me.leave()
+
+
+def test_a_snapshot_answers_about_one_exact_tenure(registry):
+    """「那个 incarnation 还在吗」要在一份固定的快照里问。
+
+    对着活池子问两次，可能问到的是两个时刻。
+    """
+    me = tinyray.join("held", "stateful", slot=0)
+    me.ready()
+    try:
+        snap = tinyray.pool("held").snapshot()
+        assert snap.get(me.identity) is not None
+        assert snap.get(f"held/0#{me.incarnation - 1}") is None, "旧任期不该被认成还在"
+        assert snap.slot(0).incarnation == me.incarnation
+    finally:
+        me.leave()
