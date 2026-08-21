@@ -1,0 +1,59 @@
+name: docs
+
+# Builds the site on every push to main and publishes it to GitHub Pages.
+#
+# Deploys from an artifact rather than a gh-pages branch: nothing is committed
+# back to the repository, so the docs cannot drift from the commit that built
+# them and a bad build never leaves anything behind to roll back.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and let a newer commit win rather than queueing behind
+# an older one. Cancelling in progress would be wrong here: a half-finished
+# deploy is worse than a slightly stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: python -m pip install --upgrade pip mkdocs-material
+
+      # --strict, so a dead link or an unresolved reference fails the build
+      # rather than shipping. Docs that quietly rot are how docs/README.md came
+      # to say "not implemented" while 0.5.0 was on PyPI.
+      - run: mkdocs build --strict
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

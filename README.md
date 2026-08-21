@@ -56,16 +56,30 @@ def watchdog():                        # 训练循环里查是没用的：卡住
 
 ## 文档
 
+**<https://hspk.github.io/tinyray/>**
+
 | 文档 | 内容 |
 |---|---|
-| [docs/01-why.md](docs/01-why.md) | 为什么 —— 问题、真实代价、现有工具为何不合身 |
-| [docs/02-design.md](docs/02-design.md) | 是什么 —— API、数据结构、进程模型、策略 |
-| [docs/03-plan.md](docs/03-plan.md) | 怎么做 —— 计划、代码预算、未测项 |
+| [上手](docs/getting-started.md) | 十分钟，从装上到两个进程互相调用 |
+| [API 参考](docs/api.md) | 完整接口，对着实现写的 |
+| [为什么](docs/01-why.md) | 问题、真实代价、现有工具为何不合身 |
+| [是什么](docs/02-design.md) | API、数据结构、进程模型、策略 |
+| [怎么做](docs/03-plan.md) | 计划、未测项、已定决策 |
+
+## 安装
+
+```bash
+pip install tinyray                    # wheel 里带着注册中心
+tinyray --listen 127.0.0.1:8760
+```
 
 ## 开发
 
 ```bash
 cargo build --release          # 需要 rustup 的 rustc，系统自带的太旧
 maturin develop --release
-pytest tests/ -q
+pytest tests/ -q               # 默认集
+pytest tests/ -q -m examples   # 示例，几分钟
+cargo test --workspace         # registry 与线上消息类型
+mkdocs serve                   # 文档站，需要 pip install mkdocs-material
 ```

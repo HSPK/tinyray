@@ -1,0 +1,68 @@
+site_name: tinyray
+site_description: 一本通讯录，加一次点名 —— 给异步 ML 作业用的成员关系层
+site_url: https://hspk.github.io/tinyray/
+repo_url: https://github.com/HSPK/tinyray
+repo_name: HSPK/tinyray
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: 切换到暗色
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到亮色
+
+nav:
+  - 首页: index.md
+  - 上手: getting-started.md
+  - API 参考: api.md
+  - 更新日志: changelog.md
+  - 为什么: 01-why.md
+  - 是什么: 02-design.md
+  - 怎么做: 03-plan.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/HSPK/tinyray
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/tinyray/
+
+not_in_nav: |
+  README.md

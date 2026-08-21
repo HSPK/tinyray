@@ -9,3 +9,6 @@ dist/
 
 # Internal design notes, kept out of the published repository.
 DESIGN.md
+
+# mkdocs build output
+site/
