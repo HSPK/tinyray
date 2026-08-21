@@ -81,6 +81,8 @@ impl Client {
             seen_epoch: AtomicU64::new(0),
             started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
+            revision: Mutex::new(0),
+            bell: std::sync::Condvar::new(),
         });
         Ok(Self {
             shared,
@@ -181,6 +183,37 @@ impl Client {
         cache
             .get(pool)
             .map(|c| (c.version, c.roster, c.size, c.methods.clone()))
+    }
+
+    /// The local cache's revision. It moves once per beat, after the ack has
+    /// been applied.
+    fn cache_revision(&self) -> u64 {
+        *self.shared.revision.lock().unwrap()
+    }
+
+    /// Block until the cache has moved past `since`, or `timeout_ms` elapses,
+    /// and return the revision now current.
+    ///
+    /// This is what every wait in the Python layer stands on. They were sleep
+    /// loops over the local cache -- the tightest turning 500 times a second
+    /// per pool -- which spent CPU to find out nothing had happened and still
+    /// added up to half a tick of latency when something had.
+    fn wait_revision(&self, py: Python<'_>, since: u64, timeout_ms: u64) -> u64 {
+        let s = self.shared.clone();
+        // Released, because this blocks: holding it would stop the very
+        // threads that might satisfy the caller.
+        py.allow_threads(move || {
+            let rev = s.revision.lock().unwrap();
+            if *rev != since {
+                return *rev;
+            }
+            // Spurious wakeups are fine: the caller re-checks what it wanted.
+            let (rev, _) = s
+                .bell
+                .wait_timeout(rev, std::time::Duration::from_millis(timeout_ms))
+                .unwrap();
+            *rev
+        })
     }
 
     fn leave(&self, py: Python<'_>) {

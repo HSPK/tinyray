@@ -36,6 +36,12 @@ class Client:
     def frozen(self, pool: str, require_ready: bool = ...) -> tuple[str, int, int] | None:
         """(members as JSON, their own fingerprint, the pool's), read together."""
 
+    def cache_revision(self) -> int:
+        """Moves once per beat, after the ack has been applied."""
+
+    def wait_revision(self, since: int, timeout_ms: int) -> int:
+        """Block until the cache moves past `since`. No polling anywhere."""
+
     def stats(self) -> dict[str, int]: ...
     def last_error(self) -> str: ...
     def refused(self) -> str: ...

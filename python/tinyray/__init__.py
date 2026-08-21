@@ -7,6 +7,7 @@ tensors.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import importlib.metadata as _metadata
 import json
@@ -20,7 +21,9 @@ from typing import Any
 from . import _rpc
 from ._errors import (
     Fenced,
+    NotDelivered,
     NotFound,
+    OutcomeUnknown,
     OversizeWarning,
     PolicyError,
     RemoteError,
@@ -30,6 +33,7 @@ from ._errors import (
     Unreachable,
 )
 from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
+from ._serve import CallContext
 from ._serve import MethodServer as _MethodServer
 from ._tinyray import Client as _Client
 
@@ -51,6 +55,8 @@ __all__ = [
     "AsyncHandle",
     "AsyncPool",
     "Epoch",
+    "CallContext",
+    "Snapshot",
     "Stale",
     "SeatTaken",
     "NotFound",
@@ -58,6 +64,8 @@ __all__ = [
     "OversizeWarning",
     "TinyrayError",
     "Unreachable",
+    "NotDelivered",
+    "OutcomeUnknown",
     "Fenced",
     "RemoteError",
     "apool",
@@ -212,6 +220,59 @@ class Epoch:
         return f"<Epoch {self.pool} members={len(self.members)} roster={self.roster} {state}>"
 
 
+class Snapshot:
+    """One pool as it stood at a revision, unready members included.
+
+    `all()` answers "who can I use", so it leaves out anyone who has taken a
+    seat and not yet said it is ready. That is the wrong question while a round
+    is being prepared: the seat is taken, so nobody else may have it, and the
+    occupant will be there in a moment. Asking `all()` then reports it missing.
+
+    Every entry carries its own `incarnation` and `ready`, which is what makes
+    two snapshots comparable: a seat that went quiet, a seat that changed hands
+    and a member that merely stopped being ready look nothing alike, and each
+    of them wants a different reaction.
+    """
+
+    __slots__ = ("pool", "revision", "members")
+
+    def __init__(self, pool_name: str, revision: int, members: list[Handle]):
+        self.pool = pool_name
+        self.revision = revision
+        self.members = members
+
+    def __len__(self) -> int:
+        return len(self.members)
+
+    def __iter__(self):
+        return iter(self.members)
+
+    def ready(self) -> list[Handle]:
+        return [h for h in self.members if h.ready]
+
+    def slot(self, k: int) -> Handle | None:
+        """The occupant of seat k, ready or not, or None if it is empty."""
+        for h in self.members:
+            if h.slot == k:
+                return h
+        return None
+
+    def get(self, identity: str) -> Handle | None:
+        """The member with this exact identity, tenure included, or None.
+
+        Asked of a snapshot rather than of the pool on purpose: "is that
+        incarnation still there" is a question about one moment, and asking the
+        live pool twice can answer about two.
+        """
+        for h in self.members:
+            if h.identity == identity:
+                return h
+        return None
+
+    def __repr__(self) -> str:
+        return f"<Snapshot {self.pool} rev={self.revision} members={len(self.members)}>"
+
+
 class Pool:
     """One group. Lookups read the local cache: no network, so no timeouts."""
 
@@ -235,14 +296,20 @@ class Pool:
         pay it at startup instead.
         """
         deadline = time.monotonic() + _FIRST_ANSWER_S
-        while self._c.pool_info(self._name) is None and time.monotonic() < deadline:
+        while True:
+            rev = self._c.cache_revision()
+            if self._c.pool_info(self._name) is not None:
+                return
             # A registry that is not answering will not answer this either, and
             # waiting on it would make every new pool cost the full deadline --
             # measured 10s for five pools. Losing the registry must not stall
             # lookups.
             if self._c.silence_ms > self._lease_ms() // 2:
                 return
-            time.sleep(0.002)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            self._c.wait_revision(rev, int(left * 1000) + 1)
 
     def _members(self, filt: dict[str, Any], require_ready: bool) -> list[Handle]:
         self._settle()
@@ -253,6 +320,50 @@ class Pool:
         methods = tuple(info[3]) if info else ()
         return [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
 
+    def snapshot(self, include_unready: bool = True) -> Snapshot:
+        """The pool as it stands, with the revision it stood at.
+
+        Read under one lock, so the members and the revision cannot come from
+        two different moments -- which is the same reason epoch() takes its
+        list and its fingerprint together.
+        """
+        self._settle()
+        rev = self._c.cache_revision()
+        info = self._c.pool_info(self._name)
+        raw = self._c.lookup(self._name, "{}", not include_unready)
+        methods = tuple(info[3]) if info else ()
+        members = [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
+        return Snapshot(self._name, rev, members)
+
+    def changes(self, since: int | None = None, timeout: float | None = None):
+        """Yield a fresh snapshot every time this pool moves. Never polls.
+
+        Deliberately a stream of snapshots rather than of events. The client
+        sees the pool at heartbeat cadence, and the registry collapses whatever
+        happened in between: a member that went ready and unready again inside
+        one interval arrives as one entry carrying its current state, not as
+        two events. An event stream would therefore promise a completeness the
+        wire cannot deliver. A snapshot promises what it can -- you never miss
+        a state, only the transitions nobody could have observed -- and the
+        events are a diff away, because every entry carries its incarnation.
+        """
+        seen = self._c.cache_revision() if since is None else since
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            # A superseded member stops beating, so the bell stops ringing and
+            # a consumer would wait here for as long as it was willing to. Ends
+            # the stream instead: nothing more is coming.
+            if not self._c.accepted:
+                return
+            left = 3600.0 if deadline is None else deadline - time.monotonic()
+            if left <= 0:
+                return
+            now = self._c.wait_revision(seen, int(left * 1000) + 1)
+            if now == seen:
+                continue  # the wait timed out with nothing new to say
+            seen = now
+            yield self.snapshot()
+
     def all(self, **filt: Any) -> list[Handle]:
         return self._members(filt, require_ready=True)
 
@@ -262,8 +373,8 @@ class Pool:
             raise NotFound(f"no ready member of {self._name!r} matching {filt}")
         return random.choice(found)
 
-    def slot(self, k: int) -> Handle:
-        for h in self._members({}, require_ready=False):
+    def slot(self, k: int, require_ready: bool = False) -> Handle:
+        for h in self._members({}, require_ready=require_ready):
             if h.slot == k:
                 return h
         # Never silently substitute another member: routing a keyed request to
@@ -274,15 +385,17 @@ class Pool:
         """Block until `count` members match. Bounded, and the failure names them."""
         deadline = time.monotonic() + timeout
         while True:
+            rev = self._c.cache_revision()
             found = self._members(filt, require_ready=True)
             if len(found) >= count:
                 return found
-            if time.monotonic() >= deadline:
+            left = deadline - time.monotonic()
+            if left <= 0:
                 raise TimeoutError(
                     f"waited {timeout}s for {count} ready member(s) of "
                     f"{self._name!r} matching {filt}, saw {len(found)}"
                 )
-            time.sleep(0.05)
+            self._c.wait_revision(rev, int(left * 1000) + 1)
 
     def epoch(self, min: int | None = None, timeout: float = 60.0) -> Epoch:
         """Wait for the round to be complete, then freeze it.
@@ -316,16 +429,18 @@ class Pool:
                     f"cannot open a round of {self._name!r}: no contact with the "
                     f"registry for {self._c.silence_ms}ms"
                 )
+            rev = self._c.cache_revision()
             info = self._c.pool_info(self._name)
             if info is None:
                 # No answer about this pool yet, so there is no fingerprint to
                 # freeze. min=0 used to reach the line below and crash on it.
-                if time.monotonic() >= deadline:
+                left = deadline - time.monotonic()
+                if left <= 0:
                     raise TimeoutError(
                         f"waited {timeout}s to open a round of {self._name!r}: "
                         f"the registry has said nothing about it"
                     )
-                time.sleep(0.02)
+                self._c.wait_revision(rev, int(left * 1000) + 1)
                 continue
             target = min if min is not None else info[2]
             if target is None:
@@ -337,7 +452,8 @@ class Pool:
                 found, mismatched = len(members), ours != whole
                 if found >= target and not mismatched:
                     return Epoch(self._name, self._c, members, whole)
-            if time.monotonic() >= deadline:
+            left = deadline - time.monotonic()
+            if left <= 0:
                 if mismatched and found >= target:
                     raise TimeoutError(
                         f"waited {timeout}s to open a round of {self._name!r}: "
@@ -350,7 +466,7 @@ class Pool:
                     f"waited {timeout}s to open a round of {self._name!r}: "
                     f"{found} of {target} present"
                 )
-            time.sleep(0.02)
+            self._c.wait_revision(rev, int(left * 1000) + 1)
 
     def _lease_ms(self) -> int:
         return max(int(self._c.stats().get("interval_ms", 1000)) * 4, 1000)
@@ -373,15 +489,24 @@ class Member:
         slot: int | None,
         incarnation: int,
         server: _MethodServer | None = None,
+        ident: int | None = None,
     ):
         self._c = client
         self._server = server
         self.pool = pool_name
         self.slot = slot
         self.incarnation = incarnation
+        self._ident = slot if ident is None else ident
         self._state: dict[str, Any] = {}
         self._left = False
         self._pid = os.getpid()
+
+    @property
+    def identity(self) -> str:
+        """The same string a peer holding a Handle to this process would use,
+        and the same one that rides on every call this process makes."""
+        seat = self.slot if self.slot is not None else self._ident
+        return f"{self.pool}/{seat}#{self.incarnation}"
 
     def _mine(self) -> None:
         if os.getpid() != self._pid:
@@ -415,6 +540,75 @@ class Member:
                 f"reference and let peers fetch the payload themselves"
             )
         return raw
+
+    def set_ready(self, state: dict[str, Any] | None = None) -> Member:
+        """Replace the published state outright, rather than merging into it.
+
+        `ready(**kw)` merges, which means there has been no way to take a key
+        back: publish `stale=True` once and it is there for the life of the
+        process. A weight switch wants the whole picture replaced at once, not
+        layered over the last one.
+        """
+        self._mine()
+        fresh = dict(state or {})
+        raw = self._encode_state(fresh)
+        self._state = fresh
+        self._c.set_state(raw, True)
+        return self
+
+    def flush(self, timeout: float = 10.0) -> Member:
+        """Block until the registry has been told what was last published.
+
+        ready() and set_ready() only write locally and nudge the heartbeat, so
+        "published" and "visible to peers" are a beat apart. Reading your own
+        state back to find out is a round trip that says what this does.
+
+        Costs at most one extra beat: a beat already in flight was composed
+        before the change, so confirmation waits for the one after it.
+        """
+        self._mine()
+        target = self._c.stats()["beats_ok"] + 2
+        deadline = time.monotonic() + timeout
+        while True:
+            rev = self._c.cache_revision()
+            if self._c.stats()["beats_ok"] >= target:
+                return self
+            if not self._c.accepted:
+                raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(
+                    f"waited {timeout}s for the registry to take this state; "
+                    f"last error was {self._c.last_error()!r}"
+                )
+            self._c.wait_revision(rev, int(left * 1000) + 1)
+
+    def wait_fenced(self, timeout: float | None = None) -> bool:
+        """Block until a later tenure has taken this seat. True if it has.
+
+        The RPC layer already refuses calls to a superseded member, but only
+        the ones that go through tinyray. A process holding a GPU, an inference
+        server and a socket of its own has to be told, so it can stop those too.
+
+        Learning it needs contact: while the registry is unreachable this stays
+        blocked, because nothing here can know. That is the same reason losing
+        the registry does not stop a training run -- and it means this is not
+        protection against a partition, only against being replaced.
+        """
+        self._mine()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            rev = self._c.cache_revision()
+            if not self._c.accepted:
+                return True
+            left = 3600.0 if deadline is None else deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self._c.wait_revision(rev, int(left * 1000) + 1)
+
+    async def await_fenced(self, timeout: float | None = None) -> bool:
+        """wait_fenced() for an event loop, waiting on a thread."""
+        return await asyncio.to_thread(self.wait_fenced, timeout)
 
     def unready(self) -> Member:
         self._mine()
@@ -536,9 +730,16 @@ def join(
     url: str | None = None,
     serves: Any = None,
     exclusive: bool = False,
+    max_concurrency: int | None = None,
     timeout: float = FIRST_BEAT_S,
 ) -> Member:
     """Report in. One line per process.
+
+    `max_concurrency` bounds how many calls this process will run at once.
+    Past it callers are refused rather than queued, and a refusal is bounded
+    where an unbounded thread count is not -- a hundred workers all pulling at
+    the same moment is otherwise a hundred threads. The refusal arrives as
+    NotDelivered, because nothing ran, so retrying elsewhere is safe.
 
     `timeout` is how long to keep trying before giving up on the registry.
     Launchers routinely start ranks before it is listening, so waiting is the
@@ -577,7 +778,9 @@ def join(
     methods: list[str] = []
     if serves is not None:
         seat = slot if slot is not None else ident
-        server = _MethodServer(serves, f"{pool}/{seat}#{incarnation}")
+        server = _MethodServer(
+            serves, f"{pool}/{seat}#{incarnation}", max_concurrency=max_concurrency
+        )
         methods = server.methods
         url = url or server.url(_advertise())
 
@@ -608,8 +811,14 @@ def join(
         # and a name that does not resolve: join() returned in 0.0s to 5.0s
         # with accepted=True, zero beats through and its own pool empty.
         deadline = time.monotonic() + timeout
-        while not c.stats()["beats_ok"] and time.monotonic() < deadline:
-            time.sleep(0.02)
+        while not c.stats()["beats_ok"]:
+            rev = c.cache_revision()
+            if c.stats()["beats_ok"]:
+                break
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            c.wait_revision(rev, int(left * 1000) + 1)
         if not c.stats()["beats_ok"]:
             c.leave()
             if server is not None:
@@ -644,7 +853,8 @@ def join(
         )
     _client = c
     _owner_pid = os.getpid()
-    member = Member(c, pool, slot, incarnation, server)
+    _rpc.set_identity(f"{pool}/{slot if slot is not None else ident}#{incarnation}")
+    member = Member(c, pool, slot, incarnation, server, ident)
     # A process that exits normally should say goodbye, so the seat frees up
     # immediately instead of waiting out the lease. SIGKILL still falls back
     # to lease expiry -- both paths work, they just differ in speed.
@@ -668,6 +878,26 @@ class AsyncPool(Pool):
     """
 
     _handle_cls = AsyncHandle
+
+    async def achanges(self, since: int | None = None, timeout: float | None = None):
+        """`changes()` for an event loop. Waits on the client's bell, on a
+        thread, so the loop keeps turning while nothing is happening."""
+        seen = self._c.cache_revision() if since is None else since
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            # A superseded member stops beating, so the bell stops ringing and
+            # a consumer would wait here for as long as it was willing to. Ends
+            # the stream instead: nothing more is coming.
+            if not self._c.accepted:
+                return
+            left = 3600.0 if deadline is None else deadline - time.monotonic()
+            if left <= 0:
+                return
+            now = await asyncio.to_thread(self._c.wait_revision, seen, int(left * 1000) + 1)
+            if now == seen:
+                continue
+            seen = now
+            yield self.snapshot()
 
 
 def _require_client() -> _Client:

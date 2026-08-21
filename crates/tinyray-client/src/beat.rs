@@ -13,7 +13,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 use tinyray_proto::{Beat, BeatAck, Member};
 use tokio::sync::Notify;
@@ -65,9 +65,25 @@ pub struct Shared {
     /// pool or declaring readiness costs a full heartbeat interval of silence,
     /// which is long enough for short-lived peers to come and go unseen.
     pub wake: Notify,
+    /// Rung once per beat, after the cache has been written. Waiters block on
+    /// this instead of polling: every wait in the Python layer was a sleep
+    /// loop, the tightest of them turning 500 times a second per pool.
+    ///
+    /// A std condvar rather than a tokio one on purpose -- it is waited on
+    /// from Python threads, and it has to keep working after leave() has taken
+    /// the runtime away.
+    pub revision: Mutex<u64>,
+    pub bell: Condvar,
 }
 
 impl Shared {
+    /// One tick of the bell, rung after the cache has been written so a waiter
+    /// woken by it sees the new cache rather than the old one.
+    pub fn ring(&self) {
+        *self.revision.lock().unwrap() += 1;
+        self.bell.notify_all();
+    }
+
     pub fn mark_ok(&self) {
         self.last_ok_ms
             .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -268,6 +284,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                     if !alive {
                         // Superseded. Beating on would only be waiting for the
                         // replacement to die so we could take the seat back.
+                        shared.ring();
                         return;
                     }
                 }
@@ -279,6 +296,8 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                     *shared.last_error.lock().unwrap() = why;
                 }
             }
+            // Whatever the beat did, somebody may be waiting on the answer.
+            shared.ring();
             let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
             // Wake early if the process has something new to say.
             let _ = tokio::time::timeout(Duration::from_millis(ms), shared.wake.notified()).await;
@@ -299,7 +318,7 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
         let beat = s.compose();
         // join() and leave() are one-shot and a caller is waiting, so they get
         // a fixed budget rather than the loop's.
-        match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
+        let out = match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
             Ok(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.apply(&ack, &beat.watch);
@@ -312,6 +331,8 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
                 *s.last_error.lock().unwrap() = why;
                 false
             }
-        }
+        };
+        s.ring();
+        out
     })
 }
