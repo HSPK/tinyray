@@ -235,3 +235,98 @@ def test_a_superseded_member_does_not_leave_its_watcher_hanging(registry):
             me.leave()
         except Exception:
             pass
+
+
+REPUBLISH = textwrap.dedent(
+    """
+    import sys, time, tinyray
+    with tinyray.join("pub", "churn") as me:
+        me.ready(v=0)
+        print("READY", flush=True)
+        for i in range(1, 4):
+            time.sleep(1.5)
+            me.ready(v=i)          # 已经 ready 过，这次只是改 state
+        print("DONE", flush=True)
+        sys.stdin.readline()
+    """
+)
+
+
+def test_republishing_state_reaches_a_watcher(registry):
+    """ready() 之后再 ready 只改 state —— 名单没变，指纹也不变。
+
+    订阅方必须照样看得到：roster 指纹不动是有意的（「还是不是同一批人」），
+    但 version 会动，而 changes() 跟的是 version。
+    """
+    me = tinyray.join("obs", "churn")
+    me.ready()
+    pool = tinyray.pool("pub")
+    start = pool.snapshot()
+
+    seen: list[int] = []
+    done = threading.Event()
+
+    def watch() -> None:
+        for snap in pool.changes(since=start.revision, timeout=25):
+            for h in snap:
+                if h.state.get("v") is not None:
+                    seen.append(h.state["v"])
+            if 3 in seen:
+                done.set()
+                return
+
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+    pub = subprocess.Popen(
+        [sys.executable, "-c", REPUBLISH],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert pub.stdout.readline().strip() == "READY"
+        assert done.wait(timeout=25), f"没收到全部更新，只看到 {seen}"
+        assert [1, 2, 3] == [v for v in seen if v in (1, 2, 3)][:3], seen
+    finally:
+        _stop(pub)
+        t.join(timeout=5)
+        me.leave()
+
+
+def test_a_quiet_pool_does_not_wake_its_watcher(registry):
+    """铃每拍都响，但只有池子真的动了才该产出快照。
+
+    修复前实测：14 秒里 25 次产出，其中只有 4 次是真的变化 —— 84% 是空转。
+    5000 成员时一份快照要 10.6ms，那些全是白烧的。消费者还得自己 diff 才能
+    知道有没有变，等于把这个 API 的意义抵消掉了。
+    """
+    me = tinyray.join("obs", "churn")
+    me.ready()
+    pool = tinyray.pool("quiet")
+    start = pool.snapshot()
+
+    got: list[int] = []
+
+    def watch() -> None:
+        for snap in pool.changes(since=start.revision, timeout=4):
+            got.append(snap.revision)
+
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+    t.join(timeout=20)
+
+    # ttl 2000 -> 每 500ms 一拍，4 秒里铃会响 8 次上下。一次都不该产出。
+    assert got == [], f"没人动，却产出了 {len(got)} 份快照: {got[:5]}"
+    me.leave()
+
+
+def test_the_revision_is_the_pools_own_and_not_a_local_tick(registry):
+    """revision 要能跨进程对齐，才谈得上「从这个位置接着往下看」。"""
+    me = tinyray.join("obs", "churn")
+    me.ready()
+    pool = tinyray.pool("obs")
+    snap = pool.snapshot()
+    assert snap.revision == pool._c.pool_info("obs")[0], (
+        "revision 必须是池子的版本号，不是客户端自己的拍数"
+    )
+    me.leave()

@@ -160,8 +160,8 @@ impl Client {
     }
 
     /// The members of `pool` matching `require_ready`, the fingerprint they
-    /// add up to, and the fingerprint the registry holds for the whole pool --
-    /// all read under one lock.
+    /// add up to, the fingerprint the registry holds for the whole pool, and
+    /// the pool's version -- all read under one lock.
     ///
     /// epoch() has to compare the last two, and taking them through separate
     /// calls let the beat loop land in between, so the list could come from
@@ -169,12 +169,17 @@ impl Client {
     /// members' own fingerprint here rather than in Python also keeps one
     /// implementation of the hash: a second one would drift silently.
     #[pyo3(signature = (pool, require_ready=true))]
-    fn frozen(&self, pool: &str, require_ready: bool) -> Option<(String, u64, u64)> {
+    fn frozen(&self, pool: &str, require_ready: bool) -> Option<(String, u64, u64, u64)> {
         let cache = self.shared.cache.read().unwrap();
         let c = cache.get(pool)?;
         let members = pick_from(c, &serde_json::Value::Null, require_ready);
         let mine = members.iter().fold(0u64, |acc, m| acc ^ m.roster_hash());
-        Some((serde_json::to_string(&members).unwrap(), mine, c.roster))
+        Some((
+            serde_json::to_string(&members).unwrap(),
+            mine,
+            c.roster,
+            c.version,
+        ))
     }
 
     /// Version and roster fingerprint of a cached pool, or None if unseen.
