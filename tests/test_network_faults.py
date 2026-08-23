@@ -71,23 +71,38 @@ def test_a_dropped_packet_does_not_hang_join_forever(registry):
         proxy.close()
 
 
-@pytest.mark.parametrize("seed", [11, 12, 13, 14, 15])
-def test_a_lossy_link_still_lets_a_member_start(registry, seed):
+def test_a_lossy_link_still_lets_a_member_start(registry):
     """一条只是丢包的链路不该把 rank 拦在门外。
 
-    这是冒烟，不是回归：把截止时间调回 10 秒它照样 5/5 通过。10 秒时的失败率
-    实测 6.7%，5 次试验抓到的概率只有 29%。真正有判别力的那条在下面，
-    带 slow 标记。
+    这是冒烟，不是回归：把截止时间调回 10 秒它照样通过。真正有判别力的那条在
+    下面，带 slow 标记。
+
+    五个种子跑在一条测试里，容忍一次失败 —— 因为下面那条量过：30 秒截止时间、
+    40% 丢包下，单次启动仍有约 0.8% 会失败，没有归零。五次零容忍就是每跑一次
+    套件约 4% 概率乱叫，而这不是假设：它在 CI 上拦下过一次本该发布的版本
+    （0.7.0，seed 12，双核 runner）。
+
+    教人忽略一条测试比没有它更糟 —— 这是同一条原则，下面那条测试写过一次。
+    代价是判别力：容忍一次时，它抓住"启动在丢包链路上彻底坏掉"的能力仍然很强
+    （五次里要坏两次才会红），但抓不住"失败率从 0.8% 涨到 20%"这种程度的退化。
+    那种退化归下面那条 slow 测试管。
     """
-    proxy = FaultyProxy(registry.endpoint, drop_rate=0.4, seed=seed)
-    try:
-        # run_against 已经断言了退出码 —— join() 抛 Unreachable 就是失败。
-        # 不断言"能看见自己"：ready() 要等下一拍才生效，那是另一件事的时序。
-        ok, failed, _ = run_against(proxy, seconds=3, timeout=90)
-        assert failed > 0, "这一轮没丢到包，等于没测"
-        assert ok >= 1, "一拍都没落地却返回了成功"
-    finally:
-        proxy.close()
+    failures = []
+    for seed in (11, 12, 13, 14, 15):
+        proxy = FaultyProxy(registry.endpoint, drop_rate=0.4, seed=seed)
+        try:
+            # run_against 已经断言了退出码 —— join() 抛 Unreachable 就是失败。
+            # 不断言"能看见自己"：ready() 要等下一拍才生效，那是另一件事的时序。
+            ok, failed, _ = run_against(proxy, seconds=3, timeout=90)
+            assert failed > 0, f"seed={seed} 没丢到包，等于没测"
+            assert ok >= 1, f"seed={seed} 一拍都没落地却返回了成功"
+        except AssertionError as e:
+            failures.append(f"seed={seed}: {e}"[-400:])
+        finally:
+            proxy.close()
+    assert len(failures) <= 1, f"{len(failures)}/5 次启动失败，超过实测到的 1/120:\n" + "\n".join(
+        failures[:2]
+    )
 
 
 BLACKHOLE_PROBE = textwrap.dedent(
