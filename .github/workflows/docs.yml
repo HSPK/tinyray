@@ -12,6 +12,10 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - ".github/workflows/docs.yml"
+      # docs/changelog.md is a symlink to this file, and git reports the change
+      # against the target, not the link -- so without this line every changelog
+      # edit builds nothing and the site silently keeps the previous release's.
+      - "CHANGELOG.md"
   workflow_dispatch:
 
 permissions:

@@ -9,6 +9,7 @@ docs/README.md 一路写着「提案阶段，当前未实现。代码已清空�
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import tinyray
@@ -77,3 +78,23 @@ def test_code_fences_in_the_guides_name_their_language():
                 bare.append(f"{p.name}:{n}")
             inside = not inside
     assert not bare, f"这些代码块没标语言: {bare}"
+
+
+def test_symlinked_docs_are_in_the_publish_trigger():
+    """软链的文档改了，站点却不会重建。
+
+    docs/changelog.md 指向仓库根的 CHANGELOG.md。git 把改动记在目标路径上，
+    所以 `paths: docs/**` 匹配不到它:0.7.1 的更新日志合进了 main，线上却还停在
+    0.7.0。发布流程里这种"没报错的沉默失败"最难发现,所以在这里钉住。
+    """
+    workflow = (ROOT / ".github/workflows/docs.yml").read_text()
+    escaped = [
+        p
+        for p in DOCS
+        if p.is_symlink()
+        and (target := pathlib.Path(os.readlink(p)))
+        and (p.parent / target).resolve().relative_to(ROOT).as_posix() not in workflow
+    ]
+    assert not escaped, (
+        f"这些文档是软链,目标不在 docs/ 下,也没写进 docs.yml 的 paths: {[p.name for p in escaped]}"
+    )
