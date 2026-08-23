@@ -267,11 +267,23 @@ def test_a_restart_whose_counter_climbs_past_ours_still_leaves_a_whole_roster(re
         registry.start()
 
         # Land one member at or below the position the observer still holds,
-        # and one above it.
+        # then keep going until the fresh counter is past it -- that overtaking
+        # is the whole point, and how many members it takes depends on how far
+        # the observer had got before the restart. Two was enough while a
+        # watcher lagged a beat behind; it syncs to the latest now, so it can
+        # be holding a higher number than two members will reach.
         placed.append(_spawn(NAMED, "mA"))
         _await_version(endpoint, "w", 1)
-        placed.append(_spawn(NAMED, "mB"))
-        _await_version(endpoint, "w", held + 1)
+        extra = 0
+        while _server_version(endpoint, "w") <= held:
+            extra += 1
+            assert extra <= 8, (
+                f"eight members did not take the fresh counter past {held}; "
+                f"it is at {_server_version(endpoint, 'w')}"
+            )
+            placed.append(_spawn(NAMED, f"m{extra}"))
+        assert extra >= 1, "nothing was placed above the observer's position"
+        expected = {"mA"} | {f"m{i}" for i in range(1, extra + 1)}
 
         os.kill(observer.pid, signal.SIGCONT)
 
@@ -279,11 +291,11 @@ def test_a_restart_whose_counter_climbs_past_ours_still_leaves_a_whole_roster(re
         view = _ask(observer)
         while time.monotonic() < deadline:
             view = _ask(observer)
-            if view["who"] == ["mA", "mB"]:
+            if set(view["who"]) == expected:
                 break
             time.sleep(0.1)
 
-        assert view["who"] == ["mA", "mB"], (
+        assert set(view["who"]) == expected, (
             f"the observer holds {view['who']} at version {view['version']}, but the "
             f"registry has {_server_version(endpoint, 'w')} with both members; it was "
             f"holding version {held} from the previous registry process"

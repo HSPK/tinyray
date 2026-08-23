@@ -20,9 +20,14 @@ def test_idle_heartbeats_do_not_bump_the_version(registry):
     me.ready(role="driver")
     tinyray.pool("env").wait(count=1, timeout=10)
 
+    # Let the join-and-ready sequence finish landing. wait() returns on the
+    # first ready member the cache shows, which can be a beat before the last
+    # of that sequence has reached the registry -- and a baseline taken then
+    # counts the tail of the arrival as if it were an idle beat.
+    time.sleep(registry.ttl_ms / 1000 / 2)
     start_version = _version("env")
     start_beats = me.stats()["beats_ok"]
-    time.sleep(registry.ttl_ms / 1000 * 1.5)  # several heartbeats, no changes
+    time.sleep(registry.ttl_ms / 1000 * 3)  # a dozen heartbeats, no changes
 
     beats = me.stats()["beats_ok"] - start_beats
     assert beats >= 3, f"expected several heartbeats, saw {beats}"

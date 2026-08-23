@@ -40,6 +40,7 @@ fn beat(pool: &str, id: u64) -> Beat {
         methods: Vec::new(),
         watch: Vec::new(),
         seen: HashMap::new(),
+        hold_ms: 0,
     }
 }
 

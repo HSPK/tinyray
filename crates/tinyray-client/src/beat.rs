@@ -55,6 +55,11 @@ pub struct Shared {
     /// with, as opposed to the seat being held by a later tenure.
     pub refused: Mutex<String>,
     pub interval_ms: AtomicU64,
+    /// How long we let the registry sit on an answer that says nothing. Set to
+    /// the interval we would otherwise have slept, so the request rate is the
+    /// one the polling had and the delay before hearing about a change becomes
+    /// a round trip instead of an interval.
+    pub hold_ms: AtomicU64,
     /// Monotonic ms of the last successful beat. Freezing a round on a stale
     /// roster is unsafe, so epoch() needs to know when we are flying blind.
     pub last_ok_ms: AtomicU64,
@@ -117,6 +122,7 @@ impl Shared {
             methods: self.methods.clone(),
             watch,
             seen,
+            hold_ms: self.hold_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -195,8 +201,24 @@ type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Ful
 /// us beating. It has to stay well inside the interval, or one drop costs the
 /// lease: at a 500 ms interval a five-second timeout meant a single lost packet
 /// took the member out of the roster.
-fn beat_timeout(interval_ms: u64) -> Duration {
-    Duration::from_millis(interval_ms.clamp(50, 30_000) * 3 / 4)
+/// The closest two beats from one member may be. Only reachable when a watched
+/// pool is changing constantly, and it caps that at twenty beats a second
+/// rather than as fast as the network will go.
+const MIN_GAP: Duration = Duration::from_millis(50);
+
+fn beat_timeout(interval_ms: u64, hold_ms: u64) -> Duration {
+    if hold_ms == 0 {
+        return Duration::from_millis(interval_ms.clamp(50, 30_000) * 3 / 4);
+    }
+    // The registry may sit on this for `hold_ms` plus its own jitter, and that
+    // is the answer arriving on time rather than late. Giving up before then
+    // would turn every quiet interval into a failed beat.
+    //
+    // Proportional, never a flat margin. A constant put the deadline past the
+    // lease at short leases -- 2.6s of waiting against a 2s lease -- so one
+    // dropped packet cost the seat, which is exactly what a bounded beat is
+    // for. Held at hold * 1.5 it stays at 0.44 of a lease whatever the lease.
+    Duration::from_millis(hold_ms + hold_ms / 2 + 200)
 }
 
 async fn post(
@@ -273,11 +295,36 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 // One final beat carrying `leaving` was already sent by leave().
                 return;
             }
+            let started = std::time::Instant::now();
             let beat = shared.compose();
             let interval = shared.interval_ms.load(Ordering::Relaxed);
-            match post(&http, &shared.endpoint, &beat, beat_timeout(interval)).await {
+            let hold = shared.hold_ms.load(Ordering::Relaxed);
+            let budget = beat_timeout(interval, hold);
+            // A held request is the loop's resting place, so this is also
+            // where a publish has to be able to interrupt it. Dropping the
+            // future resets the stream; the registry has already renewed the
+            // lease from the request that arrived, and a beat is idempotent,
+            // so nothing is lost by abandoning the answer.
+            let sending = post(&http, &shared.endpoint, &beat, budget);
+            tokio::pin!(sending);
+            let outcome = tokio::select! {
+                done = &mut sending => Some(done),
+                _ = shared.wake.notified(), if hold > 0 => None,
+            };
+            let Some(outcome) = outcome else {
+                // Something to publish. Go straight back round with it.
+                continue;
+            };
+            match outcome {
                 Ok(ack) => {
                     shared.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
+                    // Ask to be parked for the interval we would have slept.
+                    // Same number of requests as the polling this replaces;
+                    // the difference is that the answer now arrives when
+                    // something happens rather than when the timer says so.
+                    shared
+                        .hold_ms
+                        .store((ack.ttl_ms / 4).clamp(50, 30_000), Ordering::Relaxed);
                     let alive = shared.apply(&ack, &beat.watch);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     shared.mark_ok();
@@ -298,9 +345,21 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             }
             // Whatever the beat did, somebody may be waiting on the answer.
             shared.ring();
-            let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
-            // Wake early if the process has something new to say.
-            let _ = tokio::time::timeout(Duration::from_millis(ms), shared.wake.notified()).await;
+            if hold == 0 {
+                let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
+                // Wake early if the process has something new to say.
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(ms), shared.wake.notified()).await;
+            } else {
+                // The wait now happens inside the request, so the only reason
+                // to pause is to keep a pool that changes constantly from
+                // turning this into a spin: the answer would come back at once
+                // every time, and we would ask again just as fast.
+                let spent = started.elapsed();
+                if spent < MIN_GAP {
+                    let _ = tokio::time::timeout(MIN_GAP - spent, shared.wake.notified()).await;
+                }
+            }
         }
     });
     rt
@@ -315,12 +374,15 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
             .timer(TokioTimer::new())
             .http2_only(true)
             .build_http();
-        let beat = s.compose();
-        // join() and leave() are one-shot and a caller is waiting, so they get
-        // a fixed budget rather than the loop's.
+        let mut beat = s.compose();
+        // One-shot, with a caller waiting: never parked, and given a fixed
+        // budget rather than the loop's.
+        beat.hold_ms = 0;
         let out = match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
             Ok(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
+                s.hold_ms
+                    .store((ack.ttl_ms / 4).clamp(50, 30_000), Ordering::Relaxed);
                 s.apply(&ack, &beat.watch);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
                 s.mark_ok();

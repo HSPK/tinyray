@@ -9,6 +9,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 use crate::state::Registry;
@@ -18,6 +19,47 @@ use crate::state::Registry;
 /// megabytes left room for a single member to hand the registry something it
 /// would then copy to every subscriber.
 const MAX_BODY: usize = 512 << 10;
+
+/// Answer a beat, holding the answer back while there is nothing to say.
+///
+/// The lease is renewed by `beat()` the moment the request lands -- only the
+/// *reply* waits. Holding the renewal too would let a member expire while it
+/// was parked, which is the opposite of the point.
+///
+/// Callers that ask for no hold, including every client that predates the
+/// field, are answered immediately and see none of this.
+async fn hold(reg: &Registry, beat: &tinyray_proto::Beat) -> tinyray_proto::BeatAck {
+    let mut ack = reg.beat(beat);
+    // Capped at half a lease: a member is renewed by the arrival of its beat,
+    // so parking longer than that would starve its own lease.
+    let budget = beat.hold_ms.min(reg.ttl.as_millis() as u64 / 2);
+    if budget == 0 || !ack.accepted || !ack.pools.is_empty() || beat.watch.is_empty() {
+        return ack;
+    }
+    // Up to an eighth of the budget, keyed off the caller so it is stable for
+    // them and spread across everyone else. A pool watched by thousands wakes
+    // all of them at once; measured at 40,000 parked on one pool, that single
+    // change cost 1.75 core-seconds, and arriving together is what makes it a
+    // spike rather than a shoulder.
+    let jitter = beat.id % (budget / 8 + 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(budget + jitter);
+    let bell = Arc::new(tokio::sync::Notify::new());
+    loop {
+        // Register first, then look. The other order loses a change that lands
+        // between the look and the wait, and the caller then waits out the
+        // whole budget holding an answer that was already stale.
+        reg.park(&beat.watch, &bell);
+        let waiting = bell.notified();
+        let fresh = reg.deltas_for(beat);
+        if !fresh.is_empty() {
+            ack.pools = fresh;
+            return ack;
+        }
+        if tokio::time::timeout_at(deadline, waiting).await.is_err() {
+            return ack;
+        }
+    }
+}
 
 async fn handle(
     req: Request<hyper::body::Incoming>,
@@ -37,11 +79,11 @@ async fn handle(
                 Ok(b) => b.to_bytes(),
                 Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, b"{}".to_vec()),
             };
-            match serde_json::from_slice(&bytes) {
-                Ok(beat) => reply(
-                    StatusCode::OK,
-                    serde_json::to_vec(&reg.beat(&beat)).unwrap(),
-                ),
+            match serde_json::from_slice::<tinyray_proto::Beat>(&bytes) {
+                Ok(beat) => {
+                    let ack = hold(&reg, &beat).await;
+                    reply(StatusCode::OK, serde_json::to_vec(&ack).unwrap())
+                }
                 Err(e) => reply(
                     StatusCode::BAD_REQUEST,
                     serde_json::to_vec(&serde_json::json!({"error": e.to_string()})).unwrap(),

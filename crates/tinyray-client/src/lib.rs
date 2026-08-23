@@ -77,6 +77,7 @@ impl Client {
             last_error: Mutex::new(String::new()),
             refused: Mutex::new(String::new()),
             interval_ms: AtomicU64::new(1000),
+            hold_ms: AtomicU64::new(0),
             last_ok_ms: AtomicU64::new(0),
             seen_epoch: AtomicU64::new(0),
             started: std::time::Instant::now(),

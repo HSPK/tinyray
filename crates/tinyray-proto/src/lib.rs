@@ -104,6 +104,15 @@ pub struct Beat {
     /// Version of each watched pool already held locally.
     #[serde(default)]
     pub seen: HashMap<String, u64>,
+    /// How long this caller is willing to have its answer held back when there
+    /// is nothing to say. Zero -- and so any client that predates this field --
+    /// gets an immediate answer, exactly as before.
+    ///
+    /// A member sends the interval it would otherwise have slept, which keeps
+    /// the request rate identical to the polling it replaces and turns the
+    /// discovery delay from "up to one interval" into "one round trip".
+    #[serde(default)]
+    pub hold_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

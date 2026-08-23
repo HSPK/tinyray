@@ -20,6 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut watchers = 1usize;
     let mut offset = 0usize;
     let mut conns = 16usize;
+    let mut watch_pool = "load".to_string();
+    let mut hold = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -30,6 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--watchers" => watchers = args.next().unwrap().parse()?,
             "--offset" => offset = args.next().unwrap().parse()?,
             "--conns" => conns = args.next().unwrap().parse()?,
+            "--watch-pool" => watch_pool = args.next().unwrap(),
+            "--hold-ms" => hold = args.next().unwrap().parse()?,
             o => return Err(format!("unknown argument {o}").into()),
         }
     }
@@ -58,13 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let http = clients[i % conns].clone();
         let (ok, failed, ep) = (ok.clone(), failed.clone(), endpoint.clone());
         let lat = lat_us.clone();
+        let watch_pool = watch_pool.clone();
         tasks.push(tokio::spawn(async move {
             // Only the first member watches, mirroring the rule that a big
             // pool is watched by few: everyone watching everyone is O(N^2).
             // Only a few members watch: a big pool watched by everyone is
             // O(N^2) traffic, which is a design constraint, not a setting.
             let watch = if i < watchers {
-                vec!["load".to_string()]
+                vec![watch_pool.clone()]
             } else {
                 vec![]
             };
@@ -86,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     methods: vec![],
                     watch: watch.clone(),
                     seen: seen.clone(),
+                    hold_ms: hold,
                 };
                 let body = Full::new(Bytes::from(serde_json::to_vec(&beat).unwrap()));
                 let req = hyper::Request::builder()
