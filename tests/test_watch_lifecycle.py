@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 import textwrap
@@ -652,3 +653,43 @@ def test_readiness_can_be_watched_by_name(registry):
             time.sleep(0.05)
         w.close()
         assert got, "readiness 变了却没有产出"
+
+
+def test_each_event_loop_leaves_nothing_behind(registry):
+    """每个 `asyncio.run()` 用过 watch 之后，它的铃和管道都得还回去。
+
+    实测过没还的样子：101 次 `asyncio.run()` 之后 101 个铃、**210 个文件描述符**，
+    而且心跳每一拍都要往那 101 个死管道各写一次。
+
+    原来的清理只看弱引用死没死，而那一支**永远不会触发** —— 铃自己持有它的
+    loop，于是那条记录把 loop 一直吊着。真正会发生的是 loop 被**关闭**，
+    `asyncio.run()` 每次结束都会关。
+
+    这个坑本会话踩过一次：RPC 那个按 loop id 存的传输缓存，100 次调用留下 100
+    个条目、100 个 fd，而上限是 1024。同一个形状，换了个地方。
+    """
+    import gc
+
+    with tinyray.join("p", "churn") as me:
+        me.ready()
+
+        async def touch_a_watch() -> None:
+            async for _ in tinyray.apool("p").achanges(timeout=0.05):
+                pass
+
+        def open_fds() -> int:
+            return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+        asyncio.run(touch_a_watch())
+        gc.collect()
+        settled_fds, settled_bells = open_fds(), len(tinyray._bells)
+
+        for _ in range(30):
+            asyncio.run(touch_a_watch())
+        gc.collect()
+
+        assert len(tinyray._bells) <= settled_bells, (
+            f"30 个事件循环之后还留着 {len(tinyray._bells)} 个铃"
+        )
+        # 一次一个管道两个 fd，所以三十次没回收会是 60 个。
+        assert open_fds() <= settled_fds + 4, f"文件描述符从 {settled_fds} 涨到了 {open_fds()}"

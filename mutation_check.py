@@ -399,6 +399,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_a_watch_on_named_fields_ignores_the_rest",
     ),
     (
+        "a bell outlives the loop it belongs to",
+        PY_INIT,
+        "        if held is None or held.is_closed():",
+        "        if held is None:",
+        "tests/test_watch_lifecycle.py::test_each_event_loop_leaves_nothing_behind",
+    ),
+    (
         "the digest leaves out who the members are",
         RS_LIB,
         "            m.id.hash(&mut h);\n            m.incarnation.hash(&mut h);",

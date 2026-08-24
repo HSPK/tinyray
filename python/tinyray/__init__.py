@@ -439,9 +439,17 @@ def _loop_bell(client: _Client) -> _LoopBell:
     loop = asyncio.get_running_loop()
     # id() is reused once a loop is collected, which is how the RPC client
     # cache used to hand one loop's transport to another. Prune by the weak
-    # reference rather than trusting the number.
+    # reference rather than trusting the number -- and by whether the loop has
+    # been closed, which is the case that actually happens.
+    #
+    # Waiting for the weak reference alone never fired: a bell holds its own
+    # loop, so the entry kept the loop alive and the reference never died.
+    # Every asyncio.run() that touched a watch left one behind, with its pipe:
+    # measured at 101 bells and 210 descriptors after 101 of them, and the
+    # heartbeat writing into all 101 dead pipes on every beat.
     for key, (ref, bell) in list(_bells.items()):
-        if ref() is None:
+        held = ref()
+        if held is None or held.is_closed():
             bell.close()
             del _bells[key]
     key = id(loop)
