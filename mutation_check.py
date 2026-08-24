@@ -399,10 +399,24 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_a_watch_on_named_fields_ignores_the_rest",
     ),
     (
-        "a bell outlives the loop it belongs to",
+        "the per-loop cache is touched without a lock",
+        PY_RPC,
+        "_per_loop_lock = threading.Lock()\n\n\ndef per_loop",
+        "_per_loop_lock = contextlib.nullcontext()\n\n\ndef per_loop",
+        "tests/test_watch_lifecycle.py::test_loops_in_many_threads_do_not_close_each_others_pipes",
+    ),
+    (
+        "a forked child inherits the lock still held",
         PY_INIT,
-        "        if held is None or held.is_closed():",
-        "        if held is None:",
+        "    _live_watches.clear()\n    _rpc.reset_after_fork()",
+        "    _live_watches.clear()",
+        "tests/test_watch_lifecycle.py::test_a_child_forked_while_the_lock_was_held_can_still_watch",
+    ),
+    (
+        "a bell outlives the loop it belongs to",
+        PY_RPC,
+        "            if got is None or got.is_closed():",
+        "            if got is None:",
         "tests/test_watch_lifecycle.py::test_each_event_loop_leaves_nothing_behind",
     ),
     (

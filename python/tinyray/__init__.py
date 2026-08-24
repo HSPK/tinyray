@@ -436,29 +436,13 @@ _live_watches: weakref.WeakSet[_Watching] = weakref.WeakSet()
 
 
 def _loop_bell(client: _Client) -> _LoopBell:
-    loop = asyncio.get_running_loop()
-    # id() is reused once a loop is collected, which is how the RPC client
-    # cache used to hand one loop's transport to another. Prune by the weak
-    # reference rather than trusting the number -- and by whether the loop has
-    # been closed, which is the case that actually happens.
-    #
-    # Waiting for the weak reference alone never fired: a bell holds its own
-    # loop, so the entry kept the loop alive and the reference never died.
-    # Every asyncio.run() that touched a watch left one behind, with its pipe:
-    # measured at 101 bells and 210 descriptors after 101 of them, and the
-    # heartbeat writing into all 101 dead pipes on every beat.
-    for key, (ref, bell) in list(_bells.items()):
-        held = ref()
-        if held is None or held.is_closed():
-            bell.close()
-            del _bells[key]
-    key = id(loop)
-    got = _bells.get(key)
-    if got is not None and got[0]() is loop:
-        return got[1]
-    bell = _LoopBell(client, loop)
-    _bells[key] = (weakref.ref(loop), bell)
-    return bell
+    # Waiting for the weak reference to die never fired: a bell holds its own
+    # loop, so the entry kept that loop alive. What actually happens is the
+    # loop being closed, which asyncio.run() does every time. Left unclaimed,
+    # every run that touched a watch kept its pipe: measured at 101 bells and
+    # 210 descriptors after 101 of them, with the heartbeat writing into all
+    # 101 dead pipes on every beat.
+    return _rpc.per_loop(_bells, lambda loop: _LoopBell(client, loop), lambda bell: bell.close())
 
 
 def _left_ms(deadline: float | None) -> int | None:
@@ -1320,6 +1304,7 @@ def _after_fork() -> None:
     # closing: the parent still owns the descriptors.
     _bells.clear()
     _live_watches.clear()
+    _rpc.reset_after_fork()
 
 
 if hasattr(os, "register_at_fork"):

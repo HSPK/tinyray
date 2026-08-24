@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -693,3 +694,104 @@ def test_each_event_loop_leaves_nothing_behind(registry):
         )
         # 一次一个管道两个 fd，所以三十次没回收会是 60 个。
         assert open_fds() <= settled_fds + 4, f"文件描述符从 {settled_fds} 涨到了 {open_fds()}"
+
+
+def test_loops_in_many_threads_do_not_close_each_others_pipes(registry):
+    """一个线程回收旧铃的时候，别把另一个线程的描述符一起关了。
+
+    每个事件循环一个铃，而回收是**下一个来问的线程**顺手做的 —— 所以两个线程
+    会同时走到那段"先列出来，再逐个关掉"的代码。两个人关同一个铃，`os.close()`
+    就调了两次；而第一次释放掉的号码，内核会立刻发给下一个要 fd 的人。
+
+    实测没加锁的样子：8 个线程各跑 25 轮 `asyncio.run()`，**4 个线程在第 1 轮
+    就死了**，`OSError: [Errno 9] Bad file descriptor`。EBADF 只是能看见的那
+    一面：真正危险的是第二次 close 悄悄关掉了别人刚拿到的 fd。
+    """
+    with tinyray.join("threads", "churn") as me:
+        me.ready()
+        errors: list[str] = []
+
+        def worker() -> None:
+            async def go() -> None:
+                async for _ in tinyray.apool("threads").achanges(timeout=0.02):
+                    pass
+
+            for _ in range(25):
+                try:
+                    asyncio.run(go())
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                    return
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+
+        assert not errors, f"8 个线程并发用 watch，{len(errors)} 个出错：{errors[:4]}"
+
+
+FORK_WHILE_LOCKED = textwrap.dedent(
+    """
+    import asyncio, os, sys, threading, time, tinyray
+    from tinyray import _rpc
+
+    me = tinyray.join("forklock", "churn")
+    me.ready()
+
+    held = threading.Event()
+    def hog():
+        _rpc._per_loop_lock.acquire()   # 拿住不放，模拟 fork 正好撞上
+        held.set()
+        time.sleep(120)
+    threading.Thread(target=hog, daemon=True).start()
+    held.wait()
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            kid = tinyray.join("forklock", "churn")
+            kid.ready()
+            async def go():
+                async for _ in tinyray.apool("forklock").achanges(timeout=0.02):
+                    pass
+            asyncio.run(go())
+        except BaseException:
+            os._exit(3)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    print("CHILD_EXITED", os.waitstatus_to_exitcode(status), flush=True)
+    """
+)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
+def test_a_child_forked_while_the_lock_was_held_can_still_watch(registry):
+    """锁是跟着内存复制过去的，持锁的那个线程不是。
+
+    fork 只带走调用线程。如果分叉的那一刻另一个线程正在 per_loop 里面，子进程
+    拿到的就是一把**永远锁着**的锁，没有任何线程还能去释放它 —— 子进程第一次
+    用 watch 就永久卡住。实测：不重置是 5 秒后仍卡着（只能 kill），重置了是
+    0.10 秒正常退出。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", FORK_WHILE_LOCKED],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = p.communicate(timeout=25)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise AssertionError(
+            "fork 时锁正被别的线程持有，子进程卡在了第一次 watch 上："
+            f"stdout={out!r} stderr={err[-400:]!r}"
+        ) from None
+    assert "CHILD_EXITED 0" in out, f"stdout={out!r} stderr={err[-800:]!r}"

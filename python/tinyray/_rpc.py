@@ -11,10 +11,11 @@ import contextvars
 import itertools
 import json
 import sys
+import threading
 import warnings
 import weakref
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Callable, Iterator
+from typing import Any, TypeVar
 
 import httpx
 
@@ -73,6 +74,8 @@ _sync: httpx.Client | None = None
 # asyncio.run() calls landed on an id that had already been used.
 _loops: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], httpx.AsyncClient]] = {}
 
+_T = TypeVar("_T")
+
 
 def _sync_client() -> httpx.Client:
     # Reused: a fresh socket per call drains the ephemeral port range in
@@ -83,23 +86,59 @@ def _sync_client() -> httpx.Client:
     return _sync
 
 
-def _async_client() -> httpx.AsyncClient:
-    loop = asyncio.get_running_loop()
-    # Drop whatever belongs to a loop that has gone. Dropping the reference is
-    # what closes the sockets: the pool cannot be awaited shut once its loop
-    # is closed, so this is the only lever left.
-    for key, (ref, _) in list(_loops.items()):
-        held = ref()
-        if held is None or held.is_closed():
-            del _loops[key]
+# Eviction runs from whichever thread asks next, so two loops in two threads
+# reach it together. The lock is not decoration: without it, eight threads each
+# running asyncio.run() had four die on the first round with EBADF, because two
+# of them evicted the same entry and closed its descriptors twice -- and a
+# number freed by the first close goes straight to whoever asks next.
+_per_loop_lock = threading.Lock()
 
-    key = id(loop)
-    got = _loops.get(key)
-    if got is not None and got[0]() is loop:
-        return got[1]
-    client = httpx.AsyncClient(limits=_LIMITS)
-    _loops[key] = (weakref.ref(loop), client)
-    return client
+
+def per_loop(
+    cache: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], _T]],
+    make: Callable[[asyncio.AbstractEventLoop], _T],
+    drop: Callable[[_T], None] = lambda _: None,
+) -> _T:
+    """The one `_T` belonging to the running loop, made on first ask.
+
+    Anything held per loop -- a transport pool, a wakeup pipe -- has the same
+    two problems. It must be dropped once its loop closes, or the process
+    accumulates descriptors against a limit of 1024. And it cannot be found by
+    id() alone, because a freed loop's address is handed to the next one: 2 of
+    5 consecutive asyncio.run() calls landed on an id already used. So the
+    weak reference is checked as well as the number.
+    """
+    loop = asyncio.get_running_loop()
+    with _per_loop_lock:
+        for key, (ref, held) in list(cache.items()):
+            got = ref()
+            if got is None or got.is_closed():
+                cache.pop(key, None)
+                drop(held)
+        key = id(loop)
+        entry = cache.get(key)
+        if entry is not None and entry[0]() is loop:
+            return entry[1]
+        made = make(loop)
+        cache[key] = (weakref.ref(loop), made)
+        return made
+
+
+def reset_after_fork() -> None:
+    """Give the child a lock nobody holds.
+
+    A fork can land while another thread is inside per_loop, and the child
+    inherits the lock held with no thread left to release it -- the child then
+    hangs on its first watch, in native code with no Python frame to say why.
+    """
+    global _per_loop_lock
+    _per_loop_lock = threading.Lock()
+
+
+def _async_client() -> httpx.AsyncClient:
+    # Dropping the reference is what closes the sockets: the pool cannot be
+    # awaited shut once its loop is closed, so this is the only lever left.
+    return per_loop(_loops, lambda _: httpx.AsyncClient(limits=_LIMITS))
 
 
 def _app_stacklevel() -> int:
