@@ -45,7 +45,9 @@ MUTANTS = [
         RS_BEAT,
         "            for id in &d.removed {\n                c.members.remove(id);\n            }",
         "",
-        "tests/test_m1_delta.py",
+        # test_m1_delta.py does not see this one -- it checks that a delta
+        # arrives, not that a departure is applied.
+        "tests/test_m1_membership.py",
     ),
     (
         "an incremental delta is applied across a registry restart",
@@ -88,7 +90,7 @@ MUTANTS = [
         RS_STATE,
         "        } else if let Some(why) = disagreement(p, b) {",
         "        } else if let Some(why) = None::<String> {",
-        "tests/test_admission.py",
+        "tests/test_pool_shape.py",
     ),
     (
         "expired members are never swept",

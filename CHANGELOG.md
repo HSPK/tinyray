@@ -5,6 +5,100 @@
 
 ---
 
+## 0.11.0
+
+上一轮 API 使用方提的七条里做掉六条，另外五个 bug 是在此后的定期巡检里翻出来的。
+巡检的规矩是：先写脚本量，量到了再改；改完必须验证"把 bug 放回去，测试会变红"。
+
+### 新增
+
+**`pool.until(predicate)` / `auntil()`** —— 等条件的通用底座。
+
+每个手写的等待循环都要做对同样四件事：先看已经成立没有、把 revision 无缝交接
+过去、被 `close()` 时停下、`Fenced` 放出去而不是当成"条件还没满足"。第二件做错
+最难发现 —— 池子在"先看一眼"和"开始订阅"之间动了，等待就会为一个立刻成立的条件
+白等满整个超时。下面两个都是它的特例。
+
+**`await apool.await_ready(count, timeout, **filt)`** —— `Pool.wait()` 的事件
+循环版。`AsyncPool` 原先继承的是同步阻塞版，它在 loop 上不是"不够优雅"，是
+**停掉整个 loop**：实测一秒里只放过 **5** 次 10ms 的 tick，本该有一百次。
+用 `asyncio.to_thread` 包一层也不对 —— 取消它并不停掉底下的线程，整段等待都占着
+默认 executor 的一个 worker。
+
+**`pool.wait_departure(identity)` / `await_departure()`** —— 等指定任期离场。
+和 `wait_replacement()` 是两个问题：后者只在有人接任时才回答，前任只是走了、没人
+接手的话它会等满超时返回 `None`。要接手工作的一方通常只需要知道前任不在了。
+
+**只盯几个字段的 watch**：
+
+```python
+pool.changes(fields=["role", "ready"])
+```
+
+给了 `fields` 之后，只有这些字段（或成员进出、座位换人）真的动了才产出快照。
+比较发生在 **Rust 缓存里**，在任何东西被序列化之前 —— 5,000 成员实测
+`snapshot()` **8.78ms** 对 `field_digest()` **0.40ms**，**22 倍**。放在 Python
+层做 predicate 是省不下来的：它要拿到 `Snapshot` 才能判断，那时钱已经花完了。
+
+**`with tinyray.request_id("commit-42")`** —— 让重试共用一个名字。自动生成的
+id 每次都变，对追踪是对的、对幂等是错的；没有这个的话幂等 key 只能当普通参数
+一路传下去。用块而不是逐调用参数，因为重试本来就是块的形状，而关键字会和被调方
+自己的参数名打架。ContextVar 实现，跟着 `await` 走进这个块起的任务，不漏进邻居。
+
+**`stats()` 增加服务端与观察计数**：`calls` / `failed` / `refused` /
+`in_flight` / `peak_in_flight` / `busy_ms` / `concurrency_limit`（只有传了
+`serves=` 才有），以及 `watch_wakeups` / `state_bytes` / `pool_revision` /
+`watched_pools` / `short_polls`。
+
+这一半存在，是为了让"要不要给长调用单开一条通道"有答案而不是有观点。
+`max_concurrency` 挡的是无限堆积，**不是隔离**：槽位占满之后 control 调用一样
+吃 503。`refused` 和 `peak_in_flight` 摆在一起看就知道是不是正在发生。
+
+### 修复
+
+**被服务对象的 property 会在发现方法时被求值。** `getattr` 会执行描述符，而这个
+领域的服务对象满是 `device`、`model`、`step`。三种后果都实测过：有副作用的被触发
+一次；**会抛的那种直接让 `join(serves=...)` 失败**，报出 `RuntimeError: no GPU
+on this box` —— 一次应用根本没发起的调用；返回 callable 的被登记成了远程方法。
+现在问类不问实例。
+
+**`TINYRAY_ADVERTISE` 写成 `http://...` 会拼出坏地址却注册成功。** 六种人们实际
+会写的形式**四种是坏的**：`http://10.0.0.5` 拼成
+`http://http://10.0.0.5:33097`，`10.0.0.5:8080` 拼成 `http://10.0.0.5:8080:33097`。
+四种都注册成功，失败发生在别的进程、别的时刻。现在当场拒绝并说明正确写法；前后
+空白无歧义，直接修掉。
+
+**`CallContext` 只在参数排最后时才工作。** 放第一位或中间、调用方传位置参数就报
+`Expected CallContext, got int` —— 调用方根本不为注入的参数发值，位置对不上了。
+而这句话在怪调用方，问题却在被调方的签名顺序。现在按名传参，任何顺序都成立。
+多传一个参数改走 422 通道，调用方拿到 `TypeError` 而不是
+`OutcomeUnknown`（"可能已经执行过"）—— 什么都没跑过。
+
+**超大响应的告警指向 asyncio 内部。** `stacklevel` 写死为 4，同步方向对、异步
+方向错（协程跑起来时 `BoundMethod.__call__` 早已返回）。实测指向
+`asyncio/events.py:84`。而 `warnings` 按位置去重，于是所有异步超大告警折叠成一条
+被过滤掉 —— 第二次就彻底静默。现在向上走到第一个不属于 tinyray 的栈帧。
+
+**`Epoch` 和 `Snapshot` 说是冻结，其实是可变列表。** 实测
+`epoch.members.append(...)` 会让 `len(epoch)` 从 3 变 4。这份名单发给每个 rank 建
+同一个进程组，任何一次就地 `sort()` 都能让各 rank 分道扬镳 —— **从这个类型本身
+走进它要防的死锁**。现在交出元组。
+
+### 内部
+
+`Handle` 和 `AsyncHandle` 的方法查找合并成一份（原先 6 行里 5 行逐字相同）。
+新增 `lines.py` 统计代码行数（注释单列，它们装的是决策背后的实测数字）。
+变异条目从 22 增到 52，注册表状态机和客户端缓存首次纳入。
+
+### 要改什么
+
+- `Epoch.members` / `Snapshot.members` 现在是元组。`snap.members == [...]` 这样
+  和列表字面量比较的地方要改成比较内容。
+- `TINYRAY_ADVERTISE` 带 scheme 或端口的现在会抛 `ValueError` 而不是静默拼错。
+- 被服务对象上返回 callable 的 property 不再作为远程方法发布。
+
+---
+
 ## 0.10.0
 
 ### 行为变化
