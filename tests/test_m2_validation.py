@@ -205,3 +205,42 @@ def test_a_bare_host_is_taken_as_given(monkeypatch, value):
     很容易带上。"""
     monkeypatch.setenv("TINYRAY_ADVERTISE", value)
     assert tinyray._advertise() == value.strip()
+
+
+@pytest.mark.parametrize("bad", ["有中文", "a/b", "a?b", "a b", "a-b"])
+def test_a_method_name_that_cannot_be_a_url_is_refused(bad):
+    """方法名会进每一次调用的 URL 路径，所以必须扛得住放进去。
+
+    `def 处理(self)` 是合法 Python，登记也完全正常 —— 然后调用发过去问的是
+    `%E5%A4%84%E7%90%86`，被回以"没有这个方法"。空格一样。
+
+    斜杠和问号今天**侥幸能用**，理由还是错的：服务端把路径原样读回来了。
+    两端之间任何一个会规范化 URL 的东西一出现，它们就会停。所以一并拒绝。
+    """
+
+    class Served:
+        def fine(self) -> int:
+            return 1
+
+    setattr(Served, bad, lambda self: 2)
+    with pytest.raises(ValueError, match="ASCII identifier"):
+        _serve.scan(Served())
+
+
+def test_ordinary_method_names_are_untouched():
+    """对偶：正常的名字一个都不能少。"""
+
+    class Served:
+        def normal(self) -> int:
+            return 1
+
+        def with_underscore(self) -> int:
+            return 2
+
+        def n42(self) -> int:
+            return 3
+
+        def _private(self) -> int:
+            return 4
+
+    assert sorted(_serve.scan(Served())) == ["n42", "normal", "with_underscore"]

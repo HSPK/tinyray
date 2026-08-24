@@ -137,6 +137,13 @@ MUTANTS = [
         "tests/test_m2_validation.py::test_a_bare_host_is_taken_as_given",
     ),
     (
+        "a method name that cannot go in a URL is served anyway",
+        "python/tinyray/_serve.py",
+        "        if not (name.isascii() and name.isidentifier()):",
+        "        if False:",
+        "tests/test_m2_validation.py::test_a_method_name_that_cannot_be_a_url_is_refused",
+    ),
+    (
         "method discovery reads the instance and runs its properties",
         "python/tinyray/_serve.py",
         "        static = inspect.getattr_static(obj, name, _ABSENT)",

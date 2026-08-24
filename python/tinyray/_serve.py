@@ -89,8 +89,23 @@ def scan(obj: Any) -> dict[str, Callable[..., Any]]:
             attr = getattr(obj, name)
         else:
             continue
-        if callable(attr):
-            out[name] = attr
+        if not callable(attr):
+            continue
+        # The name goes in the URL path of every call, so it has to survive
+        # being put there. `def 处理(self)` is legal Python and registered
+        # fine, and then the call arrived asking for
+        # `%E5%A4%84%E7%90%86` and was answered "no such method". A space
+        # does the same. A slash or a question mark happen to work today,
+        # for the wrong reason -- the path is read back verbatim -- and would
+        # stop the moment anything normalised the URL between the two ends.
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(
+                f"{type(obj).__name__}.{name} cannot be served: a method name "
+                f"is put in the URL of every call, so it has to be an ASCII "
+                f"identifier. Rename it, or make it private with a leading "
+                f"underscore."
+            )
+        out[name] = attr
     return out
 
 
