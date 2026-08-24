@@ -18,7 +18,6 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
@@ -44,6 +43,11 @@ from ._serve import MethodServer as _MethodServer
 from ._tinyray import Client as _Client
 
 if _TYPE_CHECKING:
+    # Only ever used in annotations, and `from __future__ import annotations`
+    # keeps those as strings. Importing them for real would put `Callable` and
+    # `Sequence` in `tinyray.*`, where they are not part of anything.
+    from collections.abc import Callable, Sequence
+
     from ._rpc import BoundMethod
 
 try:

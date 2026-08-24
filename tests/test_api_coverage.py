@@ -134,7 +134,20 @@ def test_member_accepted_and_silence_and_stats(svc):
     assert svc.accepted is True
     assert svc.silence_ms >= 0
     stats = svc.stats()
-    assert set(stats) == {"beats_ok", "beats_failed", "interval_ms", "silence_ms"}
+    # 钉的是精确集合，不是"至少包含"。多出一个键没人会发现，而它一旦出现就是
+    # 公开接口的一部分 —— 加键要在这里过一遍，是故意的摩擦。
+    assert set(stats) == {
+        "beats_ok",
+        "beats_failed",
+        "interval_ms",
+        "silence_ms",
+        "watch_wakeups",
+        "state_bytes",
+        "pool_revision",
+        "watched_pools",
+        # 这个 fixture 交出来的是 driver，它没有 serves=，所以没有服务端那一半。
+        # 服务端计数器由 tests/test_stats.py 单独盯。
+    }
     assert stats["beats_ok"] >= 1
 
 
