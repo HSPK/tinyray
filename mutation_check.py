@@ -111,8 +111,7 @@ MUTANTS = [
         PY_INIT,
         "        # that can be edited afterwards is not one.\n"
         "        self.members = tuple(members)",
-        "        # that can be edited afterwards is not one.\n"
-        "        self.members = list(members)",
+        "        # that can be edited afterwards is not one.\n        self.members = list(members)",
         "tests/test_m3_epoch.py::test_a_snapshot_cannot_be_edited_either",
     ),
     (
@@ -269,8 +268,8 @@ MUTANTS = [
     (
         "wait_replacement returns any occupant, not a new tenure",
         PY_INIT,
-        "                if now is not None and now.identity != was:\n                    return now\n        return None\n\n    def all(",
-        "                if now is not None:\n                    return now\n        return None\n\n    def all(",
+        "        return now is not None and now.identity != was",
+        "        return now is not None",
         "tests/test_watch_lifecycle.py::test_wait_replacement_names_the_new_tenure",
     ),
     (
@@ -312,7 +311,7 @@ MUTANTS = [
     (
         "the registry does not report its protocol on the ack",
         RS_STATE,
-        '            protocol: tinyray_proto::PROTOCOL,\n'
+        "            protocol: tinyray_proto::PROTOCOL,\n"
         '            version: env!("CARGO_PKG_VERSION").to_string(),\n'
         "            ttl_ms:",
         "            protocol: 0,\n            version: String::new(),\n            ttl_ms:",
@@ -427,6 +426,36 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_a_child_forked_while_the_lock_was_held_can_still_watch",
     ),
     (
+        "the blocking replacement wait only sees what comes next",
+        PY_INIT,
+        "        try:\n"
+        "            snap = self.until(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))\n"
+        "        except TimeoutError:\n"
+        "            return None\n"
+        "        return snap.slot(seat)",
+        "        with self.changes(timeout=timeout) as w:\n"
+        "            for snap in w:\n"
+        "                if _taken_over(seat, was)(snap):\n"
+        "                    return snap.slot(seat)\n"
+        "        return None",
+        "tests/test_watch_lifecycle.py::test_a_replacement_that_already_happened_is_not_missed",
+    ),
+    (
+        "the async replacement wait only sees what comes next",
+        PY_INIT,
+        "        try:\n"
+        "            snap = await self.auntil(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))\n"
+        "        except TimeoutError:\n"
+        "            return None\n"
+        "        return snap.slot(seat)",
+        "        async with self.achanges(timeout=timeout) as w:\n"
+        "            async for snap in w:\n"
+        "                if _taken_over(seat, was)(snap):\n"
+        "                    return snap.slot(seat)\n"
+        "        return None",
+        "tests/test_watch_lifecycle.py::test_a_replacement_that_already_happened_is_not_missed",
+    ),
+    (
         "a bell outlives the loop it belongs to",
         PY_RPC,
         "            if got is None or got.is_closed():",
@@ -445,8 +474,7 @@ MUTANTS = [
         "python/tinyray/_serve.py",
         "            counters.refuse()\n",
         "",
-        "tests/test_stats.py"
-        "::test_stats_shows_saturation_rather_than_leaving_it_to_guesswork",
+        "tests/test_stats.py::test_stats_shows_saturation_rather_than_leaving_it_to_guesswork",
     ),
     (
         "a pinned request id is ignored",
@@ -481,8 +509,7 @@ MUTANTS = [
         PY_INIT,
         "        if not 0 <= got <= _MAX_SEAT:",
         "        if False:",
-        "tests/test_pool_shape.py"
-        "::test_a_launcher_variable_that_cannot_be_a_seat_says_which_one",
+        "tests/test_pool_shape.py::test_a_launcher_variable_that_cannot_be_a_seat_says_which_one",
     ),
     (
         "a pool name is accepted whatever is in it",
@@ -509,8 +536,8 @@ MUTANTS = [
     (
         "every call reuses one request id",
         PY_RPC,
-        'else f"{_identity or \'anon\'}-{next(_seq)}"',
-        'else f"{_identity or \'anon\'}-1"',
+        "else f\"{_identity or 'anon'}-{next(_seq)}\"",
+        "else f\"{_identity or 'anon'}-1\"",
         "tests/test_identity_and_fencing.py::test_every_call_carries_a_request_id_that_names_that_attempt",
     ),
 ]
@@ -555,6 +582,18 @@ def main() -> int:
             bad.append(label)
             continue
         path.write_text(original.replace(find, repl, 1))
+        # Two mutants that shorten the same file by the same number of bytes,
+        # written inside one second, are indistinguishable to the bytecode
+        # cache: it keys on (mtime seconds, size), so the second one runs the
+        # first one's code. Measured -- with the mutant on disk, a plain
+        # `import tinyray` still handed back the unmutated class, and the run
+        # said MISSED for a test that fails in 0.2s on its own. The reverse is
+        # the dangerous one: a mutant called CAUGHT because some *other*
+        # mutant's bytecode broke the test would leave a toothless test looking
+        # covered. Not worth reasoning about the invalidation rules; just make
+        # sure there is nothing to load.
+        for stale in (ROOT / "python/tinyray/__pycache__").glob("*.pyc"):
+            stale.unlink()
         try:
             if rel.endswith(".rs") and not build():
                 # A mutant that will not compile is caught too: the compiler

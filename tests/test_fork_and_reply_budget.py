@@ -323,6 +323,7 @@ def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
 FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
     """
     import os, sys, tinyray
+    from tinyray import _rpc
 
     class S:
         def echo(self, x): return x
@@ -351,11 +352,12 @@ FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
     if pid == 0:
         os.close(go_r); os.close(res_r)
         try:
+            carried = _rpc._sync is not None   # fork 之后还攥着父进程那个吗？
             kid = tinyray.join("forksynccli", "churn")
             kid.ready()
             os.write(go_w, b"x")          # 加入完了再一起开打，让重叠最大
             bad = hammer("C", 400)
-            os.write(res_w, f"CHILD {len(bad)} {bad[:2]}".encode()[:400])
+            os.write(res_w, f"CHILD carried={carried} {len(bad)} {bad[:2]}".encode()[:400])
         except BaseException as e:
             os.write(res_w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
         os._exit(0)
@@ -383,6 +385,10 @@ def test_a_forked_child_does_not_share_the_synchronous_connection(registry):
     那边至少还会抛出来。
 
     异步的连接池和继承来的管道都已经这么丢掉了。共用的这个是最后一个。
+
+    串号本身是竞态：单独跑 8/8 都能复现，但放进整轮变异检查里会飘过一次。所以
+    **确定性的主张是机制** —— 子进程 fork 之后手里不该还攥着那个 client；串号
+    作为它为什么要紧的证据留在这里一起断言。
     """
     p = subprocess.Popen(
         [sys.executable, "-c", FORK_THEN_BOTH_CALL_SYNC],
@@ -397,6 +403,9 @@ def test_a_forked_child_does_not_share_the_synchronous_connection(registry):
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         out, err = p.communicate(timeout=10)
         raise AssertionError(f"fork 之后父子同步互调挂住了 stderr={err[-400:]!r}") from None
-    assert "PARENT 0 []" in out and "CHILD 0 []" in out, (
+    assert "CHILD carried=False" in out, (
+        f"子进程带着父进程那个 client 过了 fork：stdout={out!r} stderr={err[-600:]!r}"
+    )
+    assert "PARENT 0 []" in out and "CHILD carried=False 0 []" in out, (
         f"父子共用了同一条同步连接：stdout={out!r} stderr={err[-600:]!r}"
     )

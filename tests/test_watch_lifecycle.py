@@ -795,3 +795,75 @@ def test_a_child_forked_while_the_lock_was_held_can_still_watch(registry):
             f"stdout={out!r} stderr={err[-400:]!r}"
         ) from None
     assert "CHILD_EXITED 0" in out, f"stdout={out!r} stderr={err[-800:]!r}"
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+def test_a_replacement_that_already_happened_is_not_missed(registry, kind):
+    """问"谁接手了"的时候，接手常常已经发生了。
+
+    典型顺序就是这样：一次调用撞上 `Fenced`，**然后**才去问新任期是谁。等待
+    如果只订阅"接下来的变化"，就会错过那件已经发生的事，白等满整个超时。
+
+    实测同一个已完成的换人、且池子已经安静下来：同步和异步**都坐满 5s 超时
+    然后返回 None**，5/5 复现。两个都是自己驱动 watch，只订阅"接下来的变化"，
+    从不先看一眼当下已经成立没有。
+
+    这个 bug 难看见，是因为随后任何一条无关变化都会让它蒙对（离场者被清理就是
+    一条）。第一次测量时同步版 0.04s 就答对了，害我以为只有异步版坏 —— 所以
+    下面要先等池子安静。
+    """
+    peer = textwrap.dedent(
+        f"""
+        import os, sys, tinyray
+        os.environ["TINYRAY_REGISTRY"] = "{registry.endpoint}"
+        m = tinyray.join("late", slot=1, size=2)
+        m.ready(who=sys.argv[1])
+        print(m.identity, flush=True)
+        sys.stdin.readline()
+        """
+    )
+
+    def start(tag: str):
+        p = subprocess.Popen(
+            [sys.executable, "-c", peer, tag],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        return p, p.stdout.readline().strip()
+
+    def stop(p) -> None:
+        p.stdin.write("\n")
+        p.stdin.flush()
+        p.wait(timeout=10)
+
+    with tinyray.join("late", slot=0, size=2) as me:
+        me.ready()
+        pool = tinyray.pool("late")
+        first, was = start("first")
+        pool.wait(count=2, timeout=10)
+        stop(first)
+        second, now = start("second")
+        # 先确认换人**彻底完成**了，再去问 —— 这才是要测的那个顺序。
+        pool.until(lambda s: s.slot(1) is not None and s.slot(1).identity == now, timeout=15)
+        # 再等池子彻底安静。旧写法只订阅"接下来的变化"，所以只要随后还有任何
+        # 一条无关变化到达（离场者被清理就是一条），谓词早已成立，它就会**碰巧
+        # 答对** —— 这正是这个 bug 时灵时不灵的原因，也是写这条测试第一版没抓到
+        # 它的原因。
+        rev, since = pool.snapshot().revision, time.monotonic()
+        while time.monotonic() - since < 1.5:
+            time.sleep(0.1)
+            if pool.snapshot().revision != rev:
+                rev, since = pool.snapshot().revision, time.monotonic()
+
+        started = time.monotonic()
+        if kind == "sync":
+            got = pool.wait_replacement(identity=was, timeout=5)
+        else:
+            got = asyncio.run(tinyray.apool("late").await_replacement(identity=was, timeout=5))
+        spent = time.monotonic() - started
+        stop(second)
+
+    assert got is not None, f"{kind}: 换人已经发生了却答 None，白等了 {spent:.2f}s"
+    assert got.identity == now, f"{kind}: 答的是 {got.identity!r}，新任期是 {now!r}"
+    assert spent < 2, f"{kind}: 答案早就摆在那了，却等了 {spent:.2f}s"

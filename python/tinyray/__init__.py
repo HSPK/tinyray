@@ -775,12 +775,11 @@ class Pool:
         it started with, or still empty.
         """
         seat, was = self._replacement_target(slot, identity, "wait_replacement")
-        with self.changes(timeout=timeout) as w:
-            for snap in w:
-                now = snap.slot(seat)
-                if now is not None and now.identity != was:
-                    return now
-        return None
+        try:
+            snap = self.until(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))
+        except TimeoutError:
+            return None
+        return snap.slot(seat)
 
     def all(self, **filt: Any) -> list[Handle]:
         return self._members(filt, require_ready=True)
@@ -1577,12 +1576,40 @@ class AsyncPool(Pool):
     ) -> Handle | None:
         """`wait_replacement()` for an event loop."""
         seat, was = self._replacement_target(slot, identity, "await_replacement")
-        async with self.achanges(timeout=timeout) as w:
-            async for snap in w:
-                now = snap.slot(seat)
-                if now is not None and now.identity != was:
-                    return now
-        return None
+        try:
+            snap = await self.auntil(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))
+        except TimeoutError:
+            return None
+        return snap.slot(seat)
+
+
+def _WHO(seat: int) -> str:
+    return f"a different tenure in seat {seat}"
+
+
+def _taken_over(seat: int, was: str | None) -> Callable[[Snapshot], bool]:
+    """Seat `seat` held by anyone other than `was`.
+
+    Both waits go through `until()` now. Each used to drive its own watch,
+    subscribing to what came *next* without first looking at what was already
+    true -- and asking who took over a seat usually happens after the fact, a
+    call comes back `Fenced` and only then does anyone go looking.
+
+    A takeover that had already finished was therefore invisible: measured
+    against a completed handover with the pool quiet, both sat out the whole
+    5s timeout and returned None. What made this hard to see is that any
+    unrelated change arriving afterwards -- the departed member being cleaned
+    up will do -- finds the condition already true and the wait answers
+    correctly by luck. The first run of this measurement had the blocking one
+    answer in 0.04s for exactly that reason, which made it look like only the
+    async one was broken.
+    """
+
+    def taken(snap: Snapshot) -> bool:
+        now = snap.slot(seat)
+        return now is not None and now.identity != was
+
+    return taken
 
 
 def _seat_of(identity: str) -> int:
