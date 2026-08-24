@@ -269,8 +269,8 @@ MUTANTS = [
     (
         "every call reuses one request id",
         PY_RPC,
-        'return f"{_identity or \'anon\'}-{next(_seq)}"',
-        'return f"{_identity or \'anon\'}-1"',
+        'else f"{_identity or \'anon\'}-{next(_seq)}"',
+        'else f"{_identity or \'anon\'}-1"',
         "tests/test_identity_and_fencing.py::test_every_call_carries_a_request_id_that_names_that_attempt",
     ),
 ]
@@ -335,6 +335,15 @@ def main() -> int:
             caught = r.returncode != 0
             print(f"{'CAUGHT' if caught else 'MISSED'}  {label}")
             if not caught:
+                # A MISSED that does not say why is a dead end. Usually it is
+                # the test having no teeth, but it has also been the mutant
+                # never reaching the interpreter, and those need opposite
+                # reactions.
+                tail = (r.stdout or r.stderr or "").strip().splitlines()[-4:]
+                for line in tail:
+                    print(f"        | {line}")
+                still_there = find in path.read_text()
+                print(f"        | mutant present when the test ran: {still_there}")
                 bad.append(label)
         finally:
             path.write_text(original)
