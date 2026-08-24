@@ -92,13 +92,33 @@ def _coerce(
     hints = _hints(fn)
     if not hints:
         return args, kwargs
-    for param, want in hints.items():
-        if want is CallContext:
-            kwargs[param] = CallContext(caller or "", request_id)
+    injected = [p for p, want in hints.items() if want is CallContext]
+    for param in injected:
+        kwargs[param] = CallContext(caller or "", request_id)
     try:
         names = [p for p in inspect.signature(fn).parameters]
     except (TypeError, ValueError):
         return args, kwargs
+
+    if injected and args:
+        # The caller sends no value for an injected parameter, so its own
+        # arguments line up with the parameters it can actually fill -- and
+        # once one of those is not last, positions no longer agree with the
+        # signature. Passing them by name is the only thing that works for
+        # every order: positionally, `f(self, ctx, n)` called as `f(7)` bound
+        # 7 to ctx, tripped the type check, and blamed the caller for the
+        # callee's parameter order.
+        fillable = [p for p in names if p not in injected]
+        if len(args) > len(fillable):
+            # Same channel as a type mismatch: the caller got the shape wrong
+            # and nothing has run, so it must not come back as OutcomeUnknown.
+            raise msgspec.ValidationError(
+                f"takes {len(fillable)} argument(s) besides the injected "
+                f"{injected}, got {len(args)}"
+            )
+        for name, value in zip(fillable, args, strict=False):
+            kwargs[name] = value
+        args = []
 
     for i, value in enumerate(args):
         if i < len(names) and names[i] in hints:

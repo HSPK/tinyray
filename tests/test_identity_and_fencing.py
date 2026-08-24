@@ -30,6 +30,10 @@ ECHO_CALLER = textwrap.dedent(
             }
         def mixed(self, n: int, ctx: tinyray.CallContext) -> dict:
             return {"n": n, "caller": ctx.identity}
+        def ctx_first(self, ctx: tinyray.CallContext, n: int) -> dict:
+            return {"n": n, "caller": ctx.identity}
+        def ctx_middle(self, a: int, ctx: tinyray.CallContext, b: int) -> dict:
+            return {"a": a, "b": b, "caller": ctx.identity}
         def plain(self, n: int) -> int:
             return n
 
@@ -205,6 +209,31 @@ def test_a_snapshot_answers_about_one_exact_tenure(registry):
         assert snap.slot(0).incarnation == me.incarnation
     finally:
         me.leave()
+
+
+def test_the_context_can_sit_anywhere_in_the_signature(peer):
+    """注入的参数放在哪一位，都不该影响调用方怎么传参。
+
+    以前只有放在**所有位置参数之后**才工作。放第一位或中间，调用方传位置参数
+    就报 `Expected CallContext, got int` —— 位置对不上了，因为调用方根本不为
+    注入的那个参数发值。更糟的是这句话在怪调用方，而问题出在被调方的签名顺序。
+    """
+    h = tinyray.pool("svc").slot(0)
+    assert h.mixed(7)["n"] == 7
+    assert h.ctx_first(7)["n"] == 7
+    assert h.ctx_middle(1, 2) == {
+        "a": 1,
+        "b": 2,
+        "caller": h.ctx_middle(1, 2)["caller"],
+    }
+    # 关键字调用一直是好的，这里作为对照，确保修复没把它弄坏。
+    assert h.ctx_first(n=7)["n"] == 7
+    assert h.ctx_middle(a=1, b=2)["b"] == 2
+    # 注入的参数不算在调用方能填的里面。多给一个要当场说不，而且必须走"调用方
+    # 传错了、什么都没跑"那条通道 —— 不能是 OutcomeUnknown，那会让人以为可能
+    # 已经执行过。
+    with pytest.raises(TypeError):
+        h.ctx_first(7, 8)
 
 
 def test_a_caller_can_pin_one_name_across_retries(peer):

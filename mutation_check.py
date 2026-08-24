@@ -41,6 +41,20 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "the injected parameter counts as one the caller fills",
+        "python/tinyray/_serve.py",
+        "        fillable = [p for p in names if p not in injected]",
+        "        fillable = list(names)",
+        "tests/test_identity_and_fencing.py::test_the_context_can_sit_anywhere_in_the_signature",
+    ),
+    (
+        "positional arguments are left positional when a context is injected",
+        "python/tinyray/_serve.py",
+        "    if injected and args:",
+        "    if False:",
+        "tests/test_identity_and_fencing.py::test_the_context_can_sit_anywhere_in_the_signature",
+    ),
+    (
         "the oversize nudge goes back to a fixed stack depth",
         "python/tinyray/_rpc.py",
         "        stacklevel=_app_stacklevel(),",
