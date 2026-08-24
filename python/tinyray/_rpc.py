@@ -133,6 +133,14 @@ def reset_after_fork() -> None:
     """
     global _per_loop_lock
     _per_loop_lock = threading.Lock()
+    # The transports belong to the parent's loops and speak over the parent's
+    # sockets. Dropped rather than closed: the parent still owns those
+    # descriptors. Left in place, both processes write down the same
+    # connection -- measured over 300 calls each from parent and child, every
+    # run had a request arrive garbled as HTTP 400 (an OutcomeUnknown, so the
+    # call may well have run) or the loop refuse the socket with
+    # FileExistsError, against no failure at all once these are dropped.
+    _loops.clear()
 
 
 def _async_client() -> httpx.AsyncClient:

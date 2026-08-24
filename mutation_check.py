@@ -406,6 +406,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_loops_in_many_threads_do_not_close_each_others_pipes",
     ),
     (
+        "a forked child keeps the parent's transports",
+        PY_RPC,
+        "    _loops.clear()\n",
+        "",
+        "tests/test_fork_and_reply_budget.py::test_a_forked_child_does_not_talk_down_the_parents_sockets",
+    ),
+    (
         "a forked child inherits the lock still held",
         PY_INIT,
         "    _live_watches.clear()\n    _rpc.reset_after_fork()",

@@ -230,3 +230,82 @@ def test_the_oversize_nudge_points_at_the_line_that_made_the_call(registry):
             p.wait(timeout=5)
         except Exception:
             p.kill()
+
+
+FORK_THEN_BOTH_CALL = textwrap.dedent(
+    """
+    import asyncio, os, sys, tinyray
+
+    class S:
+        def echo(self, x): return x
+
+    srv = tinyray.join("forksock", "stateful", slot=0, size=1, serves=S())
+    srv.ready()
+    loop = asyncio.new_event_loop()
+
+    async def hammer(tag, n):
+        h = tinyray.apool("forksock").slot(0)
+        bad = []
+        for i in range(n):
+            want = f"{tag}{i}"
+            try:
+                got = await h.echo(want)
+                if got != want:
+                    bad.append(f"串号 想要{want!r} 拿到{got!r}")
+            except Exception as e:
+                bad.append(f"{type(e).__name__}: {e}")
+        return bad
+
+    loop.run_until_complete(hammer("warm", 3))   # 让连接池装上父进程的 socket
+
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            kid = tinyray.join("forkcli", "churn")
+            kid.ready()
+            bad = loop.run_until_complete(hammer("C", 300))   # 沿用同一个 loop
+            os.write(w, f"CHILD {len(bad)} {bad[:2]}".encode()[:400])
+        except BaseException as e:
+            os.write(w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
+        os._exit(0)
+    os.close(w)
+    mine = loop.run_until_complete(hammer("P", 300))
+    kid_says = os.read(r, 4000).decode()
+    os.waitpid(pid, 0)
+    print(f"PARENT {len(mine)} {mine[:2]} | {kid_says}", flush=True)
+    """
+)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
+def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
+    """连接池是按事件循环存的，而 fork 把循环连同它的 socket 一起复制了。
+
+    子进程如果继续用 fork 之前那个 loop，拿到的就是**父进程那一个** httpx
+    client —— 同一批已经建立好的 TCP 连接。于是两个进程往同一条连接里写请求。
+
+    实测父子各调 300 次：每一轮都至少坏一次，要么服务端收到拼接错的请求回
+    `HTTP 400`（而且是 `OutcomeUnknown`，这次调用可能已经执行了），要么事件
+    循环拒绝这个 socket 报 `FileExistsError: [Errno 17]` —— 两个进程往同一个
+    epoll 注册同一个 fd。丢掉继承来的连接池之后，三轮都是 0。
+
+    继承来的管道早就是这么处理的：丢掉但不关闭，描述符还是父进程的。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", FORK_THEN_BOTH_CALL],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = p.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        out, err = p.communicate(timeout=10)
+        raise AssertionError(f"fork 之后父子互相调用挂住了 stderr={err[-400:]!r}") from None
+    assert "PARENT 0 []" in out and "CHILD 0 []" in out, (
+        f"父子共用了一条连接：stdout={out!r} stderr={err[-600:]!r}"
+    )

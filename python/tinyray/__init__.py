@@ -1301,7 +1301,8 @@ def _after_fork() -> None:
     _left = False
     # The inherited pipes belong to the parent's loops and its heartbeat is
     # gone, so nothing will ever write to them again. Drop them without
-    # closing: the parent still owns the descriptors.
+    # closing: the parent still owns the descriptors. reset_after_fork does
+    # the same for the transports, which had been left behind.
     _bells.clear()
     _live_watches.clear()
     _rpc.reset_after_fork()
