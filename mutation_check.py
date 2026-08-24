@@ -79,6 +79,20 @@ MUTANTS = [
         "tests/test_long_poll.py::test_publishing_flat_out_does_not_starve_the_heartbeat",
     ),
     (
+        "dedup ignores readiness and only compares state",
+        RS_LIB,
+        "            if cur.state == state && cur.ready == ready {",
+        "            if cur.state == state {",
+        "tests/test_readiness_owner.py::test_going_ready_again_is_never_deduplicated_away",
+    ),
+    (
+        "dedup compares raw bytes instead of parsed values",
+        RS_LIB,
+        "            if cur.state == state && cur.ready == ready {",
+        "            if cur.state.to_string() == state_json && cur.ready == ready {",
+        "tests/test_readiness_owner.py::test_key_order_is_not_a_change",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'return f"{_identity or \'anon\'}-{next(_seq)}"',

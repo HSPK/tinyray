@@ -12,6 +12,7 @@ readiness owner" 就不再是一条靠自觉遵守的约定，而是结构上做
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -96,6 +97,38 @@ def test_two_publishers_do_not_lose_each_others_keys(registry):
             t.join()
         missing = [f"w{i}" for i in range(writers) if f"w{i}" not in m.state]
         assert not missing, f"并发合并丢了这些 key: {missing}"
+
+
+def test_going_ready_again_is_never_deduplicated_away(registry):
+    """同值去重必须把就绪位算进去。
+
+    只比 state 的话，`unready()` 之后用同一份 state 再 `ready()` 会被当成"没变"
+    丢掉 —— 成员从此停在不可用状态，而调用方以为自己已经宣告可用了。这是去重
+    能造成的最坏后果，比多花一次请求严重得多。
+    """
+    with tinyray.join("p", slot=0, size=1) as m:
+        pool = tinyray.pool("p")
+        m.set_ready({"a": 1, "b": 2})
+        assert _published(m, pool)[0] is True
+        m.unready()
+        assert _published(m, pool)[0] is False
+        m.ready()  # 一个字节都没改，只有就绪位变了
+        assert _published(m, pool)[0] is True, "重新 ready 被当成同值丢掉了"
+
+
+def test_key_order_is_not_a_change(registry):
+    """比的是解析后的值，不是字节。
+
+    `{"b": 2, "a": 1}` 和 `{"a": 1, "b": 2}` 是同一件事。按字节比会把它当成
+    两次改动，于是 dict 的构造顺序一变就白跑一趟 —— 而那个顺序调用方通常都
+    不知道自己在控制。
+    """
+    with tinyray.join("p", slot=0, size=1) as m:
+        m.set_ready({"a": 1, "b": 2, "cfg": {"x": 1, "y": 2}})
+        assert m._c.set_state(json.dumps({"a": 1, "b": 2, "cfg": {"x": 1, "y": 2}}), True) is False
+        assert m._c.set_state(json.dumps({"b": 2, "a": 1, "cfg": {"x": 1, "y": 2}}), True) is False
+        assert m._c.set_state(json.dumps({"a": 1, "b": 2, "cfg": {"y": 2, "x": 1}}), True) is False
+        assert m._c.set_state(json.dumps({"a": 1, "b": 3, "cfg": {"x": 1, "y": 2}}), True) is True
 
 
 def test_republishing_the_same_thing_costs_nothing(registry):

@@ -87,7 +87,7 @@ with pool.changes() as w: ...
 |---|---|
 | `hold_ms` 独立暴露 | 它不决定新鲜度。ttl=20s 下发现延迟 41ms，因为变化是**唤醒**挂起的请求，不是等它超时。hold 只管空闲请求率和黑洞连接的察觉速度，暴露出去只会让人为了"更快"把它调小，延迟一点不省而请求量翻几十倍 |
 | 服务端状态投影 / predicate | 它真正解决的是"被无关变更吵醒"，不是带宽，而 state 已有 16 KB 上限。需要成员数、state 大小、无关唤醒占比三个真实数字才谈得上，否则做出来大概率是错的抽象 |
-| 独立 Queue / streaming 通道 | 同一个 leased-queue 论证已经否过（见 `docs/02-design.md`）。长驻 RPC 占满 worker 由 `max_concurrency` 解决：它在 dispatch **之前**返回 503，所以什么都没跑过，可安全重试 |
+| 独立 Queue / streaming 通道 | 同一个 leased-queue 论证已经否过（见 `docs/02-design.md`）。`max_concurrency` 解决的是**无限堆积**，不是隔离：它在 dispatch 之前返回 503，所以拒绝是安全可重试的，但并发槽被长驻 RPC 占满时，control 调用同样吃 503 —— 控制面并没有和数据面分开。目前使用方不跑共享 Actor 的长驻 RPC，所以这条先不做，一旦要跑就得重开 |
 | 跨 pool 一致性快照 / 原子 fanout | 每个成员是独立到期的租约，跨 pool"一致"只对注册表账本成立、对现实不成立。原子 fanout 是共识，另一个系统的问题 |
 | readiness generation / CAS | 层次错了。线上不存在这个乱序：只有一个心跳循环、顺序发送、注册表存最后值。乱序只在进程内，而那是 `update()` 解决的 |
 
