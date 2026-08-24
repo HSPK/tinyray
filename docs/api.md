@@ -86,6 +86,7 @@ tinyray.join(
 | `beats_ok` / `beats_failed` | 心跳被应答的次数，和没有的次数 |
 | `interval_ms` / `silence_ms` | 当前心跳间隔；距上次成功多久 |
 | `watch_wakeups` | 本地缓存动过、并因此唤醒等待者的次数 |
+| `short_polls` | 心跳等在**定时器**而不是注册中心上的次数。只有第一次 ack 之前才该发生；一直涨说明这个客户端在轮询，没吃到长轮询的好处 |
 | `state_bytes` | 这个成员正在发布的 state 有多大 |
 | `pool_revision` | 自己所在 pool 的版本号，以最后一次听到的为准 |
 | `watched_pools` | 订阅了几个 pool |

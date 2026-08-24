@@ -263,7 +263,13 @@ def test_a_superseded_member_finds_out_within_a_round_trip(long_lease):
         sys.stdin.readline()
         # 一次发布取消掉挂起的请求，取消之后那一个是不挂起的 —— 这正是那段
         # 错误睡眠的入口。发完就闭嘴，否则后续发布会把它从睡眠里叫醒。
+        before = m.stats()["beats_ok"]
         m.update(nudge=1)
+        # 等那个不挂起的替补请求真的回来，窗口才算打开。原先这里是对面 sleep
+        # 固定 0.3s，机器一忙就不够 —— 顶替落在窗口打开之前，幽灵当场就知道，
+        # 于是把 bug 放回去测试照样通过（在变异脚本里量到过 0.70s 的"通过"）。
+        while m.stats()["beats_ok"] <= before:
+            time.sleep(0.002)
         print("PUBLISHED", flush=True)
         while m.accepted:
             time.sleep(0.002)
@@ -281,11 +287,8 @@ def test_a_superseded_member_finds_out_within_a_round_trip(long_lease):
         assert ghost.stdout.readline().strip() == "UP", ghost.stderr.read()
         ghost.stdin.write("\n")
         ghost.stdin.flush()
+        # 对面自己确认了替补请求已经回来，所以窗口一定是开着的，不必猜时间。
         assert ghost.stdout.readline().strip() == "PUBLISHED", ghost.stderr.read()
-        # 取消之后还要一个 MIN_GAP 加一个往返，那段错误的睡眠才真正开始。抢得
-        # 比这更早的话，顶替会落在那一拍**里面**，幽灵当场就知道了 —— 于是这条
-        # 测试对着有 bug 的代码也会通过，五次里通过三次。
-        time.sleep(0.3)
 
         took = time.time()
         with tinyray.join("seat", "stateful", slot=0) as taker:
@@ -305,3 +308,29 @@ def test_a_superseded_member_finds_out_within_a_round_trip(long_lease):
         f"被顶替之后过了 {noticed:.0f}ms 才发现，超过 {budget:.0f}ms —— "
         f"像是在等下一拍而不是等注册中心叫醒"
     )
+
+
+def test_publishing_never_makes_the_loop_fall_back_to_a_timer(long_lease):
+    """注册中心答得上话时，心跳循环永远等在它身上，不等定时器。
+
+    这条是上面那条围栏延迟测试的确定版。那条量的是后果 —— 被顶替之后多久发现 ——
+    而后果要撞上一个内部瞬态才看得见，五次里只能抓到两次。这条量的是机制本身：
+    循环有没有走到"睡满一个 interval"那条分支。
+
+    那条分支只有在**一次 ack 都还没拿到**时才该走：没人应答就没有东西可挂，
+    而猛敲一个死掉的注册中心比等着更糟。一旦有过一次成功心跳，就永远该挂起。
+
+    实测二十次发布：正常 0 次，把判断从"循环的意图"改回"上一个请求要了什么"
+    是 12 次。
+    """
+    with tinyray.join("p", "churn") as me:
+        me.ready(a=1)
+        tinyray.pool("p")
+        me.flush()
+        assert me.stats()["short_polls"] == 0, "还没发布就已经在轮询了"
+        for i in range(20):
+            me.update(step=i)
+            time.sleep(0.1)
+        time.sleep(1.0)
+        got = me.stats()["short_polls"]
+        assert got == 0, f"发布了二十次之后，循环有 {got} 次是等在定时器上而不是等在注册中心上"

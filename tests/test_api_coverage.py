@@ -142,6 +142,7 @@ def test_member_accepted_and_silence_and_stats(svc):
         "interval_ms",
         "silence_ms",
         "watch_wakeups",
+        "short_polls",
         "state_bytes",
         "pool_revision",
         "watched_pools",

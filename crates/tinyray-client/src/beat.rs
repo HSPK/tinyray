@@ -90,6 +90,19 @@ pub struct Shared {
     /// once a beat whether or not anyone cares; this counts the ones that had
     /// a waiter, which is what says whether watching is costing anything.
     pub wakeups: AtomicU64,
+    /// Times the loop waited on a timer instead of on the registry.
+    ///
+    /// Only the path before the first ack should ever do this: with nobody
+    /// answering there is nothing to park on, and hammering a dead registry
+    /// is worse than waiting. Once a beat has landed the loop always parks,
+    /// so a number that keeps climbing means this client is polling rather
+    /// than being told -- which is the whole difference long polling buys.
+    ///
+    /// It is also the deterministic form of a bug that was otherwise only
+    /// visible as a race: reading the per-request hold here rather than the
+    /// loop's intent sent the loop to sleep unparked after every publish.
+    /// Measured over twenty publishes: 0 against 12.
+    pub short_polls: AtomicU64,
     /// Pipes written one byte at a time when the bell rings, so an event loop
     /// can wait on an fd instead of parking a thread in `wait_revision`. One
     /// per loop rather than one per client: a second loop in the same process
@@ -430,6 +443,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             // longer reach it. Measured on a superseded member: it took 940ms
             // to notice it had been fenced, against 1-2ms when parked.
             if shared.hold_ms.load(Ordering::Relaxed) == 0 {
+                shared.short_polls.fetch_add(1, Ordering::Relaxed);
                 let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
                 // Wake early if the process has something new to say.
                 let _ =

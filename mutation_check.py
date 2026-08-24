@@ -144,9 +144,10 @@ MUTANTS = [
     (
         "the post-beat pause reads the last request's hold, not the loop's intent",
         RS_BEAT,
-        "            if shared.hold_ms.load(Ordering::Relaxed) == 0 {\n                let ms = shared.interval_ms",
-        "            if hold == 0 {\n                let ms = shared.interval_ms",
-        "tests/test_long_poll.py::test_a_superseded_member_finds_out_within_a_round_trip",
+        "            if shared.hold_ms.load(Ordering::Relaxed) == 0 {\n"
+        "                shared.short_polls",
+        "            if hold == 0 {\n                shared.short_polls",
+        "tests/test_long_poll.py::test_publishing_never_makes_the_loop_fall_back_to_a_timer",
     ),
     (
         "the registry does not report its protocol on the ack",
@@ -342,8 +343,9 @@ def main() -> int:
                 tail = (r.stdout or r.stderr or "").strip().splitlines()[-4:]
                 for line in tail:
                     print(f"        | {line}")
-                still_there = find in path.read_text()
-                print(f"        | mutant present when the test ran: {still_there}")
+                now = path.read_text()
+                applied = find not in now and (not repl or repl in now)
+                print(f"        | mutant was in the file when the test ran: {applied}")
                 bad.append(label)
         finally:
             path.write_text(original)

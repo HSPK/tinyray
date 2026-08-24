@@ -89,6 +89,7 @@ impl Client {
             revision: Mutex::new(0),
             bell: std::sync::Condvar::new(),
             wakeups: AtomicU64::new(0),
+            short_polls: AtomicU64::new(0),
             wake_fds: Mutex::new(Vec::new()),
         });
         Ok(Self {
@@ -396,12 +397,22 @@ impl Client {
             ),
             ("silence_ms".into(), self.shared.silence_ms()),
             (
+                "short_polls".into(),
+                self.shared.short_polls.load(Ordering::Relaxed),
+            ),
+            (
                 "watch_wakeups".into(),
                 self.shared.wakeups.load(Ordering::Relaxed),
             ),
             (
                 "state_bytes".into(),
-                self.shared.published.lock().unwrap().state.to_string().len() as u64,
+                self.shared
+                    .published
+                    .lock()
+                    .unwrap()
+                    .state
+                    .to_string()
+                    .len() as u64,
             ),
             (
                 "pool_revision".into(),
