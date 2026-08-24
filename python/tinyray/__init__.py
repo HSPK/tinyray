@@ -165,11 +165,33 @@ def _checked_pool_name(name: str) -> str:
     return name
 
 
+# Seats and world sizes are unsigned on the wire, and a launcher that got one
+# wrong should hear about the variable rather than about the conversion.
+_MAX_SEAT = (1 << 63) - 1
+
+
 def _from_env(names: tuple[str, ...]) -> int | None:
+    """A seat or world size from the launcher's environment, or None.
+
+    Refuses what cannot be one. A negative or oversized value used to reach the
+    Rust boundary and come back as `OverflowError: can't convert negative int
+    to unsigned` -- an error about a conversion, naming neither the variable
+    nor the value, from a call the application never made.
+    """
     for n in names:
         v = os.environ.get(n)
-        if v is not None and v.strip().lstrip("-").isdigit():
-            return int(v)
+        if v is None:
+            continue
+        raw = v.strip()
+        if not raw.lstrip("-").isdigit():
+            continue
+        got = int(raw)
+        if not 0 <= got <= _MAX_SEAT:
+            raise ValueError(
+                f"{n}={v!r} is not a usable seat or world size: it has to be "
+                f"between 0 and {_MAX_SEAT}."
+            )
+        return got
     return None
 
 
@@ -1340,6 +1362,17 @@ def join(
             )
     if slotted and size is None:
         size = _from_env(_SIZE_VARS)
+    if slot is not None and not 0 <= slot <= _MAX_SEAT:
+        raise PolicyError(f"seat number has to be between 0 and {_MAX_SEAT}, got {slot}")
+    if size is not None and not 1 <= size <= _MAX_SEAT:
+        # Zero is the dangerous one, and it does not announce itself: a pool
+        # that declares no seats makes `epoch()` freeze on whoever happens to
+        # be there. Measured -- a lone member froze a round in 82ms against a
+        # world that was supposed to have several, so "wait for everyone"
+        # quietly became "carry on alone".
+        raise PolicyError(f"a world has at least one seat, got size={size}")
+    if slot is not None and size is not None and slot >= size:
+        raise PolicyError(f"seat {slot} is outside a world of {size}")
 
     # Fungible members have no seat, so their key is just a fresh identity.
     ident = slot if slot is not None else random.getrandbits(63)

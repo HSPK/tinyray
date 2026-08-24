@@ -428,6 +428,28 @@ MUTANTS = [
         "tests/test_identity_and_fencing.py::test_a_caller_can_pin_one_name_across_retries",
     ),
     (
+        "a world of zero seats is accepted",
+        PY_INIT,
+        "    if size is not None and not 1 <= size <= _MAX_SEAT:",
+        "    if False:",
+        "tests/test_pool_shape.py::test_a_world_of_zero_seats_is_refused",
+    ),
+    (
+        "a seat outside the world is accepted",
+        PY_INIT,
+        "    if slot is not None and size is not None and slot >= size:",
+        "    if False:",
+        "tests/test_pool_shape.py::test_a_seat_outside_the_world_is_refused",
+    ),
+    (
+        "a launcher variable is taken whatever its value",
+        PY_INIT,
+        "        if not 0 <= got <= _MAX_SEAT:",
+        "        if False:",
+        "tests/test_pool_shape.py"
+        "::test_a_launcher_variable_that_cannot_be_a_seat_says_which_one",
+    ),
+    (
         "a pool name is accepted whatever is in it",
         PY_INIT,
         '    if not name.isascii() or any(c < " " or c == "\\x7f" for c in name):',

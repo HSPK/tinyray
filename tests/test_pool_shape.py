@@ -103,3 +103,49 @@ def test_the_first_member_through_does_not_decide_the_pool_serves_nothing(regist
             p.wait(timeout=5)
         except Exception:
             p.kill()
+
+
+def test_a_world_of_zero_seats_is_refused(registry):
+    """`WORLD_SIZE=0` 是这几个坏值里最危险的，因为它不报错。
+
+    池子声明零个座位，`epoch()` 的目标就是零 —— 于是它对着"碰巧在场的人"
+    立刻冻结。实测：一个孤零零的成员 82ms 就冻结了一轮，而那本该是个多人的
+    世界。"等齐所有人"悄悄变成了"自己往下走"，而 `epoch()` 存在的全部意义
+    就是前者。
+    """
+    with pytest.raises(tinyray.PolicyError, match="at least one seat"):
+        tinyray.join("z", "collective", slot=0, size=0)
+
+
+def test_a_seat_outside_the_world_is_refused(registry):
+    """4 个人的世界里没有第 9 号座位。"""
+    with pytest.raises(tinyray.PolicyError, match="outside a world"):
+        tinyray.join("w", "collective", slot=9, size=4)
+    with pytest.raises(tinyray.PolicyError, match="outside a world"):
+        tinyray.join("w", "collective", slot=4, size=4)
+
+
+def test_a_negative_seat_is_refused(registry):
+    with pytest.raises(tinyray.PolicyError, match="between 0 and"):
+        tinyray.join("w", "collective", slot=-1, size=4)
+
+
+@pytest.mark.parametrize(
+    ("rank", "size"),
+    [("-1", "2"), ("1", "-2"), ("99999999999999999999", "2")],
+)
+def test_a_launcher_variable_that_cannot_be_a_seat_says_which_one(
+    registry, monkeypatch, rank, size
+):
+    """报的要是"哪个变量、什么值"，不是一个转换错误。
+
+    以前这些值一路走到 Rust 边界，回来的是
+    `OverflowError: can't convert negative int to unsigned` —— 既不提变量名
+    也不提值，还来自一次应用根本没发起的调用。
+    """
+    monkeypatch.setenv("RANK", rank)
+    monkeypatch.setenv("WORLD_SIZE", size)
+    with pytest.raises(ValueError, match="usable seat or world size") as caught:
+        tinyray.join("w", "collective")
+    said = str(caught.value)
+    assert ("RANK" in said) or ("WORLD_SIZE" in said), said
