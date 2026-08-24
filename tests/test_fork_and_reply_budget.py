@@ -1,10 +1,12 @@
 """fork() 和响应体积：两个静默失败，都不会自己喊疼。"""
 
+import asyncio
 import os
 import signal
 import subprocess
 import sys
 import textwrap
+import warnings
 
 import pytest
 import tinyray
@@ -168,6 +170,59 @@ def test_an_error_over_budget_arrives_whole(registry):
             assert exc.type == "ValueError"
             assert len(exc.message) == (8 << 20), "异常正文不该被裁"
             assert len(h.small()) == 1024, "之后连接必须还能用"
+    finally:
+        try:
+            p.stdin.write("\n")
+            p.stdin.flush()
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
+
+def test_the_oversize_nudge_points_at_the_line_that_made_the_call(registry):
+    """告警要指向调用它的那一行，同步异步都一样。
+
+    这条以前没人守。`stacklevel` 是写死的 4：同步方向对（`_nudge`、`invoke`、
+    `BoundMethod.__call__`、应用），异步方向错 —— 协程真正跑起来的时候
+    `__call__` 早已返回，同样数到 4 就落进了 asyncio 内部。实测指向
+    `asyncio/events.py:84`。
+
+    落错地方不只是难看：`warnings` 按 (消息, 类别, 位置) 去重，所有异步的
+    超大告警会因为位置相同被折叠成一条，然后被过滤器压掉。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", FAT], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    assert p.stdout.readline().strip() == "READY"
+    here = os.path.abspath(__file__)
+    try:
+        with tinyray.join("c", "churn") as c:
+            c.ready()
+            tinyray.pool("s").wait(count=1, timeout=15)
+
+            def blamed(caught) -> list[str]:
+                return [
+                    f"{os.path.basename(w.filename)}:{w.lineno}"
+                    for w in caught
+                    if issubclass(w.category, tinyray.OversizeWarning)
+                ]
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                tinyray.pool("s").slot(0).fat()
+            sync_at = [w for w in caught if issubclass(w.category, tinyray.OversizeWarning)]
+            assert sync_at, "超大返回值没有发出告警"
+            assert sync_at[0].filename == here, f"同步告警指向了 {blamed(caught)}"
+
+            async def call_it() -> None:
+                with warnings.catch_warnings(record=True) as inner:
+                    warnings.simplefilter("always")
+                    await tinyray.apool("s").slot(0).fat()
+                found = [w for w in inner if issubclass(w.category, tinyray.OversizeWarning)]
+                assert found, "异步方向没有发出告警"
+                assert found[0].filename == here, f"异步告警指向了 {blamed(inner)}"
+
+            asyncio.run(call_it())
     finally:
         try:
             p.stdin.write("\n")

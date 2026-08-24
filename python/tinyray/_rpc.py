@@ -10,6 +10,7 @@ import contextlib
 import contextvars
 import itertools
 import json
+import sys
 import warnings
 import weakref
 from collections.abc import Iterator
@@ -101,20 +102,40 @@ def _async_client() -> httpx.AsyncClient:
     return client
 
 
+def _app_stacklevel() -> int:
+    """How far up the first frame that is not ours is.
+
+    A fixed number cannot be right for both directions. Synchronously the
+    frames are `_nudge`, `invoke`, `BoundMethod.__call__`, then the
+    application -- four. On an event loop `__call__` has already returned by
+    the time the coroutine runs, so the same four lands in asyncio's
+    internals: measured pointing at `asyncio/events.py:84` instead of the line
+    that made the call, which also collapses every async nudge into one
+    suppressed duplicate.
+
+    Counting is cheap here because nothing reaches this unless something was
+    already over a megabyte.
+    """
+    level = 1
+    frame: Any = sys._getframe(1)
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("tinyray"):
+        level += 1
+        frame = frame.f_back
+    return level
+
+
 def _nudge(what: str, size: int, where: str | None) -> None:
     """Oversize is worth saying and never worth refusing."""
     if size <= SOFT_BODY:
         return
-    # stacklevel 4: here, invoke/ainvoke, BoundMethod.__call__, then the line
-    # the application wrote -- which is why both directions are nudged from
-    # invoke and not from _prepare, one frame deeper. The default filter
-    # collapses repeats, so a hot loop nudges once rather than screaming.
+    # The default filter collapses repeats, so a hot loop nudges once rather
+    # than screaming -- which only works if the location is the caller's.
     warnings.warn(
         f"{what} {size} bytes, past the {SOFT_BODY} the control plane is meant "
         f"for. It goes through -- a nudge, not a limit -- but consider passing a "
         f"reference and fetching the payload from {where} yourself.",
         OversizeWarning,
-        stacklevel=4,
+        stacklevel=_app_stacklevel(),
     )
 
 

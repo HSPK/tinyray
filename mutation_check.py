@@ -41,6 +41,14 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "the oversize nudge goes back to a fixed stack depth",
+        "python/tinyray/_rpc.py",
+        "        stacklevel=_app_stacklevel(),",
+        "        stacklevel=4,",
+        "tests/test_fork_and_reply_budget.py"
+        "::test_the_oversize_nudge_points_at_the_line_that_made_the_call",
+    ),
+    (
         "an async handle sends its calls synchronously",
         "python/tinyray/_rpc.py",
         "    _send = staticmethod(ainvoke)",
