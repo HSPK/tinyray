@@ -136,6 +136,30 @@ MUTANTS = [
         "::test_wanting_more_than_the_registry_has_says_so_instead_of_degrading_quietly",
     ),
     (
+        "await_fenced goes back to an executor thread",
+        PY_INIT,
+        "        self._mine()\n        bell = _loop_bell(self._c)\n        deadline = None if timeout is None else time.monotonic() + timeout\n        while True:\n            if not self._c.accepted:\n                return True\n            ms = _left_ms(deadline)\n            if ms is None:\n                return False\n            await bell.wait(ms / 1000)",
+        "        return await asyncio.to_thread(self.wait_fenced, timeout)",
+        "tests/test_watch_lifecycle.py::test_await_fenced_holds_no_executor_thread_either",
+    ),
+    (
+        "await_fenced never notices the takeover",
+        PY_INIT,
+        "        while True:\n            if not self._c.accepted:\n                return True\n"
+        "            ms = _left_ms(deadline)\n            if ms is None:\n                return False\n"
+        "            await bell.wait(ms / 1000)",
+        "        while True:\n            ms = _left_ms(deadline)\n            if ms is None:\n"
+        "                return False\n            await bell.wait(ms / 1000)",
+        "tests/test_watch_lifecycle.py::test_await_fenced_still_reports_a_takeover",
+    ),
+    (
+        "a bell timeout escapes instead of ending the stream",
+        PY_INIT,
+        "        except asyncio.TimeoutError:\n            pass",
+        "        except asyncio.TimeoutError:\n            raise",
+        "tests/test_watch_lifecycle.py::test_achanges_with_a_timeout_ends_rather_than_raises",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'return f"{_identity or \'anon\'}-{next(_seq)}"',

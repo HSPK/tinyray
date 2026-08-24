@@ -231,3 +231,104 @@ def test_wait_replacement_wants_exactly_one_of_slot_or_identity(registry):
             pool.wait_replacement()
         with pytest.raises(TypeError):
             pool.wait_replacement(slot=0, identity="p/0#1")
+
+
+def test_await_fenced_holds_no_executor_thread_either(long_lease):
+    """`await_fenced()` 也不能借 executor 线程。
+
+    它一直没有任何测试，所以当 `achanges()` 从 `asyncio.to_thread` 搬走时，
+    它被落下了 —— 同一个毛病，只是没人在看。
+
+    等待者带 timeout 是必须的：不带的话，走线程的实现会让 40 个 worker 永远
+    卡在里面，解释器退出时等它们，测试变成**挂死**而不是失败。挂死的测试比
+    没有测试更糟 —— CI 只会超时，不会告诉你哪里错了。
+    """
+
+    async def body() -> tuple[float, bool]:
+        me = tinyray.join("seat", "stateful", slot=0)
+        me.ready()
+        waiters = [asyncio.create_task(me.await_fenced(timeout=5)) for _ in range(40)]
+        await asyncio.sleep(0.5)
+        for t in waiters:
+            t.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        t0 = time.monotonic()
+        await asyncio.to_thread(lambda: None)
+        cost = (time.monotonic() - t0) * 1000
+        # 没被顶替时要如实返回 False，而不是一直挂着。
+        timely = await me.await_fenced(timeout=0.3)
+        me.leave()
+        return cost, timely
+
+    cost, timely = asyncio.run(body())
+    assert timely is False, "没被顶替却报告被顶替了"
+    assert cost < 500, f"取消 40 个 await_fenced 之后，一次 to_thread 等了 {cost:.0f}ms"
+
+
+def test_await_fenced_still_reports_a_takeover(long_lease):
+    """对偶：真被顶替时必须返回 True，而且要快。"""
+
+    async def body() -> tuple[bool, float]:
+        me = tinyray.join("seat", "stateful", slot=0)
+        me.ready()
+        waiting = asyncio.create_task(me.await_fenced(timeout=20))
+        await asyncio.sleep(0.3)
+        assert not waiting.done(), "还没人抢座就返回了"
+        t0 = time.monotonic()
+        taker = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    f"""
+                    import os, sys, tinyray
+                    os.environ["TINYRAY_REGISTRY"] = "{long_lease.endpoint}"
+                    m = tinyray.join("seat", "stateful", slot=0)
+                    m.ready()
+                    print("TOOK", flush=True)
+                    sys.stdin.readline()
+                    """
+                ),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            taker.stdout.readline()
+            got = await asyncio.wait_for(waiting, 20)
+            took = (time.monotonic() - t0) * 1000
+        finally:
+            taker.stdin.write("\n")
+            taker.stdin.close()
+            taker.wait(timeout=10)
+        return got, took
+
+    got, took = asyncio.run(body())
+    assert got is True, "座位被抢了却没报告"
+    # 一拍是 ttl/4 = 5s；靠铃唤醒应该快两三个数量级。
+    assert took < 1000, f"过了 {took:.0f}ms 才知道，像是在等下一拍"
+
+
+def test_achanges_with_a_timeout_ends_rather_than_raises(long_lease):
+    """超时是流的正常结局，不是异常。
+
+    异步侧等的是管道，而 `asyncio.wait_for` 超时会抛 —— 一路放出去的话，
+    `achanges(timeout=)` 就变成了抛 `TimeoutError`，而同步的 `changes(timeout=)`
+    只是安静地结束。两边必须一样。
+    """
+
+    async def body() -> float:
+        me = tinyray.join("p", slot=0, size=1)
+        me.ready()
+        me.flush()
+        t0 = time.monotonic()
+        # 不接 pytest.raises：要的是它**正常走完**，产出几次都无所谓。
+        async for _ in tinyray.apool("p").achanges(timeout=0.3):
+            pass
+        took = time.monotonic() - t0
+        me.leave()
+        return took
+
+    took = asyncio.run(body())
+    assert 0.3 <= took < 3.0, f"流在 {took:.2f}s 结束，既不像超时也不像正常收尾"

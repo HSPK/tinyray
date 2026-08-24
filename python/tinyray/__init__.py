@@ -318,15 +318,24 @@ class _LoopBell:
                 f.set_result(None)
 
     async def wait(self, timeout: float) -> None:
+        """Return when the bell rings, or when `timeout` runs out.
+
+        Running out is an ordinary answer, not an error: callers loop and
+        re-check the thing they actually care about, exactly as the
+        synchronous `wait_revision` lets them. Letting the TimeoutError out
+        instead turned `achanges(timeout=...)` into a raise where the stream
+        should simply have ended.
+        """
         fut: asyncio.Future[None] = self._loop.create_future()
         self._waiters.append(fut)
         try:
             await asyncio.wait_for(fut, timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            # Cancelled is not an error here: the caller went away, and the
-            # only thing left to do is stop holding a slot in the list.
-            raise
+        except asyncio.TimeoutError:
+            pass
         finally:
+            # Cancellation lands here too. Whatever happened, the slot in the
+            # list has to go, or a caller that came and went would be woken
+            # for the rest of the process's life.
             try:
                 self._waiters.remove(fut)
             except ValueError:
@@ -366,6 +375,20 @@ def _loop_bell(client: _Client) -> _LoopBell:
     bell = _LoopBell(client, loop)
     _bells[key] = (weakref.ref(loop), bell)
     return bell
+
+
+def _left_ms(deadline: float | None) -> int | None:
+    """Milliseconds still allowed, or None once the time is up.
+
+    Every wait in here spelled this out, and eight copies of a deadline is
+    eight chances to get one of them wrong. An unbounded wait still needs a
+    number to hand the Rust side: an hour, re-armed each time round, since the
+    bell rings far more often than that.
+    """
+    if deadline is None:
+        return 3_600_000
+    left = deadline - time.monotonic()
+    return None if left <= 0 else int(left * 1000) + 1
 
 
 class RegistryInfo:
@@ -459,10 +482,8 @@ class _Watching:
         if info is not None and info[0] != self._seen:
             self._seen = info[0]
             return self._pool.snapshot(), 0
-        left = 3600.0 if self._deadline is None else self._deadline - time.monotonic()
-        if left <= 0:
-            return None, 0
-        return None, int(left * 1000) + 1
+        ms = _left_ms(self._deadline)
+        return (None, 0) if ms is None else (None, ms)
 
 
 class Watch(_Watching):
@@ -557,10 +578,10 @@ class Pool:
             # lookups.
             if self._c.silence_ms > self._lease_ms() // 2:
                 return
-            left = deadline - time.monotonic()
-            if left <= 0:
+            ms = _left_ms(deadline)
+            if ms is None:
                 return
-            self._c.wait_revision(rev, int(left * 1000) + 1)
+            self._c.wait_revision(rev, ms)
 
     def _members(self, filt: dict[str, Any], require_ready: bool) -> list[Handle]:
         self._settle()
@@ -601,6 +622,18 @@ class Pool:
         """
         return Watch(self, since, timeout)
 
+    def _replacement_target(
+        self, slot: int | None, identity: str | None, who: str
+    ) -> tuple[int, str | None]:
+        """The seat to watch and the tenure that must give way."""
+        if (slot is None) == (identity is None):
+            raise TypeError(f"{who}() takes exactly one of slot= or identity=")
+        if identity is not None:
+            return _seat_of(identity), identity
+        assert slot is not None
+        here = self.snapshot().slot(slot)
+        return slot, here.identity if here else None
+
     def wait_replacement(
         self,
         slot: int | None = None,
@@ -618,16 +651,7 @@ class Pool:
         None means the timeout ran out with the seat still held by the tenure
         it started with, or still empty.
         """
-        if (slot is None) == (identity is None):
-            raise TypeError("wait_replacement() takes exactly one of slot= or identity=")
-        was: str | None
-        if identity is not None:
-            seat, was = _seat_of(identity), identity
-        else:
-            assert slot is not None
-            seat = slot
-            here = self.snapshot().slot(seat)
-            was = here.identity if here else None
+        seat, was = self._replacement_target(slot, identity, "wait_replacement")
         with self.changes(timeout=timeout) as w:
             for snap in w:
                 now = snap.slot(seat)
@@ -660,13 +684,13 @@ class Pool:
             found = self._members(filt, require_ready=True)
             if len(found) >= count:
                 return found
-            left = deadline - time.monotonic()
-            if left <= 0:
+            ms = _left_ms(deadline)
+            if ms is None:
                 raise TimeoutError(
                     f"waited {timeout}s for {count} ready member(s) of "
                     f"{self._name!r} matching {filt}, saw {len(found)}"
                 )
-            self._c.wait_revision(rev, int(left * 1000) + 1)
+            self._c.wait_revision(rev, ms)
 
     def epoch(self, min: int | None = None, timeout: float = 60.0) -> Epoch:
         """Wait for the round to be complete, then freeze it.
@@ -705,13 +729,13 @@ class Pool:
             if info is None:
                 # No answer about this pool yet, so there is no fingerprint to
                 # freeze. min=0 used to reach the line below and crash on it.
-                left = deadline - time.monotonic()
-                if left <= 0:
+                ms = _left_ms(deadline)
+                if ms is None:
                     raise TimeoutError(
                         f"waited {timeout}s to open a round of {self._name!r}: "
                         f"the registry has said nothing about it"
                     )
-                self._c.wait_revision(rev, int(left * 1000) + 1)
+                self._c.wait_revision(rev, ms)
                 continue
             target = min if min is not None else info[2]
             if target is None:
@@ -723,8 +747,8 @@ class Pool:
                 found, mismatched = len(members), ours != whole
                 if found >= target and not mismatched:
                     return Epoch(self._name, self._c, members, whole)
-            left = deadline - time.monotonic()
-            if left <= 0:
+            ms = _left_ms(deadline)
+            if ms is None:
                 if mismatched and found >= target:
                     raise TimeoutError(
                         f"waited {timeout}s to open a round of {self._name!r}: "
@@ -737,7 +761,7 @@ class Pool:
                     f"waited {timeout}s to open a round of {self._name!r}: "
                     f"{found} of {target} present"
                 )
-            self._c.wait_revision(rev, int(left * 1000) + 1)
+            self._c.wait_revision(rev, ms)
 
     def _lease_ms(self) -> int:
         return max(int(self._c.stats().get("interval_ms", 1000)) * 4, 1000)
@@ -888,13 +912,13 @@ class Member:
                 return self
             if not self._c.accepted:
                 raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")
-            left = deadline - time.monotonic()
-            if left <= 0:
+            ms = _left_ms(deadline)
+            if ms is None:
                 raise TimeoutError(
                     f"waited {timeout}s for the registry to take this state; "
                     f"last error was {self._c.last_error()!r}"
                 )
-            self._c.wait_revision(rev, int(left * 1000) + 1)
+            self._c.wait_revision(rev, ms)
 
     def wait_fenced(self, timeout: float | None = None) -> bool:
         """Block until a later tenure has taken this seat. True if it has.
@@ -914,14 +938,28 @@ class Member:
             rev = self._c.cache_revision()
             if not self._c.accepted:
                 return True
-            left = 3600.0 if deadline is None else deadline - time.monotonic()
-            if left <= 0:
+            ms = _left_ms(deadline)
+            if ms is None:
                 return False
-            self._c.wait_revision(rev, int(left * 1000) + 1)
+            self._c.wait_revision(rev, ms)
 
     async def await_fenced(self, timeout: float | None = None) -> bool:
-        """wait_fenced() for an event loop, waiting on a thread."""
-        return await asyncio.to_thread(self.wait_fenced, timeout)
+        """`wait_fenced()` for an event loop, on the same pipe achanges uses.
+
+        It waited on a thread until 0.9.1, which meant cancelling it did not
+        release the worker -- the executor problem achanges was moved off, left
+        behind in the one other place that had it.
+        """
+        self._mine()
+        bell = _loop_bell(self._c)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if not self._c.accepted:
+                return True
+            ms = _left_ms(deadline)
+            if ms is None:
+                return False
+            await bell.wait(ms / 1000)
 
     def unready(self) -> Member:
         """Withdraw the sign, keeping the published state. Pairs with ready()
@@ -1157,10 +1195,10 @@ def join(
             rev = c.cache_revision()
             if c.stats()["beats_ok"]:
                 break
-            left = deadline - time.monotonic()
-            if left <= 0:
+            ms = _left_ms(deadline)
+            if ms is None:
                 break
-            c.wait_revision(rev, int(left * 1000) + 1)
+            c.wait_revision(rev, ms)
         if not c.stats()["beats_ok"]:
             c.leave()
             if server is not None:
@@ -1251,16 +1289,7 @@ class AsyncPool(Pool):
         timeout: float | None = None,
     ) -> Handle | None:
         """`wait_replacement()` for an event loop."""
-        if (slot is None) == (identity is None):
-            raise TypeError("await_replacement() takes exactly one of slot= or identity=")
-        was: str | None
-        if identity is not None:
-            seat, was = _seat_of(identity), identity
-        else:
-            assert slot is not None
-            seat = slot
-            here = self.snapshot().slot(seat)
-            was = here.identity if here else None
+        seat, was = self._replacement_target(slot, identity, "await_replacement")
         async with self.achanges(timeout=timeout) as w:
             async for snap in w:
                 now = snap.slot(seat)
