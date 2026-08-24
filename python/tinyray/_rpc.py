@@ -266,16 +266,13 @@ class BoundMethod:
 
 
 class AsyncHandleMixin:
-    """Same handle, awaitable methods."""
+    """Same handle, awaitable methods.
 
-    # Declared because __getattr__ below answers for every other name, which
-    # otherwise makes these look like BoundMethods too.
-    _methods: tuple[str, ...]
-    identity: str
+    The whole difference is which of the two senders a bound method carries,
+    so that is the whole class. The lookup itself -- what counts as a served
+    name, and what the AttributeError says when it is not -- lives once on
+    `Handle`; it used to live here as well, word for word, which is one place
+    for an improved message to be made and the other to be forgotten in.
+    """
 
-    def __getattr__(self, name: str) -> BoundMethod:
-        if name.startswith("_") or name not in self._methods:
-            raise AttributeError(
-                f"{self.identity} serves {sorted(self._methods) or 'no methods'}, not {name!r}"
-            )
-        return BoundMethod(self, name, DEFAULT_TIMEOUT, ainvoke)
+    _send = staticmethod(ainvoke)

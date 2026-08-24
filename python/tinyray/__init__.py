@@ -141,6 +141,9 @@ class Handle:
 
     __slots__ = ("pool", "id", "slot", "incarnation", "url", "state", "ready", "_methods")
 
+    #: How a call goes out. `AsyncHandle` swaps this and changes nothing else.
+    _send = staticmethod(_rpc.invoke)
+
     def __init__(self, pool_name: str, raw: dict[str, Any], methods: tuple[str, ...] = ()):
         self._methods = methods
         self.pool = pool_name
@@ -164,7 +167,7 @@ class Handle:
             raise AttributeError(
                 f"{self.identity} serves {sorted(self._methods) or 'no methods'}, not {name!r}"
             )
-        return _rpc.BoundMethod(self, name, _rpc.DEFAULT_TIMEOUT)
+        return _rpc.BoundMethod(self, name, _rpc.DEFAULT_TIMEOUT, self._send)
 
     @property
     def label(self) -> str:

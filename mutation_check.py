@@ -41,6 +41,20 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "an async handle sends its calls synchronously",
+        "python/tinyray/_rpc.py",
+        "    _send = staticmethod(ainvoke)",
+        "    _send = staticmethod(invoke)",
+        "tests/test_m2_async.py",
+    ),
+    (
+        "a plain handle hands back coroutines",
+        PY_INIT,
+        "    _send = staticmethod(_rpc.invoke)",
+        "    _send = staticmethod(_rpc.ainvoke)",
+        "tests/test_m2_calling.py",
+    ),
+    (
         "until() waits instead of checking what is already true",
         PY_INIT,
         UNTIL_BOOTSTRAP,
