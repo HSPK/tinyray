@@ -247,6 +247,10 @@ def test_a_superseded_member_finds_out_within_a_round_trip(long_lease):
     于是去睡满一个 interval，而且不再挂起 —— 注册中心叫不醒它。被顶替的成员因此
     要 940ms 才知道，而挂起时只要 1-2ms。是 examples 里的 06_fencing 在双核上
     偶然撞出来的，这里把它钉死。
+
+    那段错误的睡眠只在**刚发生过一次取消**之后才开始，所以这条测试必须自己把
+    那个窗口打开：让对方明确发布一次，说一声，然后立刻抢座。指望 join 时的
+    `ready()` 碰巧制造出取消是不行的 —— 三次里会漏一次。
     """
     peer = textwrap.dedent(
         f"""
@@ -254,21 +258,34 @@ def test_a_superseded_member_finds_out_within_a_round_trip(long_lease):
         os.environ["TINYRAY_REGISTRY"] = "{long_lease.endpoint}"
         m = tinyray.join("seat", "stateful", slot=0)
         m.ready()
+        m.flush()
         print("UP", flush=True)
+        sys.stdin.readline()
+        # 一次发布取消掉挂起的请求，取消之后那一个是不挂起的 —— 这正是那段
+        # 错误睡眠的入口。发完就闭嘴，否则后续发布会把它从睡眠里叫醒。
+        m.update(nudge=1)
+        print("PUBLISHED", flush=True)
         while m.accepted:
             time.sleep(0.002)
         print("FENCED %.6f" % time.time(), flush=True)
         """
     )
     ghost = subprocess.Popen(
-        [sys.executable, "-c", peer], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        [sys.executable, "-c", peer],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     try:
         assert ghost.stdout.readline().strip() == "UP", ghost.stderr.read()
-        # 只等它把开头几拍走完，不能等更久：那段错误的睡眠正是从 ready() 之后
-        # 开始的，等过了它，这条测试就再也证明不了什么 —— 第一版就是这样，
-        # 把 bug 放回去照样通过。
-        time.sleep(0.5)
+        ghost.stdin.write("\n")
+        ghost.stdin.flush()
+        assert ghost.stdout.readline().strip() == "PUBLISHED", ghost.stderr.read()
+        # 取消之后还要一个 MIN_GAP 加一个往返，那段错误的睡眠才真正开始。抢得
+        # 比这更早的话，顶替会落在那一拍**里面**，幽灵当场就知道了 —— 于是这条
+        # 测试对着有 bug 的代码也会通过，五次里通过三次。
+        time.sleep(0.3)
 
         took = time.time()
         with tinyray.join("seat", "stateful", slot=0) as taker:

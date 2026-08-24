@@ -332,3 +332,137 @@ def test_achanges_with_a_timeout_ends_rather_than_raises(long_lease):
 
     took = asyncio.run(body())
     assert 0.3 <= took < 3.0, f"流在 {took:.2f}s 结束，既不像超时也不像正常收尾"
+
+
+SEAT_TAKER = textwrap.dedent(
+    """
+    import os, sys, tinyray
+    os.environ["TINYRAY_REGISTRY"] = "{endpoint}"
+    m = tinyray.join("seats", "collective", slot=0, size=2)
+    m.ready()
+    print("READY", flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+def test_the_three_ways_a_stream_ends_are_told_apart(registry):
+    """超时、被 close、被顶替，是三件不相干的事。
+
+    过去三种都是"循环安静地退出"，消费者只能事后去查 `Member.accepted` 才知道
+    自己是不是丢了座位 —— 而丢座位意味着缓存从此冻结，之后每一次查询都是陈旧的
+    却不声张。把它和"超时到了、一切正常"混在一起，是这套 API 里最贵的一次混同。
+
+    这条测试的价值全在**对比**：只测被顶替会抛，不足以说明另外两种不会抛。
+    """
+    # 1) 超时：正常收尾
+    with tinyray.join("solo", slot=0, size=1) as me:
+        me.ready()
+        for _ in tinyray.pool("solo").changes(timeout=0.2):
+            pass  # 走到这里就说明没抛
+
+    # 2) close()：正常收尾，哪怕从别的线程关
+    with tinyray.join("solo", slot=0, size=1) as me:
+        me.ready()
+        w = tinyray.pool("solo").changes()
+        ended: list = []
+
+        def drain() -> None:
+            try:
+                for _ in w:
+                    pass
+                ended.append(None)
+            except BaseException as exc:  # noqa: BLE001
+                ended.append(exc)
+
+        t = threading.Thread(target=drain, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        w.close()
+        t.join(timeout=10)
+        assert ended == [None], f"close() 不该抛: {ended}"
+
+    # 3) 被顶替：必须抛，而且要说得出为什么
+    me = tinyray.join("seats", "collective", slot=0, size=2)
+    me.ready()
+    pool = tinyray.pool("seats")
+    pool.snapshot()
+    thief = subprocess.Popen(
+        [sys.executable, "-c", SEAT_TAKER.format(endpoint=registry.endpoint)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert thief.stdout.readline().strip() == "READY"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and me.accepted:
+            time.sleep(0.05)
+        assert not me.accepted, "没有被顶替，这条测试就没测到东西"
+        with pytest.raises(tinyray.Fenced) as caught:
+            for _ in pool.changes():
+                pass
+        assert "seats" in str(caught.value), "报错没有说是哪个池子"
+    finally:
+        thief.stdin.write("\n")
+        thief.stdin.close()
+        thief.wait(timeout=10)
+        try:
+            me.leave()
+        except Exception:
+            pass
+
+
+def test_the_async_stream_ends_the_same_three_ways(registry):
+    """异步侧必须和同步侧一致。两条路各写一遍，是它们分头跑偏的开始。"""
+
+    async def timed_out() -> None:
+        me = tinyray.join("solo", slot=0, size=1)
+        me.ready()
+        async for _ in tinyray.apool("solo").achanges(timeout=0.2):
+            pass
+        me.leave()
+
+    asyncio.run(timed_out())
+
+    async def closed() -> None:
+        me = tinyray.join("solo", slot=0, size=1)
+        me.ready()
+        w = tinyray.apool("solo").achanges()
+        w.close()
+        async for _ in w:
+            pass
+        me.leave()
+
+    asyncio.run(closed())
+
+    me = tinyray.join("seats", "collective", slot=0, size=2)
+    me.ready()
+    tinyray.apool("seats").snapshot()
+    thief = subprocess.Popen(
+        [sys.executable, "-c", SEAT_TAKER.format(endpoint=registry.endpoint)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert thief.stdout.readline().strip() == "READY"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and me.accepted:
+            time.sleep(0.05)
+        assert not me.accepted
+
+        async def fenced() -> None:
+            async for _ in tinyray.apool("seats").achanges():
+                pass
+
+        with pytest.raises(tinyray.Fenced):
+            asyncio.run(fenced())
+    finally:
+        thief.stdin.write("\n")
+        thief.stdin.close()
+        thief.wait(timeout=10)
+        try:
+            me.leave()
+        except Exception:
+            pass

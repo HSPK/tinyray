@@ -150,6 +150,18 @@ for snap in pool.changes(since=snap.revision):
 `changes()` 阻塞在事件上，池子不动就一直不返回，**不烧 CPU**。异步用
 `AsyncPool.achanges()`。
 
+循环安静地结束，意味着超时到了或者有人调了 `close()` —— 都没事。但如果**本进程
+被顶替**，它会抛 `Fenced`：那不是"看完了"，那是座位没了、缓存从此冻结，得停掉
+手里的东西再重新 `join()`。
+
+```python
+try:
+    for snap in pool.changes():
+        ...
+except tinyray.Fenced:
+    ...   # 座位没了
+```
+
 `snapshot()` 和 `all()` 的区别值得记住：
 
 - `all()` 回答"**谁能用**" —— 只给 ready 的

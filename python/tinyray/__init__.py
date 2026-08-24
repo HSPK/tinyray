@@ -466,12 +466,30 @@ class _Watching:
 
     def _step(self) -> tuple[Snapshot | None, int]:
         """A snapshot to hand over, or how many ms we may wait for one. Zero
-        milliseconds means the stream is over."""
-        # A superseded member stops beating, so the bell stops ringing and a
-        # consumer would wait here for as long as it was willing to. Nothing
-        # more is coming.
-        if self._closed or not self._c.accepted:
+        milliseconds means the stream is over.
+
+        Raises `Fenced` if the stream is over because this process lost its
+        seat, which is a different fact from the other two and needs a
+        different reaction.
+        """
+        # Asked to stop wins over everything: a caller that closed the stream
+        # is not interested in why it would have ended anyway.
+        if self._closed:
             return None, 0
+        if not self._c.accepted:
+            # A superseded member stops beating, so the bell stops ringing and
+            # nothing more is coming -- but ending quietly here made losing the
+            # seat look exactly like the timeout running out, and the cache is
+            # frozen from this moment on, so every later lookup is stale
+            # without saying so. The only way to tell used to be asking
+            # `Member.accepted` afterwards, which is the guessing this is
+            # supposed to remove.
+            raise Fenced(
+                f"cannot watch {self._pool._name!r} any further: this process "
+                f"lost its seat to a later tenure, so its view of the pool is "
+                f"frozen. Nothing here can recover; the process has to stop "
+                f"using whatever the seat entitled it to."
+            )
         self._tick = self._c.cache_revision()
         info = self._c.pool_info(self._pool._name)
         # The bell rings once a beat whether or not anything happened, so what
@@ -497,6 +515,10 @@ class Watch(_Watching):
     promises what it can -- you never miss a state, only the transitions nobody
     could have observed -- and the events are a diff away, because every entry
     carries its incarnation.
+
+    Ends quietly when the timeout runs out or `close()` is called, and raises
+    `Fenced` if it ends because this process lost its seat. Those are three
+    unrelated facts and only one of them needs the caller to do something.
     """
 
     __slots__ = ()

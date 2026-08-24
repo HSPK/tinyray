@@ -160,6 +160,27 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_achanges_with_a_timeout_ends_rather_than_raises",
     ),
     (
+        "a fenced stream ends quietly, like a timeout",
+        PY_INIT,
+        "        if self._closed:\n            return None, 0\n        if not self._c.accepted:",
+        "        if self._closed or not self._c.accepted:\n            return None, 0\n        if False:",
+        "tests/test_watch_lifecycle.py::test_the_three_ways_a_stream_ends_are_told_apart",
+    ),
+    (
+        "the async stream ends quietly when fenced",
+        PY_INIT,
+        "        if self._closed:\n            return None, 0\n        if not self._c.accepted:",
+        "        if self._closed or not self._c.accepted:\n            return None, 0\n        if False:",
+        "tests/test_watch_lifecycle.py::test_the_async_stream_ends_the_same_three_ways",
+    ),
+    (
+        "close() raises Fenced too, instead of ending quietly",
+        PY_INIT,
+        "        if self._closed:\n            return None, 0",
+        "        if False:\n            return None, 0",
+        "tests/test_watch_lifecycle.py::test_the_three_ways_a_stream_ends_are_told_apart",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'return f"{_identity or \'anon\'}-{next(_seq)}"',

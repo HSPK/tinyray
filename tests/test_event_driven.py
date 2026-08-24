@@ -198,7 +198,10 @@ def test_a_superseded_member_does_not_leave_its_watcher_hanging(registry):
     """被顶替之后心跳循环就退出了，铃不会再响。
 
     如果变化流只是"等下一次响铃"，消费者会在这里永久阻塞 —— 它等的是一件
-    再也不会发生的事，而且没有任何东西说明为什么。失败必须有界，所以流要结束。
+    再也不会发生的事，而且没有任何东西说明为什么。失败必须有界。
+
+    有界的方式是抛 `Fenced` 而不是安静结束：安静结束和"超时到了、一切正常"
+    长得一模一样，而这两件事需要的反应完全相反。
     """
     me = tinyray.join("seats", "collective", slot=0, size=2)
     me.ready()
@@ -221,14 +224,22 @@ def test_a_superseded_member_does_not_leave_its_watcher_hanging(registry):
 
         done = threading.Event()
 
+        why: list = []
+
         def watcher() -> None:
-            for _ in pool.changes():  # 故意不给 timeout
-                pass
+            try:
+                for _ in pool.changes():  # 故意不给 timeout
+                    pass
+            except BaseException as exc:  # noqa: BLE001 - 要的就是它抛了什么
+                why.append(exc)
             done.set()
 
         t = threading.Thread(target=watcher, daemon=True)
         t.start()
         assert done.wait(timeout=15), "变化流在成员被顶替后挂住了"
+        assert why and isinstance(why[0], tinyray.Fenced), (
+            f"被顶替后流安静地结束了，和超时无法区分: {why}"
+        )
     finally:
         _stop(thief)
         try:
