@@ -56,13 +56,39 @@ class CallContext:
         return f"<CallContext {self.identity or 'anonymous'}>"
 
 
+_ABSENT = object()
+
+
 def scan(obj: Any) -> dict[str, Callable[..., Any]]:
-    """Public methods, in declaration order. Leading underscore means private."""
+    """Public methods, in declaration order. Leading underscore means private.
+
+    Asks the class before the instance. `getattr` runs descriptors, so simply
+    reading every public name evaluates every property -- and serving objects
+    in this domain are full of them. Measured on a class with one property:
+    it fired once during discovery; one that raises took `join(serves=...)`
+    down with it, reporting `RuntimeError: no GPU on this box` from a call the
+    application never made; and one returning a callable was published as a
+    remote method.
+
+    A property is not a method. Neither is a `cached_property`, and neither is
+    data. What they have in common is that the object found on the class is
+    not itself callable -- which is the whole test, with `classmethod` the one
+    exception, being a method that is not a callable object until it is bound.
+    """
     out: dict[str, Callable[..., Any]] = {}
     for name in dir(obj):
         if name.startswith("_"):
             continue
-        attr = getattr(obj, name)
+        static = inspect.getattr_static(obj, name, _ABSENT)
+        if static is _ABSENT:
+            # Nothing on the class or in the instance dict, so `__dir__` and
+            # `__getattr__` are answering together: a proxy. Only the instance
+            # can say what this is, and there is no descriptor to trip.
+            attr = getattr(obj, name, None)
+        elif callable(static) or isinstance(static, classmethod):
+            attr = getattr(obj, name)
+        else:
+            continue
         if callable(attr):
             out[name] = attr
     return out

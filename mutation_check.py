@@ -41,6 +41,27 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "method discovery reads the instance and runs its properties",
+        "python/tinyray/_serve.py",
+        "        static = inspect.getattr_static(obj, name, _ABSENT)",
+        "        static = getattr(obj, name, _ABSENT)",
+        "tests/test_m2_validation.py::test_a_property_on_a_served_object_is_never_evaluated",
+    ),
+    (
+        "classmethods stop being found",
+        "python/tinyray/_serve.py",
+        "        elif callable(static) or isinstance(static, classmethod):",
+        "        elif callable(static):",
+        "tests/test_m2_validation.py::test_the_kinds_of_method_are_all_still_found",
+    ),
+    (
+        "a __getattr__ proxy loses its methods",
+        "python/tinyray/_serve.py",
+        "        if static is _ABSENT:",
+        "        if False:",
+        "tests/test_m2_validation.py::test_a_proxy_that_answers_through_getattr_still_works",
+    ),
+    (
         "the injected parameter counts as one the caller fills",
         "python/tinyray/_serve.py",
         "        fillable = [p for p in names if p not in injected]",
