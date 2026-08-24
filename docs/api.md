@@ -77,6 +77,33 @@ tinyray.join(
 | `accepted` | `False` 表示座位已被更晚的任期拿走 |
 | `silence_ms` | 距离上一次成功心跳多久。它涨的时候一切照常，只是失效检测变慢 |
 | `last_error` | 最近一次心跳失败的原因，恢复后仍保留 |
+| `stats()` | 计数器，见下 |
+
+### `stats()`
+
+| 键 | 含义 |
+|---|---|
+| `beats_ok` / `beats_failed` | 心跳被应答的次数，和没有的次数 |
+| `interval_ms` / `silence_ms` | 当前心跳间隔；距上次成功多久 |
+| `watch_wakeups` | 本地缓存动过、并因此唤醒等待者的次数 |
+| `state_bytes` | 这个成员正在发布的 state 有多大 |
+| `pool_revision` | 自己所在 pool 的版本号，以最后一次听到的为准 |
+| `watched_pools` | 订阅了几个 pool |
+
+**只有传了 `serves=` 的成员**才多出下面这些：
+
+| 键 | 含义 |
+|---|---|
+| `calls` / `failed` | 处理过几次调用，其中几次抛了 |
+| `refused` | 因为到并发上限被挡回去几次（503）|
+| `in_flight` / `peak_in_flight` | 此刻在飞几个，历史峰值多少 |
+| `busy_ms` | 花在处理函数里的总时间 |
+| `concurrency_limit` | `max_concurrency` 的值 |
+
+这一半存在，是为了让"要不要给长调用单开一条通道"有答案而不是有观点。
+`max_concurrency` 挡的是无限堆积，**不是隔离**：并发槽被占满之后，control 调用
+和别的调用一样吃 503。`refused` 和 `peak_in_flight` 摆在一起看，就知道这件事是
+不是正在发生。
 
 ### 发布状态
 
@@ -200,6 +227,29 @@ apool.achanges(since=None, timeout=None) -> AsyncWatch # 异步迭代
 查询都是陈旧的却不声张。三种都安静结束的话，丢座位和"超时到了、一切正常"长得
 一模一样 —— 只能事后去查 `Member.accepted`，而那正是不该让调用方去猜的东西。
 
+### 只盯几个字段
+
+```python
+pool.changes(fields=["role", "ready"])
+apool.achanges(fields=["role", "ready"])
+```
+
+给了 `fields` 之后，只有这些字段（或成员进出、座位换人）真的动了才产出快照。
+`ready` 和 `url` 是成员自己的一部分，也能点名；其余名字在 state 里找。
+
+比较发生在 **Rust 缓存里**，在任何东西被序列化之前。实测 5,000 成员：
+
+| | |
+|---|---|
+| `pool.snapshot()` | 8.78 ms |
+| `field_digest(["role", "ready"])` | **0.40 ms** |
+
+放在 Python 层做 predicate 是省不下来的 —— 它要拿到 `Snapshot` 才能判断，而那
+时候钱已经花完了。
+
+**身份永远算数。** 座位换人即使新任期发布的字段和前任一模一样，也会产出 ——
+否则你会继续对着一个已经死掉的 incarnation 说话。
+
 ### `Watch` / `AsyncWatch`
 
 `changes()` 和 `achanges()` 返回的对象，可迭代、可关闭、也是上下文管理器：
@@ -232,6 +282,51 @@ w.close()                          # 也可以从另一个线程/任务关掉
     客户端以心跳为采样率，注册中心会把一个间隔内的多次变化折叠成"该成员的当前
     状态"。所以承诺"不丢事件"是协议兑现不了的；快照能诚实兑现"不丢状态"。
     事件是一次 diff 的事 —— 每条记录都带 `incarnation` 和 `ready`。
+
+### 等条件
+
+```python
+pool.until(predicate, since=None, timeout=None, describe="") -> Snapshot
+await apool.auntil(predicate, since=None, timeout=None, describe="")
+```
+
+阻塞到 `predicate(snapshot)` 为真，返回那个快照；超时抛 `TimeoutError`，
+`describe` 是错误里说"在等什么"的那句话。
+
+**每个手写的等待循环都要做对同样四件事**，所以只写一遍：先看已经成立没有、把
+revision 无缝交接过去、被 `close()` 时停下、`Fenced` 放出去而不是当成"条件还没
+满足"。第二件做错最难发现 —— 池子在"先看一眼"和"开始订阅"之间动了，等待就会为
+一个立刻成立的条件白等满整个超时。
+
+下面几个都是它的特例。
+
+### 等成员就绪（异步）
+
+```python
+await apool.await_ready(count=1, timeout=30.0, **filt) -> list[Handle]
+```
+
+`Pool.wait()` 的事件循环版。
+
+!!! warning "不要在事件循环上调用继承来的 `wait()`"
+    `AsyncPool` 继承了同步的 `wait()`，它在 loop 上不是"不够优雅"，是**停掉整个
+    loop**：实测一秒的 `apool.wait()` 只放过 5 次 10ms 的 tick，本该有一百次。
+
+    用 `asyncio.to_thread` 包一层也不对 —— 取消它并不会停掉底下那个线程，等待
+    期间一直占着默认 executor 的一个 worker。
+
+### 等指定任期离场
+
+```python
+pool.wait_departure(identity, timeout=None) -> bool
+await apool.await_departure(identity, timeout=None) -> bool
+```
+
+阻塞到这个**任期**不在池子里了，返回 `True`；超时返回 `False`。离开、租约过期、
+座位换人都算。
+
+和 `wait_replacement()` 是两个问题：后者只在有人接任时才回答，前任只是走了、没人
+接手的话，它会等满超时返回 `None`。要接手工作的一方通常只需要知道前任不在了。
 
 ### 等待座位换人
 
@@ -376,7 +471,22 @@ def pull_job(self, ctx: tinyray.CallContext) -> dict:
 **自称的身份，不是认证。** 这个系统里任期号本来也是成员自己生成的。它买到的是
 "调用方不会忘了传、也不会传错"，仅此而已。
 
-`request_id` 每次调用都不同，两侧的日志因此能指着同一次尝试说话。
+`request_id` 默认每次调用都不同，两侧的日志因此能指着同一次尝试说话。
+
+要让**重试共用一个名字**（幂等场景需要），把重试循环整个包起来：
+
+```python
+with tinyray.request_id(f"commit-{batch}"):
+    for _ in range(3):
+        try:
+            return h.commit(rows)
+        except tinyray.NotDelivered:
+            continue
+```
+
+用块而不是逐调用的参数，因为重试本来就是块的形状，也因为关键字会和被调方自己的
+参数名打架。ContextVar 实现，所以它跟着 `await` 走进这个块起的任务，不会漏进
+旁边那个。
 
 !!! note "tinyray 不做幂等缓存"
     只给名字，不按它去重。被调方无从知道一次调用重放是否安全 —— 结果留多久、
