@@ -240,7 +240,9 @@ def test_a_beat_still_in_flight_cannot_undo_a_leave(registry):
     机制：注册表把刚离开的任期记住一个租约的时间，之后带着那个任期来的心跳一律
     当幽灵。用 `Client` 直接指定任期就能确定地送出这样一拍。
     """
-    ident = 4242
+    # 座位号得落在世界里 —— 写这条测试时随手挑了 4242 配 size=1，被后来加的
+    # 形状校验当场拦下。座位是 0 号，id 就是 0，补那一拍照样构造得出来。
+    ident = 0
     with tinyray.join("late", "stateful", slot=ident, size=1) as me:
         me.ready()
         tenure = me.incarnation
