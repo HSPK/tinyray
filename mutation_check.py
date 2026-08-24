@@ -406,6 +406,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_loops_in_many_threads_do_not_close_each_others_pipes",
     ),
     (
+        "a forked child keeps the parent's shared connection",
+        PY_RPC,
+        "    _sync = None\n",
+        "",
+        "tests/test_fork_and_reply_budget.py::test_a_forked_child_does_not_share_the_synchronous_connection",
+    ),
+    (
         "a forked child keeps the parent's transports",
         PY_RPC,
         "    _loops.clear()\n",

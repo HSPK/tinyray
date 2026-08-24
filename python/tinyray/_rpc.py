@@ -131,8 +131,13 @@ def reset_after_fork() -> None:
     inherits the lock held with no thread left to release it -- the child then
     hangs on its first watch, in native code with no Python frame to say why.
     """
-    global _per_loop_lock
+    global _per_loop_lock, _sync
     _per_loop_lock = threading.Lock()
+    # The shared one goes the same way, and it is the one that bites: two
+    # processes taking turns on one keep-alive connection had a call come back
+    # with the *other* process's answer -- no exception, no warning, just the
+    # wrong value. Measured at 300 calls each from parent and child.
+    _sync = None
     # The transports belong to the parent's loops and speak over the parent's
     # sockets. Dropped rather than closed: the parent still owns those
     # descriptors. Left in place, both processes write down the same

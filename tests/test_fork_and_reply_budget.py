@@ -235,6 +235,7 @@ def test_the_oversize_nudge_points_at_the_line_that_made_the_call(registry):
 FORK_THEN_BOTH_CALL = textwrap.dedent(
     """
     import asyncio, os, sys, tinyray
+    from tinyray import _rpc
 
     class S:
         def echo(self, x): return x
@@ -258,21 +259,25 @@ FORK_THEN_BOTH_CALL = textwrap.dedent(
 
     loop.run_until_complete(hammer("warm", 3))   # 让连接池装上父进程的 socket
 
-    r, w = os.pipe()
+    go_r, go_w = os.pipe()
+    res_r, res_w = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os.close(r)
+        os.close(go_r); os.close(res_r)
         try:
+            carried = len(_rpc._loops)    # fork 之后第一件事：手里还攥着几个？
             kid = tinyray.join("forkcli", "churn")
             kid.ready()
-            bad = loop.run_until_complete(hammer("C", 300))   # 沿用同一个 loop
-            os.write(w, f"CHILD {len(bad)} {bad[:2]}".encode()[:400])
+            os.write(go_w, b"x")          # 加入完了再一起开打，让重叠最大
+            bad = loop.run_until_complete(hammer("C", 400))   # 沿用同一个 loop
+            os.write(res_w, f"CHILD carried={carried} {len(bad)} {bad[:2]}".encode()[:400])
         except BaseException as e:
-            os.write(w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
+            os.write(res_w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
         os._exit(0)
-    os.close(w)
-    mine = loop.run_until_complete(hammer("P", 300))
-    kid_says = os.read(r, 4000).decode()
+    os.close(go_w); os.close(res_w)
+    os.read(go_r, 1)
+    mine = loop.run_until_complete(hammer("P", 400))
+    kid_says = os.read(res_r, 4000).decode()
     os.waitpid(pid, 0)
     print(f"PARENT {len(mine)} {mine[:2]} | {kid_says}", flush=True)
     """
@@ -286,10 +291,14 @@ def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
     子进程如果继续用 fork 之前那个 loop，拿到的就是**父进程那一个** httpx
     client —— 同一批已经建立好的 TCP 连接。于是两个进程往同一条连接里写请求。
 
-    实测父子各调 300 次：每一轮都至少坏一次，要么服务端收到拼接错的请求回
-    `HTTP 400`（而且是 `OutcomeUnknown`，这次调用可能已经执行了），要么事件
-    循环拒绝这个 socket 报 `FileExistsError: [Errno 17]` —— 两个进程往同一个
-    epoll 注册同一个 fd。丢掉继承来的连接池之后，三轮都是 0。
+    实测能坏成什么样：请求被拼接串了、服务端回 `HTTP 400`（而且是
+    `OutcomeUnknown`，这次调用可能已经执行了），或者事件循环拒绝这个 socket 报
+    `FileExistsError: [Errno 17]` —— 两个进程往同一个 epoll 注册同一个 fd。
+
+    但**断言的是机制不是损坏**：把修复撤掉，即使父子加了握手同时开打，400 次
+    调用也只有 1/5 的轮次真的串起来 —— 拿这个当唯一信号就是条会飘的测试。
+    子进程 fork 之后手里攥着几个连接池是确定的：0，撤掉修复就是 1。
+    （同步那条路上串号是 5/5 稳定复现的，危害由它去证。）
 
     继承来的管道早就是这么处理的：丢掉但不关闭，描述符还是父进程的。
     """
@@ -306,6 +315,88 @@ def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         out, err = p.communicate(timeout=10)
         raise AssertionError(f"fork 之后父子互相调用挂住了 stderr={err[-400:]!r}") from None
-    assert "PARENT 0 []" in out and "CHILD 0 []" in out, (
+    assert "CHILD carried=0 0 []" in out and "PARENT 0 []" in out, (
         f"父子共用了一条连接：stdout={out!r} stderr={err[-600:]!r}"
+    )
+
+
+FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
+    """
+    import os, sys, tinyray
+
+    class S:
+        def echo(self, x): return x
+
+    srv = tinyray.join("forksync", "stateful", slot=0, size=1, serves=S())
+    srv.ready()
+
+    def hammer(tag, n):
+        h = tinyray.pool("forksync").slot(0)
+        bad = []
+        for i in range(n):
+            want = f"{tag}{i}"
+            try:
+                got = h.echo(want)
+                if got != want:
+                    bad.append(f"串号 想要{want!r} 拿到{got!r}")
+            except Exception as e:
+                bad.append(f"{type(e).__name__}: {e}")
+        return bad
+
+    hammer("warm", 3)   # 让共用的那个 client 装上父进程的 socket
+
+    go_r, go_w = os.pipe()
+    res_r, res_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(go_r); os.close(res_r)
+        try:
+            kid = tinyray.join("forksynccli", "churn")
+            kid.ready()
+            os.write(go_w, b"x")          # 加入完了再一起开打，让重叠最大
+            bad = hammer("C", 400)
+            os.write(res_w, f"CHILD {len(bad)} {bad[:2]}".encode()[:400])
+        except BaseException as e:
+            os.write(res_w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
+        os._exit(0)
+    os.close(go_w); os.close(res_w)
+    os.read(go_r, 1)
+    mine = hammer("P", 400)
+    kid_says = os.read(res_r, 4000).decode()
+    os.waitpid(pid, 0)
+    print(f"PARENT {len(mine)} {mine[:2]} | {kid_says}", flush=True)
+    """
+)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
+def test_a_forked_child_does_not_share_the_synchronous_connection(registry):
+    """同步这条路上，共用连接不是报错，是**拿回别人的答案**。
+
+    同步调用共用一个 httpx.Client —— 一个连接池，几条长连接。fork 把它连同
+    socket 一起复制过去，于是父子在同一条 keep-alive 连接上轮流发请求，应答就
+    按到达顺序发错了人。
+
+    实测父子各调 300 次，三轮里有两轮串号，而且是成对的：父进程 `want 'P118'`
+    拿到 `'C0'`，同一时刻子进程 `want 'C0'` 拿到 `'P118'`。**没有异常、没有
+    警告**，RPC 就是返回了另一个进程的结果 —— 比异步那条路上的 HTTP 400 更坏，
+    那边至少还会抛出来。
+
+    异步的连接池和继承来的管道都已经这么丢掉了。共用的这个是最后一个。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", FORK_THEN_BOTH_CALL_SYNC],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = p.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        out, err = p.communicate(timeout=10)
+        raise AssertionError(f"fork 之后父子同步互调挂住了 stderr={err[-400:]!r}") from None
+    assert "PARENT 0 []" in out and "CHILD 0 []" in out, (
+        f"父子共用了同一条同步连接：stdout={out!r} stderr={err[-600:]!r}"
     )
