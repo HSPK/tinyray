@@ -281,3 +281,67 @@ def test_an_empty_request_id_is_refused(peer):
     with pytest.raises(ValueError, match="something"):
         with tinyray.request_id(""):
             pass
+
+
+def test_a_non_ascii_pool_name_can_still_be_called(registry):
+    """pool 名字会随每次调用进 HTTP 头，而头值作为 str 必须是 ASCII。
+
+    `join("训练组")` 注册、被发现、被订阅都完全正常 —— 然后**每一次调用**都死在
+    一个裸的 `UnicodeEncodeError` 上：httpx 内部抛的，抛在调用现场，离那个名字
+    很远。改成按 UTF-8 字节发；ASCII 的身份逐字节不变，所以别的什么都没动。
+    """
+    peer = textwrap.dedent(
+        f"""
+        import os, sys, tinyray
+        os.environ["TINYRAY_REGISTRY"] = "{registry.endpoint}"
+        class S:
+            def who(self, ctx: tinyray.CallContext) -> str:
+                return ctx.identity
+        with tinyray.join("svc", "stateful", slot=0, serves=S()) as m:
+            m.ready()
+            print("READY", flush=True)
+            sys.stdin.readline()
+        """
+    )
+    p = subprocess.Popen(
+        [sys.executable, "-c", peer], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert p.stdout.readline().strip() == "READY"
+        with tinyray.join("训练组", "churn") as me:
+            me.ready()
+            h = tinyray.pool("svc").wait(count=1, timeout=15)[0]
+            seen = h.who()
+            assert seen.startswith("训练组/"), f"对端拿到的身份是 {seen!r}"
+            assert seen == me.identity, "身份没有原样还原"
+    finally:
+        try:
+            p.stdin.write("\n")
+            p.stdin.close()
+            p.wait(timeout=10)
+        except Exception:
+            p.kill()
+
+
+def test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set(peer):
+    """不合法的 id 要在**设置它的那一行**报错。
+
+    否则它死在 httpx 里，而调用方收到的是"对端联系不上" —— 于是跑去查网络。
+    换行更糟：它在头里就是一行的结束。
+    """
+    with pytest.raises(ValueError, match="control characters"):
+        with tinyray.request_id("a\nb"):
+            pass
+    with pytest.raises(ValueError, match="control characters"):
+        with tinyray.request_id("a\rb"):
+            pass
+    with pytest.raises(ValueError, match="too long"):
+        with tinyray.request_id("x" * 9000):
+            pass
+
+
+def test_a_request_id_may_be_a_natural_key_in_any_language(peer):
+    """自然键很可能不是 ASCII。既然身份能过，它也该能过。"""
+    h = tinyray.pool("svc").slot(0)
+    with tinyray.request_id("批次-42"):
+        assert h.whoami()["request_id"] == "批次-42"

@@ -59,6 +59,21 @@ class CallContext:
 _ABSENT = object()
 
 
+def _utf8(raw: str | None) -> str:
+    """A header value the caller sent as UTF-8 bytes.
+
+    http.server hands headers back decoded as latin-1, one byte per character,
+    so the original comes back by reversing exactly that. An ASCII value is
+    unchanged either way, which is why this is safe for every existing caller.
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return raw
+
+
 def scan(obj: Any) -> dict[str, Callable[..., Any]]:
     """Public methods, in declaration order. Leading underscore means private.
 
@@ -337,7 +352,7 @@ class _Handler(BaseHTTPRequestHandler):
         # nothing about the request looks wrong and only we know we are a ghost.
         if not self.server.still_ours():
             return self._send(409, {"error": "superseded", "identity": self.server.identity})
-        target = self.headers.get("x-tinyray-target")
+        target = _utf8(self.headers.get("x-tinyray-target")) or None
         if target and target != self.server.identity:
             return self._send(409, {"error": "fenced", "identity": self.server.identity})
 
@@ -371,8 +386,8 @@ class _Handler(BaseHTTPRequestHandler):
             args, kwargs = _coerce(
                 fn,
                 json.loads(raw or b"{}"),
-                self.headers.get("x-tinyray-caller") or "",
-                self.headers.get("x-tinyray-request") or "",
+                _utf8(self.headers.get("x-tinyray-caller")),
+                _utf8(self.headers.get("x-tinyray-request")),
             )
         except json.JSONDecodeError as e:
             self._send(400, {"error": str(e)})

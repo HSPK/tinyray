@@ -421,6 +421,28 @@ MUTANTS = [
         "tests/test_identity_and_fencing.py::test_a_caller_can_pin_one_name_across_retries",
     ),
     (
+        "the caller identity goes out as a str header again",
+        PY_RPC,
+        '        "x-tinyray-caller": _identity.encode(),',
+        '        "x-tinyray-caller": _identity,',
+        "tests/test_identity_and_fencing.py::test_a_non_ascii_pool_name_can_still_be_called",
+    ),
+    (
+        "the serving side does not decode what the caller sent",
+        "python/tinyray/_serve.py",
+        '        return raw.encode("latin-1").decode("utf-8")',
+        "        return raw",
+        "tests/test_identity_and_fencing.py::test_a_non_ascii_pool_name_can_still_be_called",
+    ),
+    (
+        "a request id with a newline in it is accepted",
+        PY_RPC,
+        '    if any(c < " " or c == "\\x7f" for c in value):',
+        "    if False:",
+        "tests/test_identity_and_fencing.py"
+        "::test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'else f"{_identity or \'anon\'}-{next(_seq)}"',

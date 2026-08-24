@@ -145,13 +145,19 @@ def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str
     body = json.dumps(payload).encode()
     headers = {
         "content-type": "application/json",
-        "x-tinyray-target": handle.identity,
-        "x-tinyray-caller": _identity,
+        # As bytes, because a header value has to be ASCII as a str and a pool
+        # name does not have to be ASCII. `join("训练组")` registers, is found
+        # and is watched perfectly well, and then every call to it died with a
+        # raw UnicodeEncodeError -- an error from httpx's internals, raised at
+        # the call site, a long way from the name that caused it. UTF-8 bytes
+        # are byte-identical for an ASCII identity, so nothing else moves.
+        "x-tinyray-target": handle.identity.encode(),
+        "x-tinyray-caller": _identity.encode(),
         # Names this attempt, so the two sides can talk about the same call.
         # Deliberately just the name: deduplicating on it would mean the
         # callee deciding what is safe to replay, and only the caller knows
         # that. OutcomeUnknown is where that decision belongs.
-        "x-tinyray-request": _request_id(),
+        "x-tinyray-request": _request_id().encode(),
     }
     return f"{handle.url}/call/{name}", body, headers
 
@@ -192,8 +198,21 @@ def request_id(value: str) -> Iterator[str]:
     A ContextVar, so it follows an await into the tasks that block starts and
     does not leak into a neighbouring one.
     """
+    # Checked here, where the mistake is. A name that cannot be a header value
+    # fails inside httpx otherwise, and the caller is told the peer could not
+    # be reached -- which sends them to look at the network.
     if not value:
         raise ValueError("a request id has to be something; empty names nothing")
+    if any(c < " " or c == "\x7f" for c in value):
+        raise ValueError(
+            f"a request id cannot contain control characters; got {value!r}. "
+            f"It travels as a header, where a newline would end it."
+        )
+    if len(value.encode()) > 200:
+        raise ValueError(
+            f"a request id of {len(value.encode())} bytes is too long; keep it "
+            f"under 200. It is sent on every attempt, and servers cap headers."
+        )
     token = _pinned.set(value)
     try:
         yield value
