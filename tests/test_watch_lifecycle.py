@@ -466,3 +466,117 @@ def test_the_async_stream_ends_the_same_three_ways(registry):
             me.leave()
         except Exception:
             pass
+
+
+def _drain_into(w, out: list) -> threading.Thread:
+    def go() -> None:
+        try:
+            for snap in w:
+                out.append(snap)
+        except BaseException:  # noqa: BLE001 - 由调用方断言
+            pass
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    return t
+
+
+def test_a_watch_on_named_fields_ignores_the_rest(registry):
+    """只关心两个 key 的 watcher，不该为第三个 key 的变化付整份快照的钱。
+
+    比较必须在 Rust 缓存里做。放在 Python 里做等于白做 —— predicate 要拿到
+    `Snapshot` 才能判断，而那时候钱已经花完了。实测 5,000 成员：
+    `snapshot()` 8.78ms，`field_digest(['role','ready'])` 0.40ms，差 22 倍。
+    """
+    with tinyray.join("p", "churn") as me:
+        me.ready(role="trainer", step=0)
+        me.flush()
+        pool = tinyray.pool("p")
+
+        got: list = []
+        w = pool.changes(fields=["role"])
+        _drain_into(w, got)
+        time.sleep(0.3)
+
+        for i in range(1, 6):
+            me.update(step=i)  # 没人订阅的字段
+            time.sleep(0.1)
+        me.flush()
+        time.sleep(0.3)
+        assert got == [], f"无关字段的变化产出了 {len(got)} 个快照"
+
+        me.update(role="rollout")  # 订阅了的字段
+        me.flush()
+        time.sleep(0.5)
+        w.close()
+        assert len(got) >= 1, "订阅的字段变了，却没有产出"
+        assert any(h.state.get("role") == "rollout" for h in got[-1].members)
+
+
+def test_a_watch_on_fields_still_sees_people_come_and_go(registry):
+    """成员进出永远算数，不管订阅了哪些字段 —— 否则"谁在池子里"就成了盲区。"""
+    with tinyray.join("p", "churn") as me:
+        me.ready(role="trainer")
+        me.flush()
+        pool = tinyray.pool("p")
+        got: list = []
+        w = pool.changes(fields=["role"])
+        _drain_into(w, got)
+        time.sleep(0.3)
+        assert got == []
+
+        peer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    f"""
+                    import os, sys, tinyray
+                    os.environ["TINYRAY_REGISTRY"] = "{registry.endpoint}"
+                    m = tinyray.join("p", "churn")
+                    m.ready(role="trainer")
+                    print("READY", flush=True)
+                    sys.stdin.readline()
+                    """
+                ),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            peer.stdout.readline()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not got:
+                time.sleep(0.05)
+            assert got, "来了一个新成员，订阅字段的 watcher 却没看见"
+        finally:
+            w.close()
+            peer.stdin.write("\n")
+            peer.stdin.close()
+            peer.wait(timeout=10)
+
+
+def test_readiness_can_be_watched_by_name(registry):
+    """`ready` 和 `url` 是成员自己的一部分，不在 state 里，但一样能点名。"""
+    with tinyray.join("p", "churn") as me:
+        me.ready(step=0)
+        me.flush()
+        pool = tinyray.pool("p")
+        got: list = []
+        w = pool.changes(fields=["ready"])
+        _drain_into(w, got)
+        time.sleep(0.3)
+
+        me.update(step=1)
+        me.flush()
+        time.sleep(0.3)
+        assert got == [], "改的是 step，不该惊动订阅 ready 的 watcher"
+
+        me.unready()
+        me.flush()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not got:
+            time.sleep(0.05)
+        w.close()
+        assert got, "readiness 变了却没有产出"

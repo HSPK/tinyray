@@ -205,3 +205,50 @@ def test_a_snapshot_answers_about_one_exact_tenure(registry):
         assert snap.slot(0).incarnation == me.incarnation
     finally:
         me.leave()
+
+
+def test_a_caller_can_pin_one_name_across_retries(peer):
+    """自动生成的 id 每次都变 —— 对追踪是对的，对幂等是错的。
+
+    被调方要认出"这是同一次重试"，就得每次拿到同一个名字。没有这个的话，幂等
+    key 只能当普通参数传，于是它成了又一件要一路穿下去、又一件在重试分支上会
+    忘掉的东西。
+    """
+    h = tinyray.pool("svc").slot(0)
+    assert h.whoami()["request_id"] != h.whoami()["request_id"], "自动 id 应该每次都不同"
+
+    with tinyray.request_id("commit-42"):
+        seen = [h.whoami()["request_id"] for _ in range(3)]
+    assert seen == ["commit-42"] * 3, seen
+
+    # 出了这个块就该恢复自动生成，否则一个名字会粘住整个进程。
+    assert h.whoami()["request_id"] != "commit-42"
+
+
+def test_a_pinned_name_does_not_leak_into_a_neighbouring_task(peer):
+    """用 ContextVar 而不是全局变量：它跟着 await 走进这个块起的任务，
+    但不会漏进旁边那个。"""
+    import asyncio
+
+    async def body() -> tuple[str, str]:
+        ah = tinyray.apool("svc").slot(0)
+
+        async def pinned() -> str:
+            with tinyray.request_id("pinned-one"):
+                return (await ah.whoami())["request_id"]
+
+        async def loose() -> str:
+            await asyncio.sleep(0.05)
+            return (await ah.whoami())["request_id"]
+
+        return await asyncio.gather(pinned(), loose())  # type: ignore[return-value]
+
+    a, b = asyncio.run(body())
+    assert a == "pinned-one"
+    assert b != "pinned-one", f"名字漏进了旁边的任务: {b}"
+
+
+def test_an_empty_request_id_is_refused(peer):
+    with pytest.raises(ValueError, match="something"):
+        with tinyray.request_id(""):
+            pass

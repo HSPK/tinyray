@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import threading
+import time
 import traceback
 import typing
 from collections.abc import Callable
@@ -108,6 +109,59 @@ def _coerce(
     return args, kwargs
 
 
+class Counters:
+    """What the serving side has been asked to do, and how much of it it refused.
+
+    Exists so the question "do these long calls need a transport of their own"
+    can be settled with numbers. `max_concurrency` bounds pile-up, but it does
+    not separate control traffic from data traffic: once every slot is held,
+    a control call is refused exactly like any other. Whether that is happening
+    is not something to have an opinion about.
+
+    Plain ints under a lock rather than a metrics library: this is a membership
+    layer, and whoever wants histograms can build them from `calls` and
+    `busy_ns`.
+    """
+
+    __slots__ = ("calls", "refused", "failed", "in_flight", "peak_in_flight", "busy_ns", "_lock")
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.refused = 0
+        self.failed = 0
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self.busy_ns = 0
+        self._lock = threading.Lock()
+
+    def entered(self) -> None:
+        with self._lock:
+            self.in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+
+    def left(self, spent_ns: int, failed: bool) -> None:
+        with self._lock:
+            self.in_flight -= 1
+            self.calls += 1
+            self.busy_ns += spent_ns
+            self.failed += failed
+
+    def refuse(self) -> None:
+        with self._lock:
+            self.refused += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "calls": self.calls,
+                "refused": self.refused,
+                "failed": self.failed,
+                "in_flight": self.in_flight,
+                "peak_in_flight": self.peak_in_flight,
+                "busy_ms": self.busy_ns // 1_000_000,
+            }
+
+
 class _Server(ThreadingHTTPServer):
     """Carries what the handler needs. Declared rather than attached on the
     fly, so a rename is a type error instead of an AttributeError at request
@@ -119,6 +173,7 @@ class _Server(ThreadingHTTPServer):
     still_ours: Callable[[], bool]
     loop: asyncio.AbstractEventLoop | None
     slots: threading.Semaphore | None
+    counters: Counters
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -250,15 +305,22 @@ class _Handler(BaseHTTPRequestHandler):
         # saying no *here* -- after the body, before the method -- is what
         # makes it safe to retry: nothing ran.
         slots = self.server.slots
+        counters = self.server.counters
         if slots is not None and not slots.acquire(blocking=False):
+            counters.refuse()
             return self._send(503, {"error": "at the concurrency limit"})
+        counters.entered()
+        started = time.perf_counter_ns()
+        failed = True
         try:
-            return self._dispatch(fn, name, raw)
+            failed = self._dispatch(fn, name, raw)
         finally:
+            counters.left(time.perf_counter_ns() - started, failed)
             if slots is not None:
                 slots.release()
 
-    def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> None:
+    def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> bool:
+        """Returns True if the call failed, however it failed."""
         try:
             args, kwargs = _coerce(
                 fn,
@@ -267,11 +329,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self.headers.get("x-tinyray-request") or "",
             )
         except json.JSONDecodeError as e:
-            return self._send(400, {"error": str(e)})
+            self._send(400, {"error": str(e)})
+            return True
         except msgspec.ValidationError as e:
             # A type mismatch is the caller's fault, so it is reported as one
             # rather than dressed up as a business failure.
-            return self._send(422, {"error": f"{name}(): {e}"})
+            self._send(422, {"error": f"{name}(): {e}"})
+            return True
 
         try:
             result = fn(*args, **kwargs)
@@ -284,7 +348,7 @@ class _Handler(BaseHTTPRequestHandler):
                     # new one: the user's clients are bound to theirs.
                     result = asyncio.run_coroutine_threadsafe(result, loop).result()
         except Exception as exc:
-            return self._send(
+            self._send(
                 200,
                 {
                     "error": {
@@ -294,7 +358,9 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 },
             )
+            return True
         self._send(200, {"result": result})
+        return False
 
 
 class MethodServer:
@@ -321,6 +387,9 @@ class MethodServer:
         self._srv.still_ours = lambda: self.still_ours()
         self._srv.loop = loop
         self._srv.slots = None if max_concurrency is None else threading.Semaphore(max_concurrency)
+        self.counters = Counters()
+        self._srv.counters = self.counters
+        self.limit = max_concurrency
         self.port = self._srv.server_address[1]
         self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
         self._thread.start()

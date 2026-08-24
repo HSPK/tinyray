@@ -18,6 +18,7 @@ import threading
 import time
 import warnings
 import weakref
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
@@ -37,6 +38,7 @@ from ._errors import (
     Unreachable,
 )
 from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
+from ._rpc import request_id
 from ._serve import CallContext
 from ._serve import MethodServer as _MethodServer
 from ._tinyray import Client as _Client
@@ -60,6 +62,7 @@ __all__ = [
     "AsyncPool",
     "Epoch",
     "CallContext",
+    "request_id",
     "Snapshot",
     "RegistryInfo",
     "Watch",
@@ -439,15 +442,35 @@ class _Watching:
     waiting is written twice.
     """
 
-    __slots__ = ("_pool", "_c", "_seen", "_deadline", "_closed", "_tick", "__weakref__")
+    __slots__ = (
+        "_pool",
+        "_c",
+        "_seen",
+        "_deadline",
+        "_closed",
+        "_tick",
+        "_fields",
+        "_digest",
+        "__weakref__",
+    )
 
-    def __init__(self, pool: Pool, since: int | None, timeout: float | None):
+    def __init__(
+        self,
+        pool: Pool,
+        since: int | None,
+        timeout: float | None,
+        fields: Sequence[str] | None = None,
+    ):
         self._pool = pool
         self._c = pool._c
         self._seen = pool.snapshot().revision if since is None else since
         self._deadline = None if timeout is None else time.monotonic() + timeout
         self._closed = False
         self._tick = 0
+        self._fields = None if fields is None else list(fields)
+        self._digest = (
+            None if self._fields is None else self._c.field_digest(pool._name, self._fields, False)
+        )
         _live_watches.add(self)
 
     def close(self) -> None:
@@ -499,7 +522,15 @@ class _Watching:
         # did not move.
         if info is not None and info[0] != self._seen:
             self._seen = info[0]
-            return self._pool.snapshot(), 0
+            if self._fields is None:
+                return self._pool.snapshot(), 0
+            # Something moved, but maybe not anything this watcher named. Ask
+            # the cache directly: building the snapshot to find out would be
+            # the whole cost we are trying to avoid.
+            digest = self._c.field_digest(self._pool._name, self._fields, False)
+            if digest != self._digest:
+                self._digest = digest
+                return self._pool.snapshot(), 0
         ms = _left_ms(self._deadline)
         return (None, 0) if ms is None else (None, ms)
 
@@ -631,7 +662,12 @@ class Pool:
         members = [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
         return Snapshot(self._name, version, members)
 
-    def changes(self, since: int | None = None, timeout: float | None = None) -> Watch:
+    def changes(
+        self,
+        since: int | None = None,
+        timeout: float | None = None,
+        fields: Sequence[str] | None = None,
+    ) -> Watch:
         """Snapshots of this pool, one per change. Never polls.
 
         The result is closeable and works as a context manager, which is the
@@ -642,7 +678,7 @@ class Pool:
                 for snap in w:
                     ...
         """
-        return Watch(self, since, timeout)
+        return Watch(self, since, timeout, fields)
 
     def _replacement_target(
         self, slot: int | None, identity: str | None, who: str
@@ -697,6 +733,67 @@ class Pool:
         # Never silently substitute another member: routing a keyed request to
         # the wrong seat corrupts data instead of raising.
         raise NotFound(f"seat {k} of {self._name!r} is empty")
+
+    def until(
+        self,
+        predicate: Callable[[Snapshot], bool],
+        since: int | None = None,
+        timeout: float | None = None,
+        describe: str = "",
+    ) -> Snapshot:
+        """Block until `predicate` accepts a snapshot of this pool, and return it.
+
+        Every wait on a pool is this loop with a different condition in the
+        middle, and each hand-written copy has the same four things to get
+        right: test what is already true before waiting, hand the revision over
+        without leaving a gap, stop when the watch is closed, and let `Fenced`
+        through rather than treating a lost seat as "condition not met yet".
+        Getting the second one wrong is the interesting failure -- the pool
+        moves between the first look and the subscription, and the wait then
+        sits out its whole timeout on a condition that came true immediately.
+
+        `describe` is what the timeout message says was being waited for. Worth
+        passing: "waited 30s" without saying for what is a bad error.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        # Already true? Then no waiting, and no chance to miss anything.
+        snap = self.snapshot()
+        if predicate(snap):
+            return snap
+        # Hand over the revision this snapshot stood at, so a change that
+        # landed while the predicate was running is still delivered.
+        with self.changes(since=snap.revision if since is None else since, timeout=timeout) as w:
+            for snap in w:
+                if predicate(snap):
+                    return snap
+        raise TimeoutError(
+            f"waited {timeout}s for {describe or 'a condition'} in "
+            f"{self._name!r}; the pool holds {len(snap)} member(s)"
+            + (f", last seen at revision {snap.revision}" if deadline else "")
+        )
+
+    def wait_departure(self, identity: str, timeout: float | None = None) -> bool:
+        """Block until this exact tenure is no longer in the pool. True if it left.
+
+        A different question from `wait_replacement()`, which only answers once
+        somebody takes the seat: an owner that simply leaves and is not
+        replaced makes that one sit out its whole timeout and return None.
+        Whoever is waiting to take over the work usually only needs to know the
+        previous owner is gone -- whether anyone succeeded it is a separate
+        matter, and often nobody has yet.
+
+        Gone covers all the ways: left, lease expired, or the seat changed
+        hands. It is the tenure that is being watched, not the seat.
+        """
+
+        def departed(snap: Snapshot) -> bool:
+            return snap.get(identity) is None
+
+        try:
+            self.until(departed, timeout=timeout, describe=f"{identity} to leave")
+        except TimeoutError:
+            return False
+        return True
 
     def wait(self, count: int = 1, timeout: float = 30.0, **filt: Any) -> list[Handle]:
         """Block until `count` members match. Bounded, and the failure names them."""
@@ -1027,8 +1124,33 @@ class Member:
         return self._c.silence_ms
 
     def stats(self) -> dict[str, int]:
+        """Counters for this process: the heartbeat, the watches, and -- if it
+        serves anything -- the calls it has been asked to run.
+
+        The serving half exists so "do the long calls need a transport of their
+        own" is a question with an answer. `max_concurrency` bounds pile-up,
+        but it does not keep control traffic apart from data traffic: once every
+        slot is held, a control call is refused like any other. `refused` next
+        to `peak_in_flight` says whether that is happening.
+
+        | key | meaning |
+        |---|---|
+        | `beats_ok` / `beats_failed` | heartbeats answered, and not |
+        | `interval_ms` / `silence_ms` | current beat spacing, time since the last one |
+        | `watch_wakeups` | times the local cache moved and woke a waiter |
+        | `state_bytes` | size of what this member is publishing |
+        | `pool_revision` | version of its own pool, as last heard |
+        | `calls` / `failed` / `refused` | served, raised, turned away at the limit |
+        | `in_flight` / `peak_in_flight` | concurrent calls now, and the most so far |
+        | `busy_ms` | total time spent inside handlers |
+        """
         self._mine()
-        return self._c.stats()
+        out = self._c.stats()
+        if self._server is not None:
+            out.update(self._server.counters.snapshot())
+            if self._server.limit is not None:
+                out["concurrency_limit"] = self._server.limit
+        return out
 
     @property
     def last_error(self) -> str:
@@ -1295,14 +1417,78 @@ class AsyncPool(Pool):
 
     _handle_cls = AsyncHandle
 
-    def achanges(self, since: int | None = None, timeout: float | None = None) -> AsyncWatch:
+    def achanges(
+        self,
+        since: int | None = None,
+        timeout: float | None = None,
+        fields: Sequence[str] | None = None,
+    ) -> AsyncWatch:
         """`changes()` for an event loop.
 
         Waits on a pipe the heartbeat writes to, so no executor thread is held
         and cancelling the iteration is immediate. Closeable and usable as an
         async context manager, same as the synchronous one.
         """
-        return AsyncWatch(self, since, timeout)
+        return AsyncWatch(self, since, timeout, fields)
+
+    async def auntil(
+        self,
+        predicate: Callable[[Snapshot], bool],
+        since: int | None = None,
+        timeout: float | None = None,
+        describe: str = "",
+    ) -> Snapshot:
+        """`until()` for an event loop."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        snap = self.snapshot()
+        if predicate(snap):
+            return snap
+        watch = self.achanges(since=snap.revision if since is None else since, timeout=timeout)
+        async with watch as w:
+            async for snap in w:
+                if predicate(snap):
+                    return snap
+        raise TimeoutError(
+            f"waited {timeout}s for {describe or 'a condition'} in "
+            f"{self._name!r}; the pool holds {len(snap)} member(s)"
+            + (f", last seen at revision {snap.revision}" if deadline else "")
+        )
+
+    async def await_ready(self, count: int = 1, timeout: float = 30.0, **filt: Any) -> list[Handle]:
+        """`Pool.wait()` for an event loop.
+
+        `AsyncPool` used to inherit the blocking one, which does not merely
+        feel wrong on a loop -- it stops the loop. Measured: one second of
+        `apool.wait()` let five 10ms ticks through where a hundred were due.
+        Wrapping it in `asyncio.to_thread` is the caller doing the library's
+        job, and it strands a worker for as long as the wait lasts.
+        """
+        found: list[Handle] = []
+
+        def enough(_: Snapshot) -> bool:
+            # Matching stays in Rust, where `wait()` does it too: the rules are
+            # not obvious (numbers compare by value, booleans strictly) and a
+            # second implementation here would drift from the first.
+            nonlocal found
+            found = self._members(filt, require_ready=True)
+            return len(found) >= count
+
+        await self.auntil(
+            enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}"
+        )
+        return found
+
+    async def await_departure(self, identity: str, timeout: float | None = None) -> bool:
+        """`wait_departure()` for an event loop."""
+
+        def departed(snap: Snapshot) -> bool:
+            return snap.get(identity) is None
+
+        try:
+            await self.auntil(departed, timeout=timeout, describe=f"{identity} to leave")
+        except TimeoutError:
+            return False
+        return True
 
     async def await_replacement(
         self,

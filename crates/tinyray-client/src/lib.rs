@@ -88,6 +88,7 @@ impl Client {
             wake: tokio::sync::Notify::new(),
             revision: Mutex::new(0),
             bell: std::sync::Condvar::new(),
+            wakeups: AtomicU64::new(0),
             wake_fds: Mutex::new(Vec::new()),
         });
         Ok(Self {
@@ -249,6 +250,49 @@ impl Client {
         ))
     }
 
+    /// A hash over only the named fields of every member, plus who is present.
+    ///
+    /// A watcher that cares about two keys should not pay for a whole snapshot
+    /// every time somebody bumps a third. Comparing in Python cannot help: the
+    /// predicate needs a `Snapshot` to look at, and by then the work is done --
+    /// measured at 5,000 members, `snapshot()` is 8.78ms against 0.40ms here,
+    /// so the comparison has to happen against the cache, before anything is
+    /// serialised.
+    ///
+    /// `ready` and `url` name those parts of a member; anything else is looked
+    /// up in its published state. Identity is always part of the hash: a seat
+    /// changing hands matters even when the new tenure publishes exactly what
+    /// the old one did.
+    fn field_digest(&self, pool: &str, fields: Vec<String>, require_ready: bool) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let cache = self.shared.cache.read().unwrap();
+        let c = cache.get(pool)?;
+        let mut ids: Vec<&u64> = c.members.keys().collect();
+        ids.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for id in ids {
+            let m = &c.members[id];
+            if require_ready && !m.ready {
+                continue;
+            }
+            m.id.hash(&mut h);
+            m.incarnation.hash(&mut h);
+            for f in &fields {
+                match f.as_str() {
+                    "ready" => m.ready.hash(&mut h),
+                    "url" => m.url.hash(&mut h),
+                    other => m
+                        .state
+                        .get(other)
+                        .map(|v| v.to_string())
+                        .unwrap_or_default()
+                        .hash(&mut h),
+                }
+            }
+        }
+        Some(h.finish())
+    }
+
     /// Version and roster fingerprint of a cached pool, or None if unseen.
     fn pool_info(&self, pool: &str) -> Option<(u64, u64, Option<u64>, Vec<String>)> {
         let cache = self.shared.cache.read().unwrap();
@@ -351,6 +395,28 @@ impl Client {
                 self.shared.interval_ms.load(Ordering::Relaxed),
             ),
             ("silence_ms".into(), self.shared.silence_ms()),
+            (
+                "watch_wakeups".into(),
+                self.shared.wakeups.load(Ordering::Relaxed),
+            ),
+            (
+                "state_bytes".into(),
+                self.shared.published.lock().unwrap().state.to_string().len() as u64,
+            ),
+            (
+                "pool_revision".into(),
+                self.shared
+                    .cache
+                    .read()
+                    .unwrap()
+                    .get(&self.shared.pool)
+                    .map(|c| c.version)
+                    .unwrap_or(0),
+            ),
+            (
+                "watched_pools".into(),
+                self.shared.watch.lock().unwrap().len() as u64,
+            ),
         ])
     }
 }

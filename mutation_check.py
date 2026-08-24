@@ -22,8 +22,54 @@ RS_STATE = "crates/tinyray-registry/src/state.rs"
 RS_LIB = "crates/tinyray-client/src/lib.rs"
 PY_RPC = "python/tinyray/_rpc.py"
 
+UNTIL_BOOTSTRAP = (
+    "        snap = self.snapshot()\n"
+    "        if predicate(snap):\n"
+    "            return snap\n"
+    "        # Hand over the revision this snapshot stood at, so a change that\n"
+    "        # landed while the predicate was running is still delivered.\n"
+    "        with self.changes("
+    "since=snap.revision if since is None else since, timeout=timeout) as w:"
+)
+AWAIT_READY = (
+    "        await self.auntil(\n"
+    '            enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}"\n'
+    "        )\n"
+    "        return found"
+)
+
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
+    (
+        "until() waits instead of checking what is already true",
+        PY_INIT,
+        UNTIL_BOOTSTRAP,
+        "        snap = self.snapshot()\n"
+        "        with self.changes(since=since, timeout=timeout) as w:",
+        "tests/test_waiting.py::test_until_returns_at_once_when_it_is_already_true",
+    ),
+    (
+        "wait_departure watches the seat instead of the tenure",
+        PY_INIT,
+        "            return snap.get(identity) is None\n\n        try:\n            self.until(departed,",
+        "            return snap.slot(0) is None\n\n        try:\n            self.until(departed,",
+        "tests/test_waiting.py::test_wait_departure_is_about_the_tenure_not_the_seat",
+    ),
+    (
+        "await_ready blocks the event loop",
+        PY_INIT,
+        AWAIT_READY,
+        "        return self.wait(count, timeout, **filt)",
+        "tests/test_waiting.py::test_await_ready_leaves_the_event_loop_turning",
+    ),
+    (
+        "await_ready borrows an executor thread",
+        PY_INIT,
+        AWAIT_READY,
+        "        found = await asyncio.to_thread(self.wait, count, timeout, **filt)\n"
+        "        return found",
+        "tests/test_waiting.py::test_await_ready_holds_no_executor_thread",
+    ),
     (
         "update() asserts readiness like ready() did",
         PY_INIT,
@@ -55,7 +101,8 @@ MUTANTS = [
     (
         "achanges() goes back to an executor thread",
         PY_INIT,
-        "            await bell.wait(ms / 1000)",
+        "            raise StopAsyncIteration\n            await bell.wait(ms / 1000)",
+        "            raise StopAsyncIteration\n"
         "            await asyncio.to_thread(self._c.wait_revision, self._tick, ms)",
         "tests/test_watch_lifecycle.py::test_async_watchers_hold_no_executor_thread",
     ),
@@ -198,7 +245,25 @@ def build() -> bool:
     ).returncode
 
 
+def check_anchors() -> list[str]:
+    """An anchor that matches twice patches whichever came first, which may not
+    be the code the label names -- and the run still says CAUGHT. Found exactly
+    that once: `await bell.wait(...)` started matching `await_fenced` as well
+    as the watch it was written for."""
+    wrong = []
+    for label, rel, find, _, _ in MUTANTS:
+        n = (ROOT / rel).read_text().count(find)
+        if n != 1:
+            wrong.append(f"{label}: anchor matches {n} times in {rel}")
+    return wrong
+
+
 def main() -> int:
+    ambiguous = check_anchors()
+    for line in ambiguous:
+        print(f"BROKEN  {line}")
+    if ambiguous:
+        return 1
     bad = []
     for label, rel, find, repl, test in MUTANTS:
         path = ROOT / rel

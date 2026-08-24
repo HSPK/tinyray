@@ -6,10 +6,13 @@ A convention over plain HTTP, not a new protocol, so curl still works.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import itertools
 import json
 import warnings
 import weakref
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -133,10 +136,48 @@ def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str
 
 
 _seq = itertools.count(1)
+_pinned: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tinyray_request_id", default=None
+)
 
 
 def _request_id() -> str:
-    return f"{_identity or 'anon'}-{next(_seq)}"
+    fixed = _pinned.get()
+    return fixed if fixed is not None else f"{_identity or 'anon'}-{next(_seq)}"
+
+
+@contextlib.contextmanager
+def request_id(value: str) -> Iterator[str]:
+    """Name every call made inside this block, so retries share one name.
+
+    The generated id changes per attempt, which is right for tracing and wrong
+    for idempotency: a callee that wants to recognise a repeat needs the same
+    name each time, and without this the key had to travel as an ordinary
+    argument -- where it is one more thing to thread through, and one more
+    thing to forget on the retry path.
+
+        with tinyray.request_id(f"commit-{batch}"):
+            for attempt in range(3):
+                try:
+                    return h.commit(rows)
+                except tinyray.NotDelivered:
+                    continue
+
+    A block rather than a per-call argument, because that is the shape retries
+    already have, and because a keyword would collide with the callee's own
+    parameter names. Deduplication is still nobody's job here: tinyray only
+    carries the name, since only the caller knows what is safe to replay.
+
+    A ContextVar, so it follows an await into the tasks that block starts and
+    does not leak into a neighbouring one.
+    """
+    if not value:
+        raise ValueError("a request id has to be something; empty names nothing")
+    token = _pinned.set(value)
+    try:
+        yield value
+    finally:
+        _pinned.reset(token)
 
 
 def _transport_error(handle: Any, name: str, exc: Exception) -> Unreachable:

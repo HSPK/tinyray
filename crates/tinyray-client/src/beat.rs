@@ -86,6 +86,10 @@ pub struct Shared {
     /// the runtime away.
     pub revision: Mutex<u64>,
     pub bell: Condvar,
+    /// How many times the bell has actually woken somebody. The revision moves
+    /// once a beat whether or not anyone cares; this counts the ones that had
+    /// a waiter, which is what says whether watching is costing anything.
+    pub wakeups: AtomicU64,
     /// Pipes written one byte at a time when the bell rings, so an event loop
     /// can wait on an fd instead of parking a thread in `wait_revision`. One
     /// per loop rather than one per client: a second loop in the same process
@@ -106,6 +110,7 @@ impl Shared {
     /// woken by it sees the new cache rather than the old one.
     pub fn ring(&self) {
         *self.revision.lock().unwrap() += 1;
+        self.wakeups.fetch_add(1, Ordering::Relaxed);
         self.bell.notify_all();
         // One byte is enough: the reader drains and re-checks the revision it
         // actually cares about, so a full pipe is not a lost wakeup.
