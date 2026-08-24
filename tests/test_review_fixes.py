@@ -14,6 +14,7 @@ import urllib.request
 
 import pytest
 import tinyray
+from tinyray import _tinyray
 
 
 def _beat(endpoint: str, **kw) -> dict:
@@ -226,3 +227,49 @@ def test_a_watchdog_thread_survives_shutdown(registry):
         if errors:
             break
     assert not errors, f"watchdog died during shutdown: {errors[0]}"
+
+
+def test_a_beat_still_in_flight_cannot_undo_a_leave(registry):
+    """离开之后，一个还在路上的心跳不许把它重新注册回来。
+
+    `leave()` 发出最后一拍，但心跳循环可能已经把下一拍送出去了 —— 那一拍带着
+    同样的 (id, 任期)，到达时座位刚被腾空，于是又被当成一次正常注册收下。原始
+    实测是 300 次 leave 里有 6 次留下了没走掉的成员。
+
+    这里不去复现那个竞态 —— 2% 的概率意味着测试要跑几百轮才看得见。改成直接量
+    机制：注册表把刚离开的任期记住一个租约的时间，之后带着那个任期来的心跳一律
+    当幽灵。用 `Client` 直接指定任期就能确定地送出这样一拍。
+    """
+    ident = 4242
+    with tinyray.join("late", "stateful", slot=ident, size=1) as me:
+        me.ready()
+        tenure = me.incarnation
+        pool = tinyray.pool("late")
+        assert len(pool.wait(count=1, timeout=15)) == 1
+        me.leave()
+
+    # 座位确实空了。
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _pools(registry.endpoint)["late"]["members"]:
+        time.sleep(0.05)
+    assert _pools(registry.endpoint)["late"]["members"] == 0, "leave() 之后成员还在"
+
+    # 现在补上那一拍：同样的座位、同样的任期，就像它从未离开。
+    straggler = _tinyray.Client(
+        endpoint=f"http://{registry.endpoint}",
+        pool="late",
+        id=ident,
+        incarnation=tenure,
+        policy="stateful",
+        slot=ident,
+        size=1,
+    )
+    try:
+        straggler.start()
+        time.sleep(0.5)
+        assert not straggler.accepted, "刚离开的任期又被收下了"
+        assert _pools(registry.endpoint)["late"]["members"] == 0, (
+            "一个在途的心跳把已经离开的成员复活了"
+        )
+    finally:
+        straggler.abandon()

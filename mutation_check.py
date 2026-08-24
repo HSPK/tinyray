@@ -41,6 +41,42 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "a departed tenure is forgotten, so a beat in flight revives it",
+        RS_STATE,
+        "            p.gone\n                .insert(b.id, (b.incarnation, Instant::now() + self.ttl));",
+        "",
+        "tests/test_review_fixes.py::test_a_beat_still_in_flight_cannot_undo_a_leave",
+    ),
+    (
+        "a stored tenure newer than the beat no longer supersedes it",
+        RS_STATE,
+        "            || b.incarnation < watermark\n"
+        "            || stored.is_some_and(|cur| cur > b.incarnation);",
+        "            || b.incarnation < watermark;",
+        "tests/test_field_coverage.py",
+    ),
+    (
+        "leaving does not take the member out of the fingerprint",
+        RS_STATE,
+        "                p.roster ^= r.member.roster_hash();\n                p.bump(b.id);",
+        "                p.bump(b.id);",
+        "tests/test_roster_fingerprint.py",
+    ),
+    (
+        "the pool's declared shape is never disagreed with",
+        RS_STATE,
+        "        } else if let Some(why) = disagreement(p, b) {",
+        "        } else if let Some(why) = None::<String> {",
+        "tests/test_admission.py",
+    ),
+    (
+        "expired members are never swept",
+        RS_STATE,
+        "                .filter(|(_, r)| r.expires_at <= now)",
+        "                .filter(|(_, _r)| false)",
+        "tests/test_m1_membership.py",
+    ),
+    (
         "a frozen round is handed out as an editable list",
         PY_INIT,
         "        self.members = tuple(members)\n        self.roster = roster",
