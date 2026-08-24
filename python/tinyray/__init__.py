@@ -144,6 +144,27 @@ def _advertise() -> str:
         probe.close()
 
 
+def _checked_pool_name(name: str) -> str:
+    """A pool name, or a refusal saying why this one cannot be used.
+
+    The name travels on every call, in the header naming who is speaking and
+    the header naming who is meant to answer, and a header value has to be
+    printable ASCII. Nothing stops a non-ASCII name from registering, being
+    discovered or being watched -- only from being *called*, which failed with
+    a raw UnicodeEncodeError out of httpx, at the call site, a long way from
+    the name. Half a working system is worse than a clear no.
+    """
+    if not name:
+        raise ValueError("a pool needs a name")
+    if not name.isascii() or any(c < " " or c == "\x7f" for c in name):
+        raise ValueError(
+            f"pool name {name!r} has to be printable ASCII: it is sent as an "
+            f"HTTP header on every call, and anything else cannot be encoded "
+            f"there. Membership would work and calling would not."
+        )
+    return name
+
+
 def _from_env(names: tuple[str, ...]) -> int | None:
     for n in names:
         v = os.environ.get(n)
@@ -1307,6 +1328,7 @@ def join(
             "this process has already joined; one process is one member. "
             "Call leave() first if you meant to re-join."
         )
+    pool = _checked_pool_name(pool)
     if policy not in POLICIES:
         raise PolicyError(f"policy must be one of {POLICIES}, got {policy!r}")
     slotted = policy in ("stateful", "collective")
@@ -1564,9 +1586,9 @@ def _require_client() -> _Client:
 
 def pool(name: str) -> Pool:
     """Look up a group. Subscribing is implicit and takes effect immediately."""
-    return Pool(name, _require_client())
+    return Pool(_checked_pool_name(name), _require_client())
 
 
 def apool(name: str) -> AsyncPool:
     """Same as `pool`, but its handles hand back awaitables."""
-    return AsyncPool(name, _require_client())
+    return AsyncPool(_checked_pool_name(name), _require_client())

@@ -283,44 +283,27 @@ def test_an_empty_request_id_is_refused(peer):
             pass
 
 
-def test_a_non_ascii_pool_name_can_still_be_called(registry):
-    """pool 名字会随每次调用进 HTTP 头，而头值作为 str 必须是 ASCII。
+@pytest.mark.parametrize("name", ["训练组", "grüße", "a\nb", "tab\there"])
+def test_a_pool_name_that_cannot_be_a_header_is_refused(registry, name):
+    """名字会随每次调用进 HTTP 头，而头值必须是可打印 ASCII。
 
-    `join("训练组")` 注册、被发现、被订阅都完全正常 —— 然后**每一次调用**都死在
-    一个裸的 `UnicodeEncodeError` 上：httpx 内部抛的，抛在调用现场，离那个名字
-    很远。改成按 UTF-8 字节发；ASCII 的身份逐字节不变，所以别的什么都没动。
+    不拦的话，`join("训练组")` 注册、被发现、被订阅全都正常 —— 然后**每一次
+    调用**死在一个裸的 `UnicodeEncodeError` 上：httpx 内部抛的，抛在调用现场，
+    离那个名字很远。半个能用的系统比一个明确的"不行"更糟。
+
+    `pool()` 也要拦：对端的 pool 名同样会进"要谁来答"那个头。
     """
-    peer = textwrap.dedent(
-        f"""
-        import os, sys, tinyray
-        os.environ["TINYRAY_REGISTRY"] = "{registry.endpoint}"
-        class S:
-            def who(self, ctx: tinyray.CallContext) -> str:
-                return ctx.identity
-        with tinyray.join("svc", "stateful", slot=0, serves=S()) as m:
-            m.ready()
-            print("READY", flush=True)
-            sys.stdin.readline()
-        """
-    )
-    p = subprocess.Popen(
-        [sys.executable, "-c", peer], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
-    )
-    try:
-        assert p.stdout.readline().strip() == "READY"
-        with tinyray.join("训练组", "churn") as me:
-            me.ready()
-            h = tinyray.pool("svc").wait(count=1, timeout=15)[0]
-            seen = h.who()
-            assert seen.startswith("训练组/"), f"对端拿到的身份是 {seen!r}"
-            assert seen == me.identity, "身份没有原样还原"
-    finally:
-        try:
-            p.stdin.write("\n")
-            p.stdin.close()
-            p.wait(timeout=10)
-        except Exception:
-            p.kill()
+    with pytest.raises(ValueError, match="printable ASCII"):
+        tinyray.join(name, "churn")
+    with tinyray.join("ok", "churn") as me:
+        me.ready()
+        with pytest.raises(ValueError, match="printable ASCII"):
+            tinyray.pool(name)
+
+
+def test_an_empty_pool_name_is_refused(registry):
+    with pytest.raises(ValueError, match="needs a name"):
+        tinyray.join("", "churn")
 
 
 def test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set(peer):
@@ -329,10 +312,10 @@ def test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set(peer):
     否则它死在 httpx 里，而调用方收到的是"对端联系不上" —— 于是跑去查网络。
     换行更糟：它在头里就是一行的结束。
     """
-    with pytest.raises(ValueError, match="control characters"):
+    with pytest.raises(ValueError, match="printable ASCII"):
         with tinyray.request_id("a\nb"):
             pass
-    with pytest.raises(ValueError, match="control characters"):
+    with pytest.raises(ValueError, match="printable ASCII"):
         with tinyray.request_id("a\rb"):
             pass
     with pytest.raises(ValueError, match="too long"):
@@ -340,8 +323,8 @@ def test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set(peer):
             pass
 
 
-def test_a_request_id_may_be_a_natural_key_in_any_language(peer):
-    """自然键很可能不是 ASCII。既然身份能过，它也该能过。"""
-    h = tinyray.pool("svc").slot(0)
-    with tinyray.request_id("批次-42"):
-        assert h.whoami()["request_id"] == "批次-42"
+def test_a_non_ascii_request_id_is_refused_too(peer):
+    """和 pool 名字同一条规则：进头的东西必须是可打印 ASCII。"""
+    with pytest.raises(ValueError, match="printable ASCII"):
+        with tinyray.request_id("批次-42"):
+            pass

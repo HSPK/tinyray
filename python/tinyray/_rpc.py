@@ -145,19 +145,15 @@ def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str
     body = json.dumps(payload).encode()
     headers = {
         "content-type": "application/json",
-        # As bytes, because a header value has to be ASCII as a str and a pool
-        # name does not have to be ASCII. `join("训练组")` registers, is found
-        # and is watched perfectly well, and then every call to it died with a
-        # raw UnicodeEncodeError -- an error from httpx's internals, raised at
-        # the call site, a long way from the name that caused it. UTF-8 bytes
-        # are byte-identical for an ASCII identity, so nothing else moves.
-        "x-tinyray-target": handle.identity.encode(),
-        "x-tinyray-caller": _identity.encode(),
+        # Plain str: a header value has to be ASCII, which is why the names
+        # that end up here are refused at the point they are chosen.
+        "x-tinyray-target": handle.identity,
+        "x-tinyray-caller": _identity,
         # Names this attempt, so the two sides can talk about the same call.
         # Deliberately just the name: deduplicating on it would mean the
         # callee deciding what is safe to replay, and only the caller knows
         # that. OutcomeUnknown is where that decision belongs.
-        "x-tinyray-request": _request_id().encode(),
+        "x-tinyray-request": _request_id(),
     }
     return f"{handle.url}/call/{name}", body, headers
 
@@ -203,10 +199,11 @@ def request_id(value: str) -> Iterator[str]:
     # be reached -- which sends them to look at the network.
     if not value:
         raise ValueError("a request id has to be something; empty names nothing")
-    if any(c < " " or c == "\x7f" for c in value):
+    if not value.isascii() or any(c < " " or c == "\x7f" for c in value):
         raise ValueError(
-            f"a request id cannot contain control characters; got {value!r}. "
-            f"It travels as a header, where a newline would end it."
+            f"a request id has to be printable ASCII; got {value!r}. It travels "
+            f"as a header, where anything else cannot be encoded and a newline "
+            f"would end the header."
         )
     if len(value.encode()) > 200:
         raise ValueError(
