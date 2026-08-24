@@ -88,3 +88,18 @@ def registry():
         yield r
     finally:
         r.stop()
+
+
+@pytest.fixture
+def long_lease():
+    """A registry whose lease is long enough that one heartbeat interval is a
+    visible amount of time. Anything measuring the cost of *not* being woken
+    needs it: at the default 2s lease the bell rings every 500ms, which papers
+    over mistakes that would cost seconds in a real deployment."""
+    r = RegistryProc(ttl_ms=20000)
+    r.start()
+    os.environ["TINYRAY_REGISTRY"] = r.endpoint
+    try:
+        yield r
+    finally:
+        r.stop()

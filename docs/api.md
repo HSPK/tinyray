@@ -73,6 +73,7 @@ tinyray.join(
 | `identity` | `"pool/座位#任期"`，和别人手里 Handle 上的那串一致 |
 | `pool` / `slot` / `incarnation` | 分解开的同一件事 |
 | `state` | 当前发布出去的 state（副本） |
+| `is_ready` | 此刻对外宣称的就绪状态 |
 | `accepted` | `False` 表示座位已被更晚的任期拿走 |
 | `silence_ms` | 距离上一次成功心跳多久。它涨的时候一切照常，只是失效检测变慢 |
 | `last_error` | 最近一次心跳失败的原因，恢复后仍保留 |
@@ -80,13 +81,34 @@ tinyray.join(
 ### 发布状态
 
 ```python
-me.ready(**state) -> Member        # 合并进已有 state，并标记 ready
-me.set_ready(state: dict) -> Member  # 整体替换
-me.unready() -> Member             # 保留 state，但标记为不可用
-me.flush(timeout=10.0) -> Member   # 阻塞到注册中心确实收下
+# 同时声明就绪 —— 属于决定"这个成员能不能用"的那部分代码
+me.ready(**state) -> Member          # 合并进已有 state，并标记 ready
+me.set_ready(state: dict) -> Member  # 整体替换，并标记 ready
+me.unready() -> Member               # 保留 state，但标记为不可用
+
+# 只发布状态，不碰就绪 —— 属于其余所有代码
+me.update(**state) -> Member         # 合并
+me.replace(state: dict) -> Member    # 整体替换
+
+me.flush(timeout=10.0) -> Member     # 阻塞到注册中心确实收下
 ```
 
-`ready()` 是**合并**，所以发出去的 key 拿不回来 —— 要清掉就用 `set_ready()`。
+`ready()` 和 `update()` 都是**合并**，发出去的 key 拿不回来 —— 要清掉用
+`set_ready()` 或 `replace()`。
+
+!!! warning "上报进度请用 `update()`，不要用 `ready()`"
+    `ready()` 一次断言两件事：这是我的状态，而且我可用。对于决定就绪的那部分
+    代码这正合适；对别的代码就是越权。
+
+    只报进度却调用 `ready(step=n)`，会把另一处刚下的暂停静默掀掉 ——
+    `unready()` 之后一句 `ready(step=1)`，对端看到的 ready 就从 `False` 变回
+    `True`，而调用者根本没打算表达这个意思。
+
+    分开之后，"每个 Member 只有一个 readiness owner" 不再是一条要靠自觉遵守的
+    约定：其余代码调用 `update()`，结构上就碰不到就绪位。
+
+同值发布不花任何代价：state 和就绪位都和已发布的逐字节相同时，既不会敲醒心跳，
+也不会抬高池子版本。
 
 `flush()` 最多多等一拍：调用时若有心跳在途，那一拍是改之前组装的，确认要等到
 再下一拍。联系不上会抛 `TimeoutError`，座位被抢会抛 `SeatTaken`。
@@ -147,17 +169,59 @@ len(pool)                                      # ready 的人数
 
 ```python
 pool.snapshot(include_unready=True) -> Snapshot
-pool.changes(since=None, timeout=None)          # 生成器，产出 Snapshot
-apool.achanges(since=None, timeout=None)        # 异步生成器
+pool.changes(since=None, timeout=None) -> Watch        # 迭代产出 Snapshot
+apool.achanges(since=None, timeout=None) -> AsyncWatch # 异步迭代
 ```
 
 `changes()` 阻塞在事件上，**不轮询**。池子不动就不返回。成员被顶替后流会结束，
 不会让消费者永远挂着。
 
+### `Watch` / `AsyncWatch`
+
+`changes()` 和 `achanges()` 返回的对象，可迭代、可关闭、也是上下文管理器：
+
+```python
+with pool.changes() as w:          # 离开 with 即关闭
+    for snap in w:
+        ...
+
+w = pool.changes()
+w.close()                          # 也可以从另一个线程/任务关掉
+```
+
+**`close()` 是唯一能停下一个阻塞中 watcher 的办法。** 它等在事件上、而不是停在
+`yield` 上，所以既 `close()` 不了生成器，设标志位它也看不见。`close()` 会顺手
+敲一下铃，把它拽回到能看见标志位的地方。
+
+`leave()` 会关掉所有还活着的 watcher —— 否则一个非 daemon 线程里的 watcher 会
+让进程再也退不出去。
+
+!!! note "异步侧不占用线程"
+    `achanges()` 等在一个心跳会写入的管道上，由事件循环 select，**不借用
+    executor 线程**。所以取消是即时的，取消多少个都不会影响别处。
+
+    早先的实现用 `asyncio.to_thread`：取消 awaitable 并不会停掉底下那个线程。
+    24 核机器上取消 40 个 watcher 之后，紧接着一次 `asyncio.to_thread` 要等
+    3,092 毫秒 —— 默认 executor 的 28 个 worker 全卡在里面。
+
 !!! info "为什么是快照流，不是事件流"
     客户端以心跳为采样率，注册中心会把一个间隔内的多次变化折叠成"该成员的当前
     状态"。所以承诺"不丢事件"是协议兑现不了的；快照能诚实兑现"不丢状态"。
     事件是一次 diff 的事 —— 每条记录都带 `incarnation` 和 `ready`。
+
+### 等待座位换人
+
+```python
+pool.wait_replacement(slot=None, identity=None, timeout=None) -> Handle | None
+await apool.await_replacement(slot=None, identity=None, timeout=None)
+```
+
+阻塞到这个座位由**另一个任期**接管，返回接任者的 `Handle`；超时返回 `None`。
+`slot=` 和 `identity=` 二选一。
+
+`Member.wait_fenced()` 是同一个问题的自视角，给必须放手的那个进程用；这个是
+旁观视角，给正在跟它说话的人用。座位空着、座位换人、成员只是不再 ready 是三件
+不同的事，只有 incarnation 分得清。
 
 ### 点名
 
@@ -239,10 +303,19 @@ def pull_job(self, ctx: tinyray.CallContext) -> dict:
     ctx.pool          # "worker"
     ctx.slot          # 3，无座位则 None
     ctx.incarnation   # 任期号
+    ctx.request_id    # 调用方给这一次尝试起的名字
 ```
 
 **自称的身份，不是认证。** 这个系统里任期号本来也是成员自己生成的。它买到的是
 "调用方不会忘了传、也不会传错"，仅此而已。
+
+`request_id` 每次调用都不同，两侧的日志因此能指着同一次尝试说话。
+
+!!! note "tinyray 不做幂等缓存"
+    只给名字，不按它去重。被调方无从知道一次调用重放是否安全 —— 结果留多久、
+    什么算"同一次调用"，都是应用层的问题。这个决定属于调用方，`NotDelivered`
+    （确定没送到，可以重试）和 `OutcomeUnknown`（可能已经跑了）的区分就是为了
+    让它做得出来。要幂等就用这个 id 当键，自己实现。
 
 ---
 

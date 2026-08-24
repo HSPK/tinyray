@@ -12,6 +12,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
@@ -38,8 +39,10 @@ pub struct Shared {
     pub size: Option<u64>,
     pub methods: Vec<String>,
     pub url: Mutex<Option<String>>,
-    pub state: Mutex<serde_json::Value>,
-    pub ready: AtomicBool,
+    /// State and readiness together, because they are published together. Read
+    /// apart, a beat could carry a new state under the previous readiness --
+    /// the pair is what `ready(**kw)` means, so the pair is what is locked.
+    pub published: Mutex<Published>,
     pub leaving: AtomicBool,
     pub exclusive: bool,
     pub watch: Mutex<Vec<String>>,
@@ -79,6 +82,19 @@ pub struct Shared {
     /// the runtime away.
     pub revision: Mutex<u64>,
     pub bell: Condvar,
+    /// Pipes written one byte at a time when the bell rings, so an event loop
+    /// can wait on an fd instead of parking a thread in `wait_revision`. One
+    /// per loop rather than one per client: a second loop in the same process
+    /// would otherwise never be woken, and would hang rather than fail.
+    /// Python owns the pipes and deregisters before closing them.
+    pub wake_fds: Mutex<Vec<i32>>,
+}
+
+/// What this member is telling the pool about itself.
+#[derive(Clone, PartialEq)]
+pub struct Published {
+    pub state: serde_json::Value,
+    pub ready: bool,
 }
 
 impl Shared {
@@ -87,6 +103,17 @@ impl Shared {
     pub fn ring(&self) {
         *self.revision.lock().unwrap() += 1;
         self.bell.notify_all();
+        // One byte is enough: the reader drains and re-checks the revision it
+        // actually cares about, so a full pipe is not a lost wakeup.
+        // ManuallyDrop so the fds are not closed when these go out of scope:
+        // Python owns them. The write ends are non-blocking, so a full pipe
+        // fails here rather than stalling the beat loop, and that is the right
+        // answer -- a byte already waiting says the same thing.
+        use std::os::fd::FromRawFd;
+        for fd in self.wake_fds.lock().unwrap().iter() {
+            let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(*fd) });
+            let _ = (&*f).write(&[1u8]);
+        }
     }
 
     pub fn mark_ok(&self) {
@@ -101,13 +128,14 @@ impl Shared {
     }
 
     fn compose(&self) -> Beat {
+        let published = self.published.lock().unwrap().clone();
         let cache = self.cache.read().unwrap();
         let watch = self.watch.lock().unwrap().clone();
         let seen = watch
             .iter()
             .filter_map(|n| cache.get(n).map(|c| (n.clone(), c.version)))
             .collect();
-        Beat {
+        let beat = Beat {
             pool: self.pool.clone(),
             slot: self.slot,
             id: self.id,
@@ -115,15 +143,16 @@ impl Shared {
             policy: self.policy.clone(),
             size: self.size,
             url: self.url.lock().unwrap().clone(),
-            state: self.state.lock().unwrap().clone(),
-            ready: self.ready.load(Ordering::Relaxed),
+            state: published.state,
+            ready: published.ready,
             leaving: self.leaving.load(Ordering::Relaxed),
             exclusive: self.exclusive,
             methods: self.methods.clone(),
             watch,
             seen,
             hold_ms: self.hold_ms.load(Ordering::Relaxed),
-        }
+        };
+        beat
     }
 
     /// Returns false once the seat has been taken by a later tenure.
@@ -289,6 +318,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             .http2_only(true)
             .pool_idle_timeout(Duration::from_secs(60))
             .build_http();
+        let mut cancelled_last = false;
         loop {
             if shared.leaving.load(Ordering::Relaxed) && shared.beats_ok.load(Ordering::Relaxed) > 0
             {
@@ -296,9 +326,20 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 return;
             }
             let started = std::time::Instant::now();
-            let beat = shared.compose();
+            let mut beat = shared.compose();
             let interval = shared.interval_ms.load(Ordering::Relaxed);
-            let hold = shared.hold_ms.load(Ordering::Relaxed);
+            // The request that replaces a cancelled one is never parked. It
+            // carries something the last one did not, so there is nothing to
+            // wait for, and completing it at round-trip speed is what bounds
+            // the cost of not being allowed to cancel it: one RTT rather than
+            // a whole hold. Measured as subscription latency going from 432ms
+            // against a 500ms interval back under 125ms.
+            let hold = if cancelled_last {
+                0
+            } else {
+                shared.hold_ms.load(Ordering::Relaxed)
+            };
+            beat.hold_ms = hold;
             let budget = beat_timeout(interval, hold);
             // A held request is the loop's resting place, so this is also
             // where a publish has to be able to interrupt it. Dropping the
@@ -311,8 +352,25 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 done = &mut sending => Some(done),
                 _ = shared.wake.notified(), if hold > 0 => None,
             };
+            // A publisher faster than the round trip always has something
+            // newer to say, so if every publish could cancel, no request would
+            // ever be answered: the cache stops updating and flush() never
+            // returns, while the member stays registered and looks fine. The
+            // replacement is sent unparked (above), which both makes it
+            // uncancellable here and lets it complete at round-trip speed.
+            cancelled_last = outcome.is_none();
             let Some(outcome) = outcome else {
-                // Something to publish. Go straight back round with it.
+                // Something to publish. Go straight back round with it, but
+                // no faster than MIN_GAP: a process publishing flat out would
+                // otherwise turn the loop into a request generator bounded
+                // only by the round trip. Measured under an unthrottled
+                // publisher, this halves it -- 24 to 11 requests a second.
+                // What keeps such a publisher *alive* is the unparked
+                // replacement above, not this.
+                let spent = started.elapsed();
+                if spent < MIN_GAP {
+                    tokio::time::sleep(MIN_GAP - spent).await;
+                }
                 continue;
             };
             match outcome {

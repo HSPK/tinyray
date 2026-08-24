@@ -37,10 +37,15 @@ class CallContext:
     one, which is what happens when the same fact travels as an argument.
     """
 
-    __slots__ = ("identity", "pool", "slot", "incarnation")
+    __slots__ = ("identity", "pool", "slot", "incarnation", "request_id")
 
-    def __init__(self, identity: str):
+    def __init__(self, identity: str, request_id: str = ""):
         self.identity = identity
+        # What the caller called this attempt. Useful in logs on both sides,
+        # and the key an application would build idempotency on if it needs
+        # one -- tinyray does not keep results, because how long to keep them
+        # and what counts as the same call are application questions.
+        self.request_id = request_id
         self.pool, _, seat = identity.partition("/")
         seat, _, tenure = seat.partition("#")
         self.slot = int(seat) if seat.isdigit() else None
@@ -69,7 +74,9 @@ def _hints(fn: Callable[..., Any]) -> dict[str, Any]:
         return {}
 
 
-def _coerce(fn: Callable[..., Any], payload: Any, caller: str = "") -> tuple[list, dict]:
+def _coerce(
+    fn: Callable[..., Any], payload: Any, caller: str = "", request_id: str = ""
+) -> tuple[list, dict]:
     """Unpack {"args": [...], "kwargs": {...}} and check it against annotations."""
     if isinstance(payload, dict) and set(payload) <= {"args", "kwargs"}:
         args = list(payload.get("args") or [])
@@ -86,7 +93,7 @@ def _coerce(fn: Callable[..., Any], payload: Any, caller: str = "") -> tuple[lis
         return args, kwargs
     for param, want in hints.items():
         if want is CallContext:
-            kwargs[param] = CallContext(caller or "")
+            kwargs[param] = CallContext(caller or "", request_id)
     try:
         names = [p for p in inspect.signature(fn).parameters]
     except (TypeError, ValueError):
@@ -254,7 +261,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> None:
         try:
             args, kwargs = _coerce(
-                fn, json.loads(raw or b"{}"), self.headers.get("x-tinyray-caller") or ""
+                fn,
+                json.loads(raw or b"{}"),
+                self.headers.get("x-tinyray-caller") or "",
+                self.headers.get("x-tinyray-request") or "",
             )
         except json.JSONDecodeError as e:
             return self._send(400, {"error": str(e)})

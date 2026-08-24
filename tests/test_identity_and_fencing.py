@@ -26,6 +26,7 @@ ECHO_CALLER = textwrap.dedent(
                 "pool": ctx.pool,
                 "slot": ctx.slot,
                 "incarnation": ctx.incarnation,
+                "request_id": ctx.request_id,
             }
         def mixed(self, n: int, ctx: tinyray.CallContext) -> dict:
             return {"n": n, "caller": ctx.identity}
@@ -85,6 +86,20 @@ def test_the_callee_is_told_who_called_without_being_passed_it(peer):
     assert got["slot"] == 3
     assert got["incarnation"] == peer.incarnation
     assert got["identity"] == f"caller/3#{peer.incarnation}"
+
+
+def test_every_call_carries_a_request_id_that_names_that_attempt(peer):
+    """两边要能指着同一次调用说话。
+
+    只给名字，不做去重：被调方无从知道一次调用重放是否安全，只有调用方知道，
+    所以那个决定留在 NotDelivered / OutcomeUnknown 那一侧。
+    """
+    h = tinyray.pool("svc").slot(0)
+    first = h.whoami()["request_id"]
+    second = h.whoami()["request_id"]
+    assert first and second, "调用没有带上 request id"
+    assert first != second, "两次不同的尝试用了同一个 id"
+    assert first.startswith(f"caller/3#{peer.incarnation}"), first
 
 
 def test_the_context_does_not_disturb_the_real_arguments(peer):

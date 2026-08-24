@@ -6,6 +6,7 @@ A convention over plain HTTP, not a new protocol, so curl still works.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import warnings
 import weakref
@@ -122,8 +123,20 @@ def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str
         "content-type": "application/json",
         "x-tinyray-target": handle.identity,
         "x-tinyray-caller": _identity,
+        # Names this attempt, so the two sides can talk about the same call.
+        # Deliberately just the name: deduplicating on it would mean the
+        # callee deciding what is safe to replay, and only the caller knows
+        # that. OutcomeUnknown is where that decision belongs.
+        "x-tinyray-request": _request_id(),
     }
     return f"{handle.url}/call/{name}", body, headers
+
+
+_seq = itertools.count(1)
+
+
+def _request_id() -> str:
+    return f"{_identity or 'anon'}-{next(_seq)}"
 
 
 def _transport_error(handle: Any, name: str, exc: Exception) -> Unreachable:

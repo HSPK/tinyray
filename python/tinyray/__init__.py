@@ -14,7 +14,9 @@ import json
 import os
 import random
 import socket
+import threading
 import time
+import weakref
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
@@ -57,6 +59,8 @@ __all__ = [
     "Epoch",
     "CallContext",
     "Snapshot",
+    "Watch",
+    "AsyncWatch",
     "Stale",
     "SeatTaken",
     "NotFound",
@@ -273,6 +277,209 @@ class Snapshot:
         return f"<Snapshot {self.pool} rev={self.revision} members={len(self.members)}>"
 
 
+class _LoopBell:
+    """One pipe per event loop, written to whenever the client's bell rings.
+
+    achanges() used to wait on `asyncio.to_thread`. Cancelling the awaitable
+    does not stop the thread underneath it, so watchers that came and went left
+    workers blocked in the Rust wait until the next beat: measured at 40
+    cancelled watchers stalling the very next asyncio.to_thread by 3,092ms on a
+    24-core box, with all 28 of the default executor's workers stuck. A pipe
+    the loop can select on costs no thread at all, and cancelling is free.
+    """
+
+    __slots__ = ("_client", "_loop", "_r", "_w", "_waiters")
+
+    def __init__(self, client: _Client, loop: asyncio.AbstractEventLoop):
+        self._client = client
+        self._loop = loop
+        self._r, self._w = os.pipe()
+        os.set_blocking(self._r, False)
+        # Non-blocking on the write end too: the bell rings from the heartbeat
+        # thread, and a reader that has fallen behind must never stall it. A
+        # byte already waiting says everything a second one would.
+        os.set_blocking(self._w, False)
+        self._waiters: list[asyncio.Future[None]] = []
+        client.add_wake_fd(self._w)
+        loop.add_reader(self._r, self._fire)
+
+    def _fire(self) -> None:
+        try:
+            os.read(self._r, 4096)
+        except BlockingIOError:
+            pass
+        waiters, self._waiters = self._waiters, []
+        for f in waiters:
+            if not f.done():
+                f.set_result(None)
+
+    async def wait(self, timeout: float) -> None:
+        fut: asyncio.Future[None] = self._loop.create_future()
+        self._waiters.append(fut)
+        try:
+            await asyncio.wait_for(fut, timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # Cancelled is not an error here: the caller went away, and the
+            # only thing left to do is stop holding a slot in the list.
+            raise
+        finally:
+            try:
+                self._waiters.remove(fut)
+            except ValueError:
+                pass
+
+    def close(self) -> None:
+        # Deregister before closing, or the bell would write a byte into
+        # whatever the descriptor number gets reused for.
+        self._client.drop_wake_fd(self._w)
+        try:
+            self._loop.remove_reader(self._r)
+        except Exception:
+            pass
+        os.close(self._r)
+        os.close(self._w)
+
+
+_bells: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], _LoopBell]] = {}
+# Watchers that are still running, so leave() can end them rather than leave a
+# thread parked on a client that has gone.
+_live_watches: weakref.WeakSet[_Watching] = weakref.WeakSet()
+
+
+def _loop_bell(client: _Client) -> _LoopBell:
+    loop = asyncio.get_running_loop()
+    # id() is reused once a loop is collected, which is how the RPC client
+    # cache used to hand one loop's transport to another. Prune by the weak
+    # reference rather than trusting the number.
+    for key, (ref, bell) in list(_bells.items()):
+        if ref() is None:
+            bell.close()
+            del _bells[key]
+    key = id(loop)
+    got = _bells.get(key)
+    if got is not None and got[0]() is loop:
+        return got[1]
+    bell = _LoopBell(client, loop)
+    _bells[key] = (weakref.ref(loop), bell)
+    return bell
+
+
+class _Watching:
+    """The bookkeeping behind changes() and achanges().
+
+    Both walk the same ground -- has the pool moved, may we still wait, has
+    anybody asked us to stop -- and differ only in how they wait, so only the
+    waiting is written twice.
+    """
+
+    __slots__ = ("_pool", "_c", "_seen", "_deadline", "_closed", "_tick", "__weakref__")
+
+    def __init__(self, pool: Pool, since: int | None, timeout: float | None):
+        self._pool = pool
+        self._c = pool._c
+        self._seen = pool.snapshot().revision if since is None else since
+        self._deadline = None if timeout is None else time.monotonic() + timeout
+        self._closed = False
+        self._tick = 0
+        _live_watches.add(self)
+
+    def close(self) -> None:
+        """End the stream, including from another thread or task.
+
+        A watcher blocked waiting for the pool to move cannot be interrupted by
+        setting a flag, because it is not running. Ringing the bell is what
+        gets it back to a point where it can see the flag -- without it, a
+        non-daemon thread iterating changes() kept the process alive for good,
+        and leave() did not release it either.
+        """
+        if not self._closed:
+            self._closed = True
+            _live_watches.discard(self)
+            self._c.wake()
+
+    def _step(self) -> tuple[Snapshot | None, int]:
+        """A snapshot to hand over, or how many ms we may wait for one. Zero
+        milliseconds means the stream is over."""
+        # A superseded member stops beating, so the bell stops ringing and a
+        # consumer would wait here for as long as it was willing to. Nothing
+        # more is coming.
+        if self._closed or not self._c.accepted:
+            return None, 0
+        self._tick = self._c.cache_revision()
+        info = self._c.pool_info(self._pool._name)
+        # The bell rings once a beat whether or not anything happened, so what
+        # decides a yield is the pool's own version. Waking on the bell but
+        # yielding on the beat was measured at 25 snapshots for 4 real changes
+        # -- and at 5,000 members a snapshot is 10.6ms spent rebuilding what
+        # did not move.
+        if info is not None and info[0] != self._seen:
+            self._seen = info[0]
+            return self._pool.snapshot(), 0
+        left = 3600.0 if self._deadline is None else self._deadline - time.monotonic()
+        if left <= 0:
+            return None, 0
+        return None, int(left * 1000) + 1
+
+
+class Watch(_Watching):
+    """A stream of snapshots, one every time the pool moves.
+
+    Deliberately snapshots rather than events. The client sees the pool at
+    heartbeat cadence and the registry collapses whatever happened in between:
+    a member that went ready and unready again inside one interval arrives as
+    one entry carrying its current state, not as two events. An event stream
+    would therefore promise a completeness the wire cannot deliver. A snapshot
+    promises what it can -- you never miss a state, only the transitions nobody
+    could have observed -- and the events are a diff away, because every entry
+    carries its incarnation.
+    """
+
+    __slots__ = ()
+
+    def __iter__(self) -> Watch:
+        return self
+
+    def __next__(self) -> Snapshot:
+        while True:
+            snap, ms = self._step()
+            if snap is not None:
+                return snap
+            if ms == 0:
+                raise StopIteration
+            self._c.wait_revision(self._tick, ms)
+
+    def __enter__(self) -> Watch:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+class AsyncWatch(_Watching):
+    """`Watch` for an event loop, waiting on an fd rather than a thread."""
+
+    __slots__ = ()
+
+    def __aiter__(self) -> AsyncWatch:
+        return self
+
+    async def __anext__(self) -> Snapshot:
+        bell = _loop_bell(self._c)
+        while True:
+            snap, ms = self._step()
+            if snap is not None:
+                return snap
+            if ms == 0:
+                raise StopAsyncIteration
+            await bell.wait(ms / 1000)
+
+    async def __aenter__(self) -> AsyncWatch:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.close()
+
+
 class Pool:
     """One group. Lookups read the local cache: no network, so no timeouts."""
 
@@ -337,41 +544,52 @@ class Pool:
         members = [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
         return Snapshot(self._name, version, members)
 
-    def changes(self, since: int | None = None, timeout: float | None = None):
-        """Yield a fresh snapshot every time this pool moves. Never polls.
+    def changes(self, since: int | None = None, timeout: float | None = None) -> Watch:
+        """Snapshots of this pool, one per change. Never polls.
 
-        Deliberately a stream of snapshots rather than of events. The client
-        sees the pool at heartbeat cadence, and the registry collapses whatever
-        happened in between: a member that went ready and unready again inside
-        one interval arrives as one entry carrying its current state, not as
-        two events. An event stream would therefore promise a completeness the
-        wire cannot deliver. A snapshot promises what it can -- you never miss
-        a state, only the transitions nobody could have observed -- and the
-        events are a diff away, because every entry carries its incarnation.
+        The result is closeable and works as a context manager, which is the
+        only way to stop a watcher that is blocked waiting for the pool to
+        move:
+
+            with pool.changes() as w:
+                for snap in w:
+                    ...
         """
-        seen = self.snapshot().revision if since is None else since
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            # A superseded member stops beating, so the bell stops ringing and
-            # a consumer would wait here for as long as it was willing to. Ends
-            # the stream instead: nothing more is coming.
-            if not self._c.accepted:
-                return
-            # The bell rings once a beat whether or not anything happened, so
-            # what decides a yield is the pool's own version. Waking on the
-            # bell but yielding on the beat was measured at 25 snapshots for 4
-            # real changes -- and at 5,000 members a snapshot is 10.6ms spent
-            # rebuilding what did not move.
-            tick = self._c.cache_revision()
-            info = self._c.pool_info(self._name)
-            if info is not None and info[0] != seen:
-                seen = info[0]
-                yield self.snapshot()
-                continue
-            left = 3600.0 if deadline is None else deadline - time.monotonic()
-            if left <= 0:
-                return
-            self._c.wait_revision(tick, int(left * 1000) + 1)
+        return Watch(self, since, timeout)
+
+    def wait_replacement(
+        self,
+        slot: int | None = None,
+        identity: str | None = None,
+        timeout: float | None = None,
+    ) -> Handle | None:
+        """Block until a *different* tenure holds this seat, and return it.
+
+        `Member.wait_fenced()` answers the same question from the inside, for
+        a process that has to stop using a GPU it no longer owns. This is the
+        outside view, for whoever was talking to that member: a seat going
+        quiet, a seat changing hands and a member merely dropping out of ready
+        are three different things, and only the incarnation tells them apart.
+
+        None means the timeout ran out with the seat still held by the tenure
+        it started with, or still empty.
+        """
+        if (slot is None) == (identity is None):
+            raise TypeError("wait_replacement() takes exactly one of slot= or identity=")
+        was: str | None
+        if identity is not None:
+            seat, was = _seat_of(identity), identity
+        else:
+            assert slot is not None
+            seat = slot
+            here = self.snapshot().slot(seat)
+            was = here.identity if here else None
+        with self.changes(timeout=timeout) as w:
+            for snap in w:
+                now = snap.slot(seat)
+                if now is not None and now.identity != was:
+                    return now
+        return None
 
     def all(self, **filt: Any) -> list[Handle]:
         return self._members(filt, require_ready=True)
@@ -507,6 +725,13 @@ class Member:
         self.incarnation = incarnation
         self._ident = slot if ident is None else ident
         self._state: dict[str, Any] = {}
+        # Merging into the published state is a read-modify-write, and two
+        # publishers racing through it lose each other's keys. Not reachable
+        # as things stand -- MAX_STATE bounds the encode that sits in the gap,
+        # and 8 publishers over 300 trials lost nothing, while widening the gap
+        # by 0.5ms lost 420 keys -- so this guards against the gap growing
+        # rather than against a bug in today's code.
+        self._lock = threading.Lock()
         self._left = False
         self._pid = os.getpid()
 
@@ -525,15 +750,49 @@ class Member:
             )
 
     def ready(self, **state: Any) -> Member:
-        """Hang out a sign. Sends nothing now; the next heartbeat carries it."""
+        """Hang out a sign. Sends nothing now; the next heartbeat carries it.
+
+        This declares readiness as well as publishing, so it belongs to
+        whichever part of the process decides whether the member should be
+        used. Anything that only reports progress wants `update()`.
+        """
         self._mine()
-        # Check before mutating: an over-budget call used to leave the blob in
-        # place, so every later ready() failed too and one bad call poisoned
-        # the member for good.
-        merged = {**self._state, **state}
-        raw = self._encode_state(merged)
-        self._state = merged
-        self._c.set_state(raw, True)
+        with self._lock:
+            # Check before mutating: an over-budget call used to leave the blob
+            # in place, so every later ready() failed too and one bad call
+            # poisoned the member for good.
+            merged = {**self._state, **state}
+            raw = self._encode_state(merged)
+            self._state = merged
+            self._c.set_state(raw, True)
+        return self
+
+    def update(self, **state: Any) -> Member:
+        """Publish state, merging into what is there, and leave readiness alone.
+
+        `ready(**kw)` asserts both at once, and until this existed that was the
+        only way to publish anything: a component reporting progress had no
+        choice but to also declare the member ready, silently lifting a pause
+        another component had just applied. Measured -- unready() then
+        ready(step=1) put ready=True back in front of peers.
+        """
+        self._mine()
+        with self._lock:
+            merged = {**self._state, **state}
+            raw = self._encode_state(merged)
+            self._state = merged
+            self._c.set_state_only(raw)
+        return self
+
+    def replace(self, state: dict[str, Any] | None = None) -> Member:
+        """`update()` but replacing the published state outright, so keys can
+        be taken back. Readiness is left alone."""
+        self._mine()
+        with self._lock:
+            fresh = dict(state or {})
+            raw = self._encode_state(fresh)
+            self._state = fresh
+            self._c.set_state_only(raw)
         return self
 
     def _encode_state(self, state: dict[str, Any]) -> str:
@@ -559,10 +818,11 @@ class Member:
         layered over the last one.
         """
         self._mine()
-        fresh = dict(state or {})
-        raw = self._encode_state(fresh)
-        self._state = fresh
-        self._c.set_state(raw, True)
+        with self._lock:
+            fresh = dict(state or {})
+            raw = self._encode_state(fresh)
+            self._state = fresh
+            self._c.set_state(raw, True)
         return self
 
     def flush(self, timeout: float = 10.0) -> Member:
@@ -620,9 +880,17 @@ class Member:
         return await asyncio.to_thread(self.wait_fenced, timeout)
 
     def unready(self) -> Member:
+        """Withdraw the sign, keeping the published state. Pairs with ready()
+        and set_ready(), and like them belongs to the readiness owner."""
         self._mine()
-        self._c.set_state(self._encode_state(self._state), False)
+        with self._lock:
+            self._c.set_state(self._encode_state(self._state), False)
         return self
+
+    @property
+    def is_ready(self) -> bool:
+        """What this member is currently telling the pool about itself."""
+        return self._c.is_ready()
 
     @property
     def state(self) -> dict[str, Any]:
@@ -661,6 +929,11 @@ class Member:
         self._mine()
         if not self._left:
             self._left = True
+            # A watcher blocked on a client that is about to go would wait out
+            # its whole timeout, and a non-daemon thread iterating one kept the
+            # process alive indefinitely.
+            for w in list(_live_watches):
+                w.close()
             global _client, _left
             if _client is self._c:
                 _client = None
@@ -724,6 +997,11 @@ def _after_fork() -> None:
         _client.abandon()
     _client = None
     _left = False
+    # The inherited pipes belong to the parent's loops and its heartbeat is
+    # gone, so nothing will ever write to them again. Drop them without
+    # closing: the parent still owns the descriptors.
+    _bells.clear()
+    _live_watches.clear()
 
 
 if hasattr(os, "register_at_fork"):
@@ -888,32 +1166,46 @@ class AsyncPool(Pool):
 
     _handle_cls = AsyncHandle
 
-    async def achanges(self, since: int | None = None, timeout: float | None = None):
-        """`changes()` for an event loop. Waits on the client's bell, on a
-        thread, so the loop keeps turning while nothing is happening."""
-        seen = self.snapshot().revision if since is None else since
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            # A superseded member stops beating, so the bell stops ringing and
-            # a consumer would wait here for as long as it was willing to. Ends
-            # the stream instead: nothing more is coming.
-            if not self._c.accepted:
-                return
-            # The bell rings once a beat whether or not anything happened, so
-            # what decides a yield is the pool's own version. Waking on the
-            # bell but yielding on the beat was measured at 25 snapshots for 4
-            # real changes -- and at 5,000 members a snapshot is 10.6ms spent
-            # rebuilding what did not move.
-            tick = self._c.cache_revision()
-            info = self._c.pool_info(self._name)
-            if info is not None and info[0] != seen:
-                seen = info[0]
-                yield self.snapshot()
-                continue
-            left = 3600.0 if deadline is None else deadline - time.monotonic()
-            if left <= 0:
-                return
-            await asyncio.to_thread(self._c.wait_revision, tick, int(left * 1000) + 1)
+    def achanges(self, since: int | None = None, timeout: float | None = None) -> AsyncWatch:
+        """`changes()` for an event loop.
+
+        Waits on a pipe the heartbeat writes to, so no executor thread is held
+        and cancelling the iteration is immediate. Closeable and usable as an
+        async context manager, same as the synchronous one.
+        """
+        return AsyncWatch(self, since, timeout)
+
+    async def await_replacement(
+        self,
+        slot: int | None = None,
+        identity: str | None = None,
+        timeout: float | None = None,
+    ) -> Handle | None:
+        """`wait_replacement()` for an event loop."""
+        if (slot is None) == (identity is None):
+            raise TypeError("await_replacement() takes exactly one of slot= or identity=")
+        was: str | None
+        if identity is not None:
+            seat, was = _seat_of(identity), identity
+        else:
+            assert slot is not None
+            seat = slot
+            here = self.snapshot().slot(seat)
+            was = here.identity if here else None
+        async with self.achanges(timeout=timeout) as w:
+            async for snap in w:
+                now = snap.slot(seat)
+                if now is not None and now.identity != was:
+                    return now
+        return None
+
+
+def _seat_of(identity: str) -> int:
+    """The seat number out of `pool/slot#tenure`."""
+    seat = identity.partition("/")[2].partition("#")[0]
+    if not seat.isdigit():
+        raise ValueError(f"{identity!r} does not name a numbered seat")
+    return int(seat)
 
 
 def _require_client() -> _Client:

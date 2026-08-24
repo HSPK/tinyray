@@ -25,7 +25,22 @@ class Client:
     def watch(self, pools: list[str]) -> None:
         """Raises once the subscription list is full."""
 
-    def set_state(self, state_json: str, ready: bool) -> None: ...
+    def set_state(self, state_json: str, ready: bool) -> bool:
+        """False when the pair was already exactly this, so nothing was nudged."""
+
+    def set_state_only(self, state_json: str) -> bool:
+        """Publish state without touching readiness."""
+
+    def is_ready(self) -> bool: ...
+    def add_wake_fd(self, fd: int) -> None:
+        """Also write a byte to `fd` whenever the bell rings."""
+
+    def drop_wake_fd(self, fd: int) -> None:
+        """Stop writing to `fd`. Call before closing it."""
+
+    def wake(self) -> None:
+        """Ring the bell with nothing changed, so waiters can re-check."""
+
     def set_url(self, url: str | None = ...) -> None: ...
     def lookup(self, pool: str, filter_json: str = ..., require_ready: bool = ...) -> str:
         """Matching members of `pool`, as a JSON list."""

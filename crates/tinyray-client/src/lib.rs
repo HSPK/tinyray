@@ -9,7 +9,7 @@
 
 mod beat;
 
-use beat::{beat_once, spawn, CachedPool, Shared};
+use beat::{beat_once, spawn, CachedPool, Published, Shared};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -65,8 +65,10 @@ impl Client {
             size,
             methods: methods.unwrap_or_default(),
             url: Mutex::new(url),
-            state: Mutex::new(serde_json::Value::Object(Default::default())),
-            ready: AtomicBool::new(false),
+            published: Mutex::new(Published {
+                state: serde_json::Value::Object(Default::default()),
+                ready: false,
+            }),
             leaving: AtomicBool::new(false),
             exclusive,
             watch: Mutex::new(Vec::new()),
@@ -84,6 +86,7 @@ impl Client {
             wake: tokio::sync::Notify::new(),
             revision: Mutex::new(0),
             bell: std::sync::Condvar::new(),
+            wake_fds: Mutex::new(Vec::new()),
         });
         Ok(Self {
             shared,
@@ -133,13 +136,65 @@ impl Client {
         Ok(())
     }
 
-    fn set_state(&self, state_json: &str, ready: bool) -> PyResult<()> {
-        let v: serde_json::Value =
+    /// Returns false when the pair was already exactly this, in which case
+    /// nothing is nudged: republishing an unchanged state used to cancel the
+    /// held beat and spend a request to tell the registry what it already had,
+    /// and the registry would not even raise the pool's version for it.
+    fn set_state(&self, state_json: &str, ready: bool) -> PyResult<bool> {
+        let state: serde_json::Value =
             serde_json::from_str(state_json).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        *self.shared.state.lock().unwrap() = v;
-        self.shared.ready.store(ready, Ordering::Relaxed);
+        {
+            let mut cur = self.shared.published.lock().unwrap();
+            if cur.state == state && cur.ready == ready {
+                return Ok(false);
+            }
+            cur.state = state;
+            cur.ready = ready;
+        }
         self.shared.wake.notify_one();
-        Ok(())
+        Ok(true)
+    }
+
+    /// Publish `state` without touching readiness.
+    ///
+    /// `ready()` and `set_ready()` assert both at once, which is right for the
+    /// component that owns readiness and wrong for every other one: a progress
+    /// report had no way to avoid also declaring the member ready, so it would
+    /// silently lift a pause somebody else had just applied.
+    fn set_state_only(&self, state_json: &str) -> PyResult<bool> {
+        let state: serde_json::Value =
+            serde_json::from_str(state_json).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        {
+            let mut cur = self.shared.published.lock().unwrap();
+            if cur.state == state {
+                return Ok(false);
+            }
+            cur.state = state;
+        }
+        self.shared.wake.notify_one();
+        Ok(true)
+    }
+
+    fn is_ready(&self) -> bool {
+        self.shared.published.lock().unwrap().ready
+    }
+
+    /// Have the bell also write a byte to `fd`, so an event loop can wait on
+    /// the fd rather than parking a thread.
+    fn add_wake_fd(&self, fd: i32) {
+        self.shared.wake_fds.lock().unwrap().push(fd);
+    }
+
+    /// Stop writing to `fd`. Must happen before Python closes it, or the bell
+    /// would write into whatever the number is reused for.
+    fn drop_wake_fd(&self, fd: i32) {
+        self.shared.wake_fds.lock().unwrap().retain(|f| *f != fd);
+    }
+
+    /// Ring the bell without anything having changed, so every waiter gets a
+    /// chance to notice it has been asked to stop.
+    fn wake(&self) {
+        self.shared.ring();
     }
 
     #[pyo3(signature = (url=None))]

@@ -190,3 +190,47 @@ def test_a_client_that_asks_for_no_hold_is_answered_at_once(registry):
         assert r.status == 200
     took = (time.monotonic() - t0) * 1000
     assert took < 300, f"不要求挂起的请求被挂了 {took:.0f}ms"
+
+
+def test_publishing_flat_out_does_not_starve_the_heartbeat(registry):
+    """发布会取消挂起的请求，但取消不能没有下界。
+
+    挂起的请求是心跳循环的休息位置，发布把它取消掉才能立刻送出去。取消之后
+    过去是直接 continue —— 绕过了每完成一拍才走的那段间隔。于是下一次发布又
+    在回答到达之前把它取消掉，如此往复，一拍都完不成。
+
+    实测：每秒 379,000 次发布之下，注册表在第 4 秒把这个还在不停说话的成员
+    从它自己的池子里删掉了 —— beats_ok 全程停在 0。
+    """
+
+    def registry_says() -> int:
+        url = f"http://{registry.endpoint}/v1/pools"
+        with urllib.request.urlopen(url, timeout=2) as r:
+            return json.loads(r.read()).get("p", {}).get("members", 0)
+
+    with tinyray.join("p", slot=0, size=1) as m:
+        m.ready()
+        tinyray.pool("p")
+        time.sleep(registry.ttl_ms / 1000)
+        before = m.stats()["beats_ok"]
+        stop = threading.Event()
+
+        def spin() -> None:
+            i = 0
+            while not stop.is_set():
+                m.update(i=i)  # 不加任何节流
+                i += 1
+
+        t = threading.Thread(target=spin, daemon=True)
+        t.start()
+        try:
+            worst = 99
+            for _ in range(8):
+                time.sleep(0.5)
+                worst = min(worst, registry_says())
+        finally:
+            stop.set()
+            t.join(timeout=10)
+
+        assert worst >= 1, "成员一边发布一边被注册表清出了自己的池子"
+        assert m.stats()["beats_ok"] > before, "全程一拍都没完成"
