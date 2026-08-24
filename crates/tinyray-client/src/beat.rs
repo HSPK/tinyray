@@ -218,6 +218,15 @@ impl Shared {
             // A full roster describes itself and is safe whoever numbered it.
             // Dropping the rest leaves no entry for the pool, so the next beat
             // asks with no position at all and is sent one.
+            //
+            // Note for whoever tries to test the `clear()` below: a restart
+            // empties the whole cache above, so the only way to reach a full
+            // roster with stale entries under it is to fall off the change log
+            // -- 4096 versions behind. That is hard to build on purpose,
+            // because the registry collapses a member's changes to one per
+            // beat: 4,300 rapid updates moved the version by 8. It stays
+            // reachable at scale, where a large pool can move that far during
+            // a stall shorter than a lease, so the clear stays.
             if restarted && !d.full {
                 continue;
             }

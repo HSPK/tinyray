@@ -41,6 +41,27 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "removals in a delta are ignored",
+        RS_BEAT,
+        "            for id in &d.removed {\n                c.members.remove(id);\n            }",
+        "",
+        "tests/test_m1_delta.py",
+    ),
+    (
+        "an incremental delta is applied across a registry restart",
+        RS_BEAT,
+        "            if restarted && !d.full {\n                continue;\n            }",
+        "",
+        "tests/test_registry_restart.py",
+    ),
+    (
+        "the cached version is never advanced",
+        RS_BEAT,
+        "            c.version = d.version;",
+        "",
+        "tests/test_m1_delta.py",
+    ),
+    (
         "a departed tenure is forgotten, so a beat in flight revives it",
         RS_STATE,
         "            p.gone\n                .insert(b.id, (b.incarnation, Instant::now() + self.ttl));",
