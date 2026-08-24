@@ -93,6 +93,13 @@ MUTANTS = [
         "tests/test_readiness_owner.py::test_key_order_is_not_a_change",
     ),
     (
+        "the post-beat pause reads the last request's hold, not the loop's intent",
+        RS_BEAT,
+        "            if shared.hold_ms.load(Ordering::Relaxed) == 0 {\n                let ms = shared.interval_ms",
+        "            if hold == 0 {\n                let ms = shared.interval_ms",
+        "tests/test_long_poll.py::test_a_superseded_member_finds_out_within_a_round_trip",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'return f"{_identity or \'anon\'}-{next(_seq)}"',

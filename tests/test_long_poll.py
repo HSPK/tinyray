@@ -234,3 +234,57 @@ def test_publishing_flat_out_does_not_starve_the_heartbeat(registry):
 
         assert worst >= 1, "成员一边发布一边被注册表清出了自己的池子"
         assert m.stats()["beats_ok"] > before, "全程一拍都没完成"
+
+
+def test_a_superseded_member_finds_out_within_a_round_trip(long_lease):
+    """被顶替的成员必须**立刻**知道，而不是等下一拍。
+
+    它是围栏的两道关之一：调用方带的 identity 只挡得住"地址被后一任复用"，
+    两代跑在不同端口时就只剩这一道 —— 旧进程自己知道自己是幽灵。
+
+    这条测试是补的。心跳循环里 `hold == 0` 一度身兼两义：既表示"注册中心老得
+    不会挂起"，也表示"取消之后顶上来的那个不挂起"。完成一拍后的分支按前者理解，
+    于是去睡满一个 interval，而且不再挂起 —— 注册中心叫不醒它。被顶替的成员因此
+    要 940ms 才知道，而挂起时只要 1-2ms。是 examples 里的 06_fencing 在双核上
+    偶然撞出来的，这里把它钉死。
+    """
+    peer = textwrap.dedent(
+        f"""
+        import os, sys, time, tinyray
+        os.environ["TINYRAY_REGISTRY"] = "{long_lease.endpoint}"
+        m = tinyray.join("seat", "stateful", slot=0)
+        m.ready()
+        print("UP", flush=True)
+        while m.accepted:
+            time.sleep(0.002)
+        print("FENCED %.6f" % time.time(), flush=True)
+        """
+    )
+    ghost = subprocess.Popen(
+        [sys.executable, "-c", peer], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        assert ghost.stdout.readline().strip() == "UP", ghost.stderr.read()
+        # 只等它把开头几拍走完，不能等更久：那段错误的睡眠正是从 ready() 之后
+        # 开始的，等过了它，这条测试就再也证明不了什么 —— 第一版就是这样，
+        # 把 bug 放回去照样通过。
+        time.sleep(0.5)
+
+        took = time.time()
+        with tinyray.join("seat", "stateful", slot=0) as taker:
+            taker.ready()
+            line = ghost.stdout.readline().strip()
+            assert line.startswith("FENCED"), f"旧任期一直没发现自己被顶替: {line!r}"
+            noticed = (float(line.split()[1]) - took) * 1000
+            ghost.wait(timeout=10)
+
+    finally:
+        if ghost.poll() is None:
+            ghost.kill()
+
+    # 一个往返是毫秒级；一拍是 ttl/4 = 5s。中间差三个数量级，取十分之一拍做界。
+    budget = long_lease.ttl_ms / 4 / 10
+    assert noticed < budget, (
+        f"被顶替之后过了 {noticed:.0f}ms 才发现，超过 {budget:.0f}ms —— "
+        f"像是在等下一拍而不是等注册中心叫醒"
+    )

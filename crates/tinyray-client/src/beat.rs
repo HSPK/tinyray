@@ -403,7 +403,14 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             }
             // Whatever the beat did, somebody may be waiting on the answer.
             shared.ring();
-            if hold == 0 {
+            // Whether to sleep is decided by what this loop *intends* to do,
+            // not by what the last request happened to ask for. Reading the
+            // per-request `hold` here confused an unparked replacement with a
+            // registry too old to park anything, and sent the loop to sleep
+            // for a whole interval -- unparked, so the registry could no
+            // longer reach it. Measured on a superseded member: it took 940ms
+            // to notice it had been fenced, against 1-2ms when parked.
+            if shared.hold_ms.load(Ordering::Relaxed) == 0 {
                 let ms = shared.interval_ms.load(Ordering::Relaxed).clamp(50, 30_000);
                 // Wake early if the process has something new to say.
                 let _ =
