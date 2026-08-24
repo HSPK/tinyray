@@ -178,3 +178,30 @@ def test_a_proxy_that_answers_through_getattr_still_works(registry):
 
     found = _serve.scan(Proxy())
     assert sorted(found) == ["dynamic"], sorted(found)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["http://10.0.0.5", "10.0.0.5:8080", "10.0.0.5/", "host name", "https://node7/x"],
+)
+def test_an_advertise_value_that_is_not_a_bare_host_is_refused(monkeypatch, value):
+    """登记一个没人能到达的地址，和登记 127.0.0.1 是同一种错：**静默错路由**。
+
+    这里只有主机名的位置，scheme 和端口是围着它拼上去的。写别的东西会被整个
+    粘进去：实测 `http://10.0.0.5` 变成 `http://http://10.0.0.5:33097`，
+    `10.0.0.5:8080` 变成 `http://10.0.0.5:8080:33097` —— 而进程照常注册成功，
+    要等到有人来调用才炸，那时现场已经离出错的地方很远了。
+
+    文档把它叫"对外地址"，本来就在引诱人写 `http://`。
+    """
+    monkeypatch.setenv("TINYRAY_ADVERTISE", value)
+    with pytest.raises(ValueError, match="bare host"):
+        tinyray._advertise()
+
+
+@pytest.mark.parametrize("value", ["10.0.0.5", "node7", " 10.0.0.5 ", "\tnode7\n"])
+def test_a_bare_host_is_taken_as_given(monkeypatch, value):
+    """对偶：正常写法不能被挡掉。前后空白是无歧义的，直接修掉 —— .env 文件里
+    很容易带上。"""
+    monkeypatch.setenv("TINYRAY_ADVERTISE", value)
+    assert tinyray._advertise() == value.strip()

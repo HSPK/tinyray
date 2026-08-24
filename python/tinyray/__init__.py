@@ -112,7 +112,23 @@ def _advertise() -> str:
     """
     explicit = os.environ.get("TINYRAY_ADVERTISE")
     if explicit:
-        return explicit
+        host = explicit.strip()
+        # Only a bare host composes into an address here -- the scheme and the
+        # port are added around it. Anything else is pasted in whole and makes
+        # a URL nobody can reach, while the process registers perfectly
+        # happily: measured, `http://10.0.0.5` became
+        # `http://http://10.0.0.5:33097`, and `10.0.0.5:8080` became
+        # `http://10.0.0.5:8080:33097`. Both only fail later, at whoever tried
+        # to call -- which is the same silent misrouting the loopback rule
+        # below exists to prevent, so it is refused the same way.
+        if not host or any(c in host for c in "/: "):
+            raise ValueError(
+                f"TINYRAY_ADVERTISE is {explicit!r}, which is not a bare host. "
+                f"Set it to a hostname or IP and nothing else -- the scheme and "
+                f"this process's port are added for you. To advertise a "
+                f"different address entirely, pass join(url=...)."
+            )
+        return host
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # Asks the routing table which local address would be used; sends

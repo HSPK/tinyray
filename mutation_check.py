@@ -41,6 +41,20 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "any advertise value is accepted whole",
+        PY_INIT,
+        '        if not host or any(c in host for c in "/: "):',
+        "        if False:",
+        "tests/test_m2_validation.py::test_an_advertise_value_that_is_not_a_bare_host_is_refused",
+    ),
+    (
+        "surrounding whitespace is left in the advertised host",
+        PY_INIT,
+        "        host = explicit.strip()",
+        "        host = explicit",
+        "tests/test_m2_validation.py::test_a_bare_host_is_taken_as_given",
+    ),
+    (
         "method discovery reads the instance and runs its properties",
         "python/tinyray/_serve.py",
         "        static = inspect.getattr_static(obj, name, _ABSENT)",

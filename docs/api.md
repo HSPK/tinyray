@@ -60,6 +60,13 @@ tinyray.join(
 - **`url=`** —— 手工指定对外地址。默认由路由表探出来；多网卡机器上可以用
   `TINYRAY_ADVERTISE` 指定。
 
+    !!! warning "只写主机名，不要写 scheme 或端口"
+        `http://` 和端口是围着它拼上去的，所以 `TINYRAY_ADVERTISE=http://10.0.0.5`
+        会拼成 `http://http://10.0.0.5:33097`。这类写法现在**当场拒绝**并说明
+        原因 —— 以前会登记成功，等到有人来调用才炸。
+
+        要登记完全不同的地址（比如在反向代理后面），用 `join(url=...)`。
+
 ---
 
 ## `Member`
@@ -529,7 +536,7 @@ OldRegistryWarning(UserWarning)  注册中心比本包旧，某个功能不可�
 | 变量 | 作用 |
 |---|---|
 | `TINYRAY_REGISTRY` | 注册中心地址，默认 `127.0.0.1:8760` |
-| `TINYRAY_ADVERTISE` | 对外地址。多网卡机器上必须指定，否则可能登记错网卡 |
+| `TINYRAY_ADVERTISE` | 对外**主机名或 IP**，只写这一个东西。多网卡机器上必须指定，否则可能登记错网卡 |
 | `TINYRAY_SLOT` / `RANK` / `SLURM_PROCID` / `OMPI_COMM_WORLD_RANK` | 座位号 |
 | `TINYRAY_SIZE` / `WORLD_SIZE` / `SLURM_NTASKS` / `OMPI_COMM_WORLD_SIZE` | 规模 |
 
