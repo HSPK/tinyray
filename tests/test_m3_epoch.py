@@ -60,8 +60,8 @@ def test_a_round_waits_for_everyone_then_freezes(registry):
         assert len(ep) == world
         assert sorted(h.slot for h in ep) == [0, 1, 2, 3]
         assert ep.valid
-        # Frozen: the list does not move under us the way all() does.
-        before = list(ep.members)
+        # Frozen: the roster does not move under us the way all() does.
+        before = tuple(ep.members)
         time.sleep(0.3)
         assert ep.members == before
         assert ep.slot(2).slot == 2
@@ -338,3 +338,93 @@ def test_a_frozen_round_is_described_by_the_fingerprint_it_carries(registry):
             lazy.kill()
         peers.stop()
         me.leave()
+
+
+def test_a_frozen_round_cannot_be_edited(registry):
+    """ "冻结"必须真的是冻结。
+
+    这份名单会发给每个 rank 去建同一个进程组。是列表的话，任何一次就地
+    `sort()` 或 `filter` 都能让各 rank 拿到不同的名单 —— 那正是这个类型存在
+    要防的死锁，却是从这个类型本身走过去的。实测过：`epoch.members.append(...)`
+    会让 `len(epoch)` 跟着变。
+    """
+    with tinyray.join("r", "collective", slot=0, size=1) as me:
+        me.ready()
+        ep = tinyray.pool("r").epoch(timeout=15)
+        assert len(ep) == 1
+        with pytest.raises(AttributeError):
+            ep.members.append("不是 Handle")  # type: ignore[attr-defined]
+        with pytest.raises(TypeError):
+            ep.members[0] = "换一个"  # type: ignore[index]
+        assert len(ep) == 1
+
+
+def test_a_snapshot_cannot_be_edited_either(registry):
+    """快照命名的是一个时刻，事后能改的就不是一个时刻。"""
+    with tinyray.join("p", "churn") as me:
+        me.ready()
+        snap = tinyray.pool("p").snapshot()
+        with pytest.raises(AttributeError):
+            snap.members.append("不是 Handle")  # type: ignore[attr-defined]
+        with pytest.raises(TypeError):
+            snap.members[0] = "换一个"  # type: ignore[index]
+
+
+def test_readiness_does_not_break_a_round_but_leaving_does(registry):
+    """指纹认的是"谁占着座位"，不是"谁准备好了"。
+
+    这个区分是刻意的：一轮开始之后有 rank 短暂 unready，不该让整轮作废；而有
+    人真的走了，就必须作废。三种变化的反应都实测过。
+    """
+    peer = textwrap.dedent(
+        f"""
+        import os, sys, tinyray
+        os.environ["TINYRAY_REGISTRY"] = "{registry.endpoint}"
+        m = tinyray.join("r", "collective", slot=1, size=2)
+        m.ready()
+        print("READY", flush=True)
+        for line in sys.stdin:
+            cmd = line.strip()
+            if cmd == "unready":
+                m.unready()
+            elif cmd == "ready":
+                m.ready()
+            elif cmd == "quit":
+                break
+            print("ok", flush=True)
+        m.leave()
+        """
+    )
+    p = subprocess.Popen(
+        [sys.executable, "-c", peer], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert p.stdout.readline().strip() == "READY"
+        with tinyray.join("r", "collective", slot=0, size=2) as me:
+            me.ready()
+            ep = tinyray.pool("r").epoch(timeout=20)
+            assert len(ep) == 2 and ep.valid
+
+            def settle() -> None:
+                time.sleep(registry.ttl_ms / 1000 * 1.5)
+
+            p.stdin.write("unready\n")
+            p.stdin.flush()
+            p.stdout.readline()
+            settle()
+            assert ep.valid, "有人 unready 不该让整轮作废"
+
+            p.stdin.write("ready\n")
+            p.stdin.flush()
+            p.stdout.readline()
+            settle()
+            assert ep.valid
+
+            p.stdin.write("quit\n")
+            p.stdin.flush()
+            p.wait(timeout=10)
+            settle()
+            assert not ep.valid, "有人离开了，这一轮必须作废"
+    finally:
+        if p.poll() is None:
+            p.kill()

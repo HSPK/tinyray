@@ -220,9 +220,14 @@ class Epoch:
 
     __slots__ = ("pool", "members", "roster", "_c")
 
-    def __init__(self, pool_name: str, client: _Client, members: list[Handle], roster: int):
+    def __init__(self, pool_name: str, client: _Client, members: Sequence[Handle], roster: int):
         self.pool = pool_name
-        self.members = members
+        # A tuple, because "frozen" has to mean it. Handed to every rank to
+        # build the same process group from, a list is one in-place sort or
+        # filter away from the ranks disagreeing -- which is the deadlock this
+        # type exists to prevent, arrived at through the type meant to prevent
+        # it. Measured before: `epoch.members.append(...)` changed `len(epoch)`.
+        self.members = tuple(members)
         self.roster = roster
         self._c = client
 
@@ -270,10 +275,12 @@ class Snapshot:
 
     __slots__ = ("pool", "revision", "members")
 
-    def __init__(self, pool_name: str, revision: int, members: list[Handle]):
+    def __init__(self, pool_name: str, revision: int, members: Sequence[Handle]):
         self.pool = pool_name
         self.revision = revision
-        self.members = members
+        # Same reason as `Epoch`: a snapshot names one moment, and a moment
+        # that can be edited afterwards is not one.
+        self.members = tuple(members)
 
     def __len__(self) -> int:
         return len(self.members)

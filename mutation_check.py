@@ -41,6 +41,29 @@ AWAIT_READY = (
 # (label, file, find, replace, test that must fail)
 MUTANTS = [
     (
+        "a frozen round is handed out as an editable list",
+        PY_INIT,
+        "        self.members = tuple(members)\n        self.roster = roster",
+        "        self.members = list(members)\n        self.roster = roster",
+        "tests/test_m3_epoch.py::test_a_frozen_round_cannot_be_edited",
+    ),
+    (
+        "a snapshot is handed out as an editable list",
+        PY_INIT,
+        "        # that can be edited afterwards is not one.\n"
+        "        self.members = tuple(members)",
+        "        # that can be edited afterwards is not one.\n"
+        "        self.members = list(members)",
+        "tests/test_m3_epoch.py::test_a_snapshot_cannot_be_edited_either",
+    ),
+    (
+        "a round never notices it has broken",
+        PY_INIT,
+        "        return info is None or info[1] == self.roster",
+        "        return True",
+        "tests/test_m3_epoch.py::test_readiness_does_not_break_a_round_but_leaving_does",
+    ),
+    (
         "any advertise value is accepted whole",
         PY_INIT,
         '        if not host or any(c in host for c in "/: "):',
@@ -370,6 +393,9 @@ def check_anchors() -> list[str]:
 
 
 def main() -> int:
+    if "--count" in sys.argv:
+        print(len(MUTANTS))
+        return 0
     ambiguous = check_anchors()
     for line in ambiguous:
         print(f"BROKEN  {line}")
