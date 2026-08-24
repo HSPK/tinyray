@@ -22,6 +22,13 @@ import msgspec
 # A caller that announces a body and never sends it pins a thread for as long
 # as it cares to: measured 200 such connections holding 203 threads, released
 # only when the attacker closed them. Real bodies are under a megabyte.
+#
+# What this bound is worth, measured since, so nobody has to wonder twice:
+# threads stop climbing rather than tracking the connection count, because
+# each one leaves after the timeout -- 500 stalled connections settled at 125
+# threads, and an ordinary call went on being answered in 1.7ms throughout.
+# The declared length is not allocated either: content-length of a terabyte,
+# with no body behind it, moved the serving process's RSS not at all.
 BODY_TIMEOUT = 15.0
 
 
