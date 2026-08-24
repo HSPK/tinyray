@@ -68,6 +68,10 @@ pub struct Shared {
     pub last_ok_ms: AtomicU64,
     /// Which registry process the cache came from.
     pub seen_epoch: AtomicU64,
+    /// What the registry last said it can do. Zero until the first ack, and
+    /// zero afterwards if the registry is old enough not to say.
+    pub registry_protocol: AtomicU64,
+    pub registry_version: Mutex<String>,
     pub started: std::time::Instant,
     /// Rung when something we publish changes. Without it, subscribing to a
     /// pool or declaring readiness costs a full heartbeat interval of silence,
@@ -156,6 +160,15 @@ impl Shared {
     }
 
     /// Returns false once the seat has been taken by a later tenure.
+    fn note_registry(&self, ack: &BeatAck) {
+        self.registry_protocol
+            .store(ack.protocol as u64, Ordering::Relaxed);
+        let mut v = self.registry_version.lock().unwrap();
+        if *v != ack.version {
+            v.clone_from(&ack.version);
+        }
+    }
+
     fn apply(&self, ack: &BeatAck, watch: &[String]) -> bool {
         // A restarted registry counts from zero again. Keeping a cache built
         // against the old numbering means asking for changes since a version
@@ -383,6 +396,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                     shared
                         .hold_ms
                         .store((ack.ttl_ms / 4).clamp(50, 30_000), Ordering::Relaxed);
+                    shared.note_registry(&ack);
                     let alive = shared.apply(&ack, &beat.watch);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     shared.mark_ok();
@@ -448,6 +462,7 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.hold_ms
                     .store((ack.ttl_ms / 4).clamp(50, 30_000), Ordering::Relaxed);
+                s.note_registry(&ack);
                 s.apply(&ack, &beat.watch);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
                 s.mark_ok();

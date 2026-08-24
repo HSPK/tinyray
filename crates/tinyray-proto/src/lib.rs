@@ -140,6 +140,20 @@ pub struct BeatAck {
     /// would sit on a stale roster forever, silently.
     #[serde(default)]
     pub epoch: u64,
+    /// What this registry can do, as a number that only goes up. Absent means
+    /// a registry from before it existed, which deserializes to 0.
+    ///
+    /// A client cannot infer this from behaviour: an old registry answers a
+    /// long-poll request immediately and correctly, it just answers it at
+    /// once, so "parked and nothing happened" and "does not park" look the
+    /// same. The difference was measured at 14.5 requests a second against
+    /// 0.12 -- a hundredfold, silently.
+    #[serde(default)]
+    pub protocol: u32,
+    /// The registry's own version, for saying so in a message. The number
+    /// above is what code should branch on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     pub ttl_ms: u64,
     /// False means the seat was taken by a later incarnation. Give up.
     pub accepted: bool,
@@ -151,3 +165,10 @@ pub struct BeatAck {
     #[serde(default)]
     pub pools: HashMap<String, PoolDelta>,
 }
+
+/// What this build of the registry can do.
+///
+///   0  everything before long polling existed (pre-0.7.0)
+///   1  honours `Beat.hold_ms`: parks a reply that has nothing to say and
+///      answers the moment a watched pool moves
+pub const PROTOCOL: u32 = 1;

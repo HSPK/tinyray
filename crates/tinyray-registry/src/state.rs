@@ -208,6 +208,8 @@ impl Registry {
         if !Self::admissible(b) {
             return BeatAck {
                 epoch: self.epoch,
+                protocol: tinyray_proto::PROTOCOL,
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 ttl_ms: self.ttl.as_millis() as u64,
                 accepted: false,
                 refused: None,
@@ -231,6 +233,8 @@ impl Registry {
             // rank to find.
             return BeatAck {
                 epoch: self.epoch,
+                protocol: tinyray_proto::PROTOCOL,
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 ttl_ms: self.ttl.as_millis() as u64,
                 accepted: false,
                 refused: Some(why),
@@ -334,6 +338,8 @@ impl Registry {
         }
         BeatAck {
             epoch: self.epoch,
+            protocol: tinyray_proto::PROTOCOL,
+            version: env!("CARGO_PKG_VERSION").to_string(),
             ttl_ms: self.ttl.as_millis() as u64,
             accepted,
             refused: None,

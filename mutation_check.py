@@ -17,6 +17,8 @@ PY = ROOT / ".venv/bin/python"
 
 PY_INIT = "python/tinyray/__init__.py"
 RS_BEAT = "crates/tinyray-client/src/beat.rs"
+RS_PROTO = "crates/tinyray-proto/src/lib.rs"
+RS_STATE = "crates/tinyray-registry/src/state.rs"
 RS_LIB = "crates/tinyray-client/src/lib.rs"
 PY_RPC = "python/tinyray/_rpc.py"
 
@@ -100,6 +102,40 @@ MUTANTS = [
         "tests/test_long_poll.py::test_a_superseded_member_finds_out_within_a_round_trip",
     ),
     (
+        "the registry does not report its protocol on the ack",
+        RS_STATE,
+        '            protocol: tinyray_proto::PROTOCOL,\n'
+        '            version: env!("CARGO_PKG_VERSION").to_string(),\n'
+        "            ttl_ms:",
+        "            protocol: 0,\n            version: String::new(),\n            ttl_ms:",
+        "tests/test_registry_capability.py::test_a_member_can_ask_what_the_registry_can_do",
+    ),
+    (
+        "a missing protocol field is an error rather than zero",
+        RS_PROTO,
+        "    #[serde(default)]\n    pub protocol: u32,",
+        "    pub protocol: u32,",
+        "crates/tinyray-proto/tests/wire.rs",
+    ),
+    (
+        "an unknown feature name answers False instead of raising",
+        PY_INIT,
+        "            raise ValueError(\n"
+        '                f"no such feature {feature!r}; this package knows about '
+        '{sorted(self.FEATURES)}"\n'
+        "            )",
+        "            return False",
+        "tests/test_registry_capability.py::test_an_unknown_feature_is_an_error_not_a_false",
+    ),
+    (
+        "joining an out-of-date registry says nothing",
+        PY_INIT,
+        '    if not seen.supports("long_poll"):',
+        "    if False:",
+        "tests/test_registry_capability.py"
+        "::test_wanting_more_than_the_registry_has_says_so_instead_of_degrading_quietly",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'return f"{_identity or \'anon\'}-{next(_seq)}"',
@@ -129,15 +165,24 @@ def main() -> int:
         path.write_text(original.replace(find, repl, 1))
         try:
             if rel.endswith(".rs") and not build():
-                print(f"SKIP  {label}\n      mutant did not compile")
-                bad.append(label)
+                # A mutant that will not compile is caught too: the compiler
+                # is the thing that noticed.
+                print(f"CAUGHT  {label}  (did not compile)")
                 continue
-            r = subprocess.run(
-                [str(PY), "-m", "pytest", test, "-q", "--timeout=180"],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-            )
+            if test.endswith(".rs"):
+                r = subprocess.run(
+                    ["cargo", "test", "-q", "-p", "tinyray-proto"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                r = subprocess.run(
+                    [str(PY), "-m", "pytest", test, "-q", "--timeout=180"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
             caught = r.returncode != 0
             print(f"{'CAUGHT' if caught else 'MISSED'}  {label}")
             if not caught:

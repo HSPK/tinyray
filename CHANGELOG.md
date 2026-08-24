@@ -5,6 +5,51 @@
 
 ---
 
+## 0.9.0
+
+### 新增
+
+**注册中心自报能做什么，不用再靠属性探测去猜。**
+
+```python
+me.registry                          # -> RegistryInfo
+me.registry.protocol                 # 只增不减；老到不报的读作 0
+me.registry.version                  # 对面的版本号，写日志用
+me.registry.supports("long_poll")    # 要分支就看这个
+```
+
+```console
+$ curl -s http://registry:7000/health
+{"status":"ok","version":"0.9.0","protocol":1}
+```
+
+猜是猜不出来的：老注册中心对长轮询请求的回答**又快又对**，只是不挂起，所以
+"挂起了但什么都没发生"和"根本不会挂起"从客户端看完全一样。实测对着 0.6.1 的
+注册中心：每秒 **14.5** 次请求，当前版本 **0.12** 次 —— 一百倍，而 `/health`
+只说 `{"status":"ok"}`，客户端也没有任何入口可问。
+
+`tinyray.__version__` 说的是本地这一侧。注册中心是另一个进程，可以独立升级，
+所以那是另一个问题，现在有了另一个答案。
+
+**版本不匹配时 `join()` 会说话**，发一条 `OldRegistryWarning`。因为这是性能悬崖
+不是报错：一切照常工作，只是变化要等一个心跳间隔而不是一个往返，而且请求量翻
+几十倍。除了这条告警，没有任何东西会提。照常用 `warnings.filterwarnings` 关掉。
+
+功能名写错抛 `ValueError`，不返回 `False` —— 后者会让一个笔误安静地走进降级分支，
+而那正是这套机制要消灭的东西。
+
+对照表 `RegistryInfo.FEATURES` 放在依赖它的这一侧，所以老客户端不必认识将来的
+功能。今天只有一个条目（`long_poll` 需要 protocol 1），这是实话：注册中心侧对
+客户端可见的能力变化，到目前为止只有长轮询这一件。
+
+### 兼容性
+
+`BeatAck` 的两个新字段都带 serde 默认值，缺失读作 `protocol=0` / 空版本号，所以
+升级过程中新客户端配旧注册中心只会收到告警，不会失败。这条由
+`crates/tinyray-proto/tests/wire.rs` 守着。
+
+---
+
 ## 0.8.1
 
 **0.8.0 从未上架 PyPI** —— 和 0.7.0 一样，流水线在 `lint and test` 就失败了。

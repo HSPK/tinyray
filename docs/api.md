@@ -306,6 +306,49 @@ NCCL 阻塞时会放开 GIL。
 
 ---
 
+## `RegistryInfo`
+
+注册中心是**另一个进程**，可以和 Python 包分开升级。`tinyray.__version__` 说的是
+本地这一侧，对面能做什么得单独问：
+
+```python
+me.registry            # -> RegistryInfo
+me.registry.protocol   # 只增不减的整数；老到不报的读作 0
+me.registry.version    # 对面的版本号，用来写进日志
+me.registry.supports("long_poll") -> bool
+```
+
+`RegistryInfo.FEATURES` 是功能名到所需 protocol 的对照表，放在依赖它的这一侧，
+所以老客户端不需要认识将来的功能。功能名写错会抛 `ValueError` 而不是返回
+`False` —— 后者会让一个笔误安静地走进降级分支。
+
+不加入也能看：
+
+```console
+$ curl -s http://registry:7000/health
+{"status":"ok","version":"0.9.0","protocol":1}
+```
+
+| protocol | 含义 |
+|---|---|
+| 0 | 长轮询之前（0.7.0 以前） |
+| 1 | 认 `hold_ms`：没话说时挂起应答，被订阅的池子一动就立刻回 |
+
+!!! warning "版本不匹配是性能悬崖，不是报错"
+    老注册中心对长轮询请求的回答**又快又对**，只是不挂起 —— 所以"挂起了但什么
+    都没发生"和"根本不会挂起"从客户端看一模一样，靠探测属性是猜不出来的。
+
+    实测对着 0.6.1 的注册中心：每秒 **14.5** 次请求，而当前版本 **0.12** 次；
+    发现延迟从一个往返退回一个心跳间隔。一切照常工作，没有任何东西会报错。
+
+    所以 `join()` 在这种情况下会发一条 `OldRegistryWarning`。照常关掉：
+
+    ```python
+    warnings.filterwarnings("ignore", category=tinyray.OldRegistryWarning)
+    ```
+
+---
+
 ## `CallContext`
 
 服务端侧的调用方身份。在参数上标注类型即可，库会填：
@@ -346,7 +389,8 @@ TinyrayError
 
 NotFound(LookupError)    没人匹配
 PolicyError(ValueError)  策略、座位、size 组合不成立
-OversizeWarning(UserWarning)   超过 1 MB 提示线（只是提示，东西照送）
+OversizeWarning(UserWarning)     超过 1 MB 提示线（只是提示，东西照送）
+OldRegistryWarning(UserWarning)  注册中心比本包旧，某个功能不可用
 ```
 
 **只有 `NotDelivered` 可以盲目重试。** `OutcomeUnknown` 意味着对面可能已经做过

@@ -32,6 +32,9 @@ class Client:
         """Publish state without touching readiness."""
 
     def is_ready(self) -> bool: ...
+    def registry(self) -> tuple[int, str]:
+        """(protocol, version) as last reported by the registry."""
+
     def add_wake_fd(self, fd: int) -> None:
         """Also write a byte to `fd` whenever the bell rings."""
 

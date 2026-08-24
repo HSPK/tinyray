@@ -23,8 +23,12 @@ import pytest
 import tinyray
 
 
-def test_close_releases_a_blocked_watcher(registry):
-    """没有变化时 watcher 是阻塞的，close() 必须把它拽回来。"""
+def test_close_releases_a_blocked_watcher(long_lease):
+    """没有变化时 watcher 是阻塞的，close() 必须把它拽回来。
+
+    必须用长租约。短租约下心跳本来就密，"被 close 拽回来"和"碰巧被下一拍
+    叫醒"只差一百多毫秒，分不开 —— 第一版就是这样，把 wake() 去掉照样通过。
+    ttl=20s 时前者是 0ms，后者要等一次挂起，差三个数量级。"""
     with tinyray.join("p", slot=0, size=1) as m:
         m.ready()
         w = tinyray.pool("p").changes()
@@ -44,8 +48,8 @@ def test_close_releases_a_blocked_watcher(registry):
         w.close()
         assert done.wait(5), "close() 没能结束一个阻塞中的 watcher"
         took = (time.monotonic() - t0) * 1000
-        # 一拍是 ttl/4 = 500ms；要求远快于此，否则只是碰巧被心跳唤醒。
-        assert took < 200, f"close() 用了 {took:.0f}ms，像是在等下一拍"
+        # 一拍是 ttl/4 = 5s；要求远快于此，否则只是碰巧被心跳唤醒。
+        assert took < 500, f"close() 用了 {took:.0f}ms，像是在等下一拍"
 
 
 def test_leave_ends_live_watchers(registry):

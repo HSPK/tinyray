@@ -188,6 +188,8 @@ fn an_ack_omits_a_refusal_it_does_not_have() {
     // accepted"; a null in the field would read as a reason that is missing.
     let ack = BeatAck {
         epoch: 1,
+        protocol: tinyray_proto::PROTOCOL,
+        version: String::new(),
         ttl_ms: 2000,
         accepted: true,
         refused: None,
@@ -195,4 +197,38 @@ fn an_ack_omits_a_refusal_it_does_not_have() {
     };
     let wire = serde_json::to_value(&ack).unwrap();
     assert!(wire.get("refused").is_none(), "got {wire}");
+}
+
+/// A registry from before the field existed does not send it, and its absence
+/// has to read as "cannot do it" rather than as a broken reply. Getting this
+/// wrong would turn an upgrade-in-progress deployment into a hard failure,
+/// which is worse than the silent degradation it is meant to replace.
+#[test]
+fn an_ack_without_a_protocol_reads_as_protocol_zero() {
+    let raw = r#"{"epoch":7,"ttl_ms":2000,"accepted":true,"pools":{}}"#;
+    let ack: tinyray_proto::BeatAck = serde_json::from_str(raw).unwrap();
+    assert_eq!(ack.protocol, 0);
+    assert_eq!(ack.version, "");
+    assert_eq!(ack.epoch, 7);
+    assert!(ack.accepted);
+}
+
+/// The other direction: a current registry says both, and an old client that
+/// does not know the fields must still parse the rest.
+#[test]
+fn a_current_ack_carries_the_protocol_and_the_version() {
+    let ack = tinyray_proto::BeatAck {
+        epoch: 1,
+        protocol: tinyray_proto::PROTOCOL,
+        version: "9.9.9".into(),
+        ttl_ms: 1000,
+        accepted: true,
+        refused: None,
+        pools: Default::default(),
+    };
+    let raw = serde_json::to_string(&ack).unwrap();
+    assert!(raw.contains("\"protocol\":1"), "{raw}");
+    assert!(raw.contains("\"version\":\"9.9.9\""), "{raw}");
+    let back: tinyray_proto::BeatAck = serde_json::from_str(&raw).unwrap();
+    assert_eq!(back.protocol, tinyray_proto::PROTOCOL);
 }

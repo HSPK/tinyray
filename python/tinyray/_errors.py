@@ -73,3 +73,17 @@ class OversizeWarning(UserWarning):
 
         warnings.filterwarnings("ignore", category=tinyray.OversizeWarning)
     """
+
+
+class OldRegistryWarning(UserWarning):
+    """The registry is older than this package and a feature is unavailable.
+
+    Raised rather than left silent because the failure mode is a performance
+    cliff, not an error: against a registry from before long polling, discovery
+    falls back to one heartbeat interval and the request rate goes up
+    hundredfold, with everything still working. Nothing else would ever say so.
+
+    Silence it the usual way:
+
+        warnings.filterwarnings("ignore", category=tinyray.OldRegistryWarning)
+    """

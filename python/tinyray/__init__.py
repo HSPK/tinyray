@@ -16,6 +16,7 @@ import random
 import socket
 import threading
 import time
+import warnings
 import weakref
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
@@ -25,6 +26,7 @@ from ._errors import (
     Fenced,
     NotDelivered,
     NotFound,
+    OldRegistryWarning,
     OutcomeUnknown,
     OversizeWarning,
     PolicyError,
@@ -59,12 +61,14 @@ __all__ = [
     "Epoch",
     "CallContext",
     "Snapshot",
+    "RegistryInfo",
     "Watch",
     "AsyncWatch",
     "Stale",
     "SeatTaken",
     "NotFound",
     "PolicyError",
+    "OldRegistryWarning",
     "OversizeWarning",
     "TinyrayError",
     "Unreachable",
@@ -362,6 +366,46 @@ def _loop_bell(client: _Client) -> _LoopBell:
     bell = _LoopBell(client, loop)
     _bells[key] = (weakref.ref(loop), bell)
     return bell
+
+
+class RegistryInfo:
+    """What the registry on the other end can do.
+
+    Without this there is nothing to ask. An old registry answers a long-poll
+    request immediately and correctly -- it just does not park it -- so
+    "parked and nothing happened" and "does not park" are indistinguishable
+    from the client. Measured against a 0.6.1 registry: 14.5 requests a second
+    where a current one does 0.12, a hundredfold, with `/health` saying only
+    `{"status": "ok"}` and no attribute anywhere to probe.
+
+    `protocol` is the number to branch on. It only goes up, and a registry too
+    old to report one reads as 0.
+    """
+
+    __slots__ = ("protocol", "version")
+
+    #: Feature name -> the protocol that first provided it. Deliberately a
+    #: table rather than a per-feature flag: the registry says one number and
+    #: the meaning of that number lives here, in the package that depends on
+    #: it, so an old client never has to be taught about a future feature.
+    FEATURES = {"long_poll": 1}
+
+    def __init__(self, protocol: int, version: str):
+        self.protocol = protocol
+        self.version = version
+
+    def supports(self, feature: str) -> bool:
+        """True if the registry is new enough for `feature`."""
+        want = self.FEATURES.get(feature)
+        if want is None:
+            raise ValueError(
+                f"no such feature {feature!r}; this package knows about {sorted(self.FEATURES)}"
+            )
+        return self.protocol >= want
+
+    def __repr__(self) -> str:
+        who = self.version or "an unnamed version"
+        return f"<RegistryInfo {who} protocol={self.protocol}>"
 
 
 class _Watching:
@@ -888,6 +932,17 @@ class Member:
         return self
 
     @property
+    def registry(self) -> RegistryInfo:
+        """What the registry this member is talking to can do.
+
+        Read it rather than probing for attributes: the package version says
+        what *this* side can do, and the two are separate processes that can
+        be upgraded independently.
+        """
+        protocol, version = self._c.registry()
+        return RegistryInfo(protocol, version)
+
+    @property
     def is_ready(self) -> bool:
         """What this member is currently telling the pool about itself."""
         return self._c.is_ready()
@@ -1140,6 +1195,20 @@ def join(
         )
     _client = c
     _owner_pid = os.getpid()
+    seen = RegistryInfo(*c.registry())
+    if not seen.supports("long_poll"):
+        warnings.warn(
+            f"the registry at {_endpoint()} reports protocol {seen.protocol} "
+            f"({seen.version or 'version not reported'}) but tinyray "
+            f"{__version__} expects {RegistryInfo.FEATURES['long_poll']}. "
+            f"Everything works; changes will take up to a heartbeat interval "
+            f"to show up instead of a round trip, and this process will beat "
+            f"far more often. Upgrade the registry, or silence this with "
+            f"warnings.filterwarnings('ignore', "
+            f"category=tinyray.OldRegistryWarning).",
+            OldRegistryWarning,
+            stacklevel=2,
+        )
     _rpc.set_identity(f"{pool}/{slot if slot is not None else ident}#{incarnation}")
     member = Member(c, pool, slot, incarnation, server, ident)
     # A process that exits normally should say goodbye, so the seat frees up

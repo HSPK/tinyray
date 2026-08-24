@@ -103,7 +103,17 @@ async fn handle(
                 .collect();
             reply(StatusCode::OK, serde_json::to_vec(&snap).unwrap())
         }
-        ("GET", "/health") => reply(StatusCode::OK, b"{\"status\":\"ok\"}".to_vec()),
+        // Says who it is as well as that it is up, so a deployment can check
+        // for a version-skewed registry without joining one.
+        ("GET", "/health") => reply(
+            StatusCode::OK,
+            format!(
+                "{{\"status\":\"ok\",\"version\":\"{}\",\"protocol\":{}}}",
+                env!("CARGO_PKG_VERSION"),
+                tinyray_proto::PROTOCOL
+            )
+            .into_bytes(),
+        ),
         _ => reply(StatusCode::NOT_FOUND, b"{}".to_vec()),
     }
 }

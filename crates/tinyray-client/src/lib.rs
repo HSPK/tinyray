@@ -82,6 +82,8 @@ impl Client {
             hold_ms: AtomicU64::new(0),
             last_ok_ms: AtomicU64::new(0),
             seen_epoch: AtomicU64::new(0),
+            registry_protocol: AtomicU64::new(0),
+            registry_version: Mutex::new(String::new()),
             started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
             revision: Mutex::new(0),
@@ -173,6 +175,15 @@ impl Client {
         }
         self.shared.wake.notify_one();
         Ok(true)
+    }
+
+    /// What the registry said it can do, and which version said it: the
+    /// protocol number to branch on, the version string to put in a message.
+    fn registry(&self) -> (u64, String) {
+        (
+            self.shared.registry_protocol.load(Ordering::Relaxed),
+            self.shared.registry_version.lock().unwrap().clone(),
+        )
     }
 
     fn is_ready(&self) -> bool {
