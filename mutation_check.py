@@ -228,6 +228,45 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_the_three_ways_a_stream_ends_are_told_apart",
     ),
     (
+        "a field-scoped watch yields on everything anyway",
+        PY_INIT,
+        "            digest = self._c.field_digest(self._pool._name, self._fields, False)\n"
+        "            if digest != self._digest:\n"
+        "                self._digest = digest\n"
+        "                return self._pool.snapshot(), 0",
+        "            return self._pool.snapshot(), 0",
+        "tests/test_watch_lifecycle.py::test_a_watch_on_named_fields_ignores_the_rest",
+    ),
+    (
+        "the digest leaves out who the members are",
+        RS_LIB,
+        "            m.id.hash(&mut h);\n            m.incarnation.hash(&mut h);",
+        "",
+        "tests/test_watch_lifecycle.py::test_a_watch_on_fields_notices_a_seat_changing_hands",
+    ),
+    (
+        "the serving side stops counting refusals",
+        "python/tinyray/_serve.py",
+        "            counters.refuse()\n",
+        "",
+        "tests/test_stats.py"
+        "::test_stats_shows_saturation_rather_than_leaving_it_to_guesswork",
+    ),
+    (
+        "a pinned request id is ignored",
+        "python/tinyray/_rpc.py",
+        "    fixed = _pinned.get()\n    return fixed if fixed is not None else ",
+        "    return ",
+        "tests/test_identity_and_fencing.py::test_a_caller_can_pin_one_name_across_retries",
+    ),
+    (
+        "the pinned name is never restored afterwards",
+        "python/tinyray/_rpc.py",
+        "    finally:\n        _pinned.reset(token)",
+        "    finally:\n        pass",
+        "tests/test_identity_and_fencing.py::test_a_caller_can_pin_one_name_across_retries",
+    ),
+    (
         "every call reuses one request id",
         PY_RPC,
         'return f"{_identity or \'anon\'}-{next(_seq)}"',

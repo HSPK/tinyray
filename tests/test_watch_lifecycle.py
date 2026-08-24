@@ -513,6 +513,78 @@ def test_a_watch_on_named_fields_ignores_the_rest(registry):
         assert any(h.state.get("role") == "rollout" for h in got[-1].members)
 
 
+def test_a_watch_on_fields_notices_a_seat_changing_hands(registry):
+    """换人也算数 —— 哪怕接任者发布的字段和前任一模一样。
+
+    要真正隔离出"身份"，订阅的必须是一个**谁都不发布**的字段。否则总有别的东西
+    在变，测试就会靠它蒙对：
+      - 只测"新来一个成员" —— 人数变了，digest 自然变；
+      - 让前一任先退出再进新的 —— 中途只剩一个人，人数又变了；
+      - 订阅 role —— 新任期是先入座、后 `ready(role=...)`，中间有一瞬 role 是
+        缺失的。
+    三种写法我都试过，把身份从 digest 里删掉，三种照样通过。
+    """
+    with tinyray.join("seats", "collective", slot=1, size=2) as me:
+        me.ready(role="trainer")
+        pool = tinyray.pool("seats")
+
+        def peer() -> subprocess.Popen:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(
+                        f"""
+                        import os, sys, tinyray
+                        os.environ["TINYRAY_REGISTRY"] = "{registry.endpoint}"
+                        m = tinyray.join("seats", "collective", slot=0, size=2)
+                        m.ready(role="trainer")
+                        print(m.identity, flush=True)
+                        sys.stdin.readline()
+                        """
+                    ),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+
+        first = peer()
+        was = first.stdout.readline().strip()
+        pool.wait(count=2, timeout=15)
+        me.flush()
+
+        got: list = []
+        w = pool.changes(fields=["nobody_publishes_this"])
+        _drain_into(w, got)
+        time.sleep(0.3)
+        assert got == []
+
+        # 故意不让前一任先退出：座位是后来者居上，所以中途池子始终是两个人，
+        # role 也始终是 trainer。变的只有任期 —— 这才逼着 digest 必须把身份
+        # 算进去，而不是靠"人数变了"蒙对。
+        second = peer()
+        try:
+            now = second.stdout.readline().strip()
+            assert now != was
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not got:
+                time.sleep(0.05)
+            assert got, "座位换人了，watcher 却没看见 —— digest 没把身份算进去"
+            assert all(len(sn.members) == 2 for sn in got), (
+                f"过程中人数变过，这条测试就可能是靠人数蒙对的: {[len(sn.members) for sn in got]}"
+            )
+        finally:
+            w.close()
+            for p_ in (first, second):
+                try:
+                    p_.stdin.write("\n")
+                    p_.stdin.close()
+                    p_.wait(timeout=10)
+                except Exception:
+                    p_.kill()
+
+
 def test_a_watch_on_fields_still_sees_people_come_and_go(registry):
     """成员进出永远算数，不管订阅了哪些字段 —— 否则"谁在池子里"就成了盲区。"""
     with tinyray.join("p", "churn") as me:
