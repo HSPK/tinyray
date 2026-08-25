@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import os
 import threading
+import time
+import urllib.request
 
 import pytest
 import tinyray
@@ -109,4 +112,56 @@ def test_a_round_of_membership_leaves_nothing_behind(registry, tag, round_trip):
     grew = {k: (before[k], after[k]) for k in before if after[k] > before[k]}
     assert not grew, f"{rounds} 轮之后没回到原处：" + ", ".join(
         f"{k} {b}->{a}（每轮 +{(a - b) / rounds:.1f}）" for k, (b, a) in grew.items()
+    )
+
+
+def registry_census(reg) -> dict[str, int]:
+    pid = reg.proc.pid
+    fields = {}
+    for line in open(f"/proc/{pid}/status"):
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].endswith(":"):
+            fields[parts[0][:-1]] = parts[1]
+    with urllib.request.urlopen(f"http://{reg.endpoint}/v1/pools", timeout=5) as r:
+        pools = json.load(r)
+    return {
+        "注册中心线程": int(fields["Threads"]),
+        "注册中心 fd": len(os.listdir(f"/proc/{pid}/fd")),
+        "池子数": len(pools),
+        "成员总数": sum(p["members"] for p in pools.values()),
+    }
+
+
+def test_the_registry_ends_a_round_where_it_started(registry):
+    """同一个池名反复换人 —— 注册中心那边也不该攒下东西。
+
+    这是真实工作负载的形状：池名是稳定的（"rollout"、"engine"），人来人走。
+    盯的还是数得清的东西：线程、文件描述符、池子数、成员总数。
+
+    RSS 不在里面，因为它会说谎。实测 500 轮，每 100 轮一批的增量是
+    3.00 / 0.24 / 0.44 / 0.04 / 0.24 kB —— 第一批是变更日志涨到 4096 条的上限
+    加分配器的 arena，之后就平了。总共 396 kB。把它写进断言只会得到一条会飘的
+    测试。
+
+    真正无界的只有池名本身：注册中心不会删掉见过的池名，每个约 4.5 kB。删了就
+    会丢掉"每个座位最后归谁"的记忆，而且没有哪个工作负载在批量造池名，所以那件
+    事记在案上，不在这里断言。
+    """
+    for _ in range(3):
+        _with_watch("steady")
+    before = registry_census(registry)
+
+    rounds = 20
+    for _ in range(rounds):
+        _with_watch("steady")
+    # 只等最后一拍落地，不等清扫器。离场必须是**当场**生效的：靠租约过期兜底
+    # 那是给崩掉的进程留的后路，不是正常走人的路子。等满一个租约再看，就等于
+    # 承认"没删干净也行" —— 实测把离场那一支整个关掉，等 2.5 秒（租约 2 秒）
+    # 之后照样回到原点，测试全绿。
+    time.sleep(0.3)
+    after = registry_census(registry)
+
+    grew = {k: (before[k], after[k]) for k in before if after[k] > before[k]}
+    assert not grew, f"{rounds} 轮之后注册中心没回到原处：" + ", ".join(
+        f"{k} {b}->{a}（每轮 +{(a - b) / rounds:.2f}）" for k, (b, a) in grew.items()
     )

@@ -426,6 +426,13 @@ MUTANTS = [
         "tests/test_cold_cache.py::test_a_dead_registry_does_not_stall_lookups",
     ),
     (
+        "saying goodbye only takes effect when the lease lapses",
+        RS_STATE,
+        "        } else if b.leaving {",
+        "        } else if false {",
+        "tests/test_nothing_left_behind.py::test_the_registry_ends_a_round_where_it_started",
+    ),
+    (
         "closing leaves the handler threads parked",
         "python/tinyray/_serve.py",
         "        for conn in list(self._srv.live):",
