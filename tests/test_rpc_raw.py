@@ -349,3 +349,47 @@ def test_a_request_the_callee_never_read_whole_is_safe_to_send_again(
     # 上一句量到的是"什么都没跑"。这一句是客户端据此必须告诉调用方的话。
     with pytest.raises(tinyray.NotDelivered):
         _rpc._decode(status, b'{"error":"x"}', "count/0#1")
+
+
+@pytest.mark.parametrize(
+    "label,cl,sent,status,rest",
+    [
+        ("body 只发一半", b"200", b'{"args":', b"408", b'[7],"kwargs":{}}' + b" " * 176),
+        ("长度不是数字", b"abc", b"", b"400", b'{"args":[7],"kwargs":{}}'),
+        ("长度是负数", b"-5", b"", b"400", b'{"args":[7],"kwargs":{}}'),
+    ],
+)
+def test_a_body_the_server_gave_up_on_takes_the_connection_with_it(
+    counting, label, cl, sent, status, rest
+):
+    """没被读干净的 body，没法在同一条连接上接着往下走。
+
+    服务端放弃之后就不再读了，可字节还在路上：慢客户端会把 body 剩下的部分发
+    完，长度读不懂时整个 body 都还没被读过。这些字节留在连接里，服务端就会拿
+    它们当**下一个请求的请求行**去解析。
+
+    实测不关连接的样子：回过 408 之后，同一条连接上又被推下来一个 `HTTP 500`。
+    客户端复用这条长连接时会把它当成自己**下一个**请求的答复 —— 一次超时就这样
+    错位成后面每次调用都答非所问。关掉之后读到的是干净的 EOF。
+
+    三个入口都是同一件事，而三个原来一条测试都没有。
+    """
+    with tinyray.join("asker", "churn") as me:
+        me.ready()
+        tinyray.pool("count").wait(count=1, timeout=10)
+
+        c = socket.create_connection(("127.0.0.1", counting), timeout=10)
+        try:
+            c.sendall(_post(b"/call/work", cl) + sent)
+            first = c.recv(200)
+            assert first.split()[1] == status, f"{label}: {first[:80]!r}"
+
+            try:
+                c.sendall(rest)
+                c.settimeout(3)
+                left = c.recv(200)
+            except (BrokenPipeError, ConnectionResetError):
+                left = b""
+            assert left == b"", f"{label}: 之后服务端又在同一条连接上推了一个回复 {left[:60]!r}"
+        finally:
+            c.close()

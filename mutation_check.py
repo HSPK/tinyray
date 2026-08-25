@@ -412,6 +412,29 @@ MUTANTS = [
         "tests/test_m2_async.py::test_a_member_still_answers_after_the_loop_it_joined_on_stops",
     ),
     (
+        "a body that timed out leaves the connection open",
+        "python/tinyray/_serve.py",
+        "                self.close_connection = True\n                return self._send(408",
+        "                return self._send(408",
+        "tests/test_rpc_raw.py::test_a_body_the_server_gave_up_on_takes_the_connection_with_it",
+    ),
+    (
+        "an unreadable content-length leaves the connection open",
+        "python/tinyray/_serve.py",
+        '            self.close_connection = True\n'
+        '            return self._send(400, {"error": "content-length is not a number"})',
+        '            return self._send(400, {"error": "content-length is not a number"})',
+        "tests/test_rpc_raw.py::test_a_body_the_server_gave_up_on_takes_the_connection_with_it",
+    ),
+    (
+        "a negative content-length leaves the connection open",
+        "python/tinyray/_serve.py",
+        '            self.close_connection = True\n'
+        '            return self._send(400, {"error": "content-length is negative"})',
+        '            return self._send(400, {"error": "content-length is negative"})',
+        "tests/test_rpc_raw.py::test_a_body_the_server_gave_up_on_takes_the_connection_with_it",
+    ),
+    (
         "a request the callee never read is called maybe-ran",
         PY_RPC,
         "    if status in (400, 408, 411):",
