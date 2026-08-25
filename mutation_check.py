@@ -426,6 +426,13 @@ MUTANTS = [
         "tests/test_cold_cache.py::test_a_dead_registry_does_not_stall_lookups",
     ),
     (
+        "closing leaves the handler threads parked",
+        "python/tinyray/_serve.py",
+        "        for conn in list(self._srv.live):",
+        "        for conn in []:",
+        "tests/test_nothing_left_behind.py::test_a_round_of_membership_leaves_nothing_behind",
+    ),
+    (
         "a closed server keeps its lookup table",
         "python/tinyray/_serve.py",
         "        self.dispatch.clear()\n        self._srv.dispatch = {}\n",

@@ -7,8 +7,10 @@ and their type hints are the schema.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
+import socket
 import threading
 import time
 import traceback
@@ -280,6 +282,25 @@ class _Server(ThreadingHTTPServer):
     slots: threading.Semaphore | None
     counters: Counters
 
+    def __init__(self, *a: Any, **k: Any):
+        # Keep-alive means a handler thread sits in a read waiting for the
+        # caller's next request, and closing the listening socket does not
+        # disturb it. When it ends is then the caller's business, and a worker
+        # taking one job after another pays for that: measured at 30 rounds of
+        # join, one call, leave, and 30 threads, 30 servers and 60 descriptors
+        # left behind, against a default limit of 1024. They have to be reached
+        # to be ended, so they are written down.
+        self.live: set[socket.socket] = set()
+        super().__init__(*a, **k)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self.live.add(request)
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request: Any) -> None:
+        self.live.discard(request)
+        super().shutdown_request(request)
+
 
 class _Handler(BaseHTTPRequestHandler):
     server: _Server
@@ -526,6 +547,11 @@ class MethodServer:
     def close(self) -> None:
         self._srv.shutdown()
         self._srv.server_close()
+        for conn in list(self._srv.live):
+            # Shut the read side down and the handler's blocked read returns
+            # empty, which ends it the same way a caller hanging up would.
+            with contextlib.suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
         # Closing the listening socket does not end a handler already parked
         # on a keep-alive connection, and that handler holds the server, the
         # dispatch table and through it the served object -- a model or a
