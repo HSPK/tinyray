@@ -1230,6 +1230,12 @@ class Member:
         self._mine()
         if not self._left:
             self._left = True
+            # join() handed this method to atexit, and atexit never forgets.
+            # Left registered it pinned the member for the life of the
+            # process, and through it the served object -- which is a model or
+            # a dataset as often as not. Measured: eight join/leave rounds
+            # left eight servers alive, each still holding its object.
+            atexit.unregister(self.leave)
             # A watcher blocked on a client that is about to go would wait out
             # its whole timeout, and a non-daemon thread iterating one kept the
             # process alive indefinitely.

@@ -426,6 +426,13 @@ MUTANTS = [
         "tests/test_cold_cache.py::test_a_dead_registry_does_not_stall_lookups",
     ),
     (
+        "leaving stays registered with atexit",
+        PY_INIT,
+        "            atexit.unregister(self.leave)\n",
+        "",
+        "tests/test_m1_membership.py::test_leaving_lets_go_of_what_it_was_serving",
+    ),
+    (
         "arguments are never checked against the signature",
         "python/tinyray/_serve.py",
         "        sig.bind(*args, **kwargs)",

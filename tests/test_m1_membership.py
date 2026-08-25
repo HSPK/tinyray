@@ -175,3 +175,39 @@ def test_lookup_before_join_is_explicit():
     mod = importlib.reload(tinyray)
     with pytest.raises(RuntimeError):
         mod.pool("anything")
+
+
+def test_leaving_lets_go_of_what_it_was_serving(registry):
+    """`join()` 把 `member.leave` 交给了 atexit，而 atexit 从不遗忘。
+
+    留在那里，这个成员就被钉到进程结束，连同它的方法服务器和**被服务的那个
+    对象** —— 那东西十有八九是个模型或一份数据。反复 join/leave 的进程（一份
+    工作换一份工作）就这么一份份攒着。
+
+    实测：8 轮 join/leave 之后 8 个方法服务器全都还活着，各自还攥着自己的对象。
+
+    （另一条是暂时的，所以不在这里断言：给服务器发过调用之后，处理线程会卡在
+    那条 keep-alive 连接上，直到 httpx 60 秒后回收空闲连接。实测 70 秒后线程
+    从 10 条降回 3 条，会自愈。所以下面不发调用。）
+    """
+    import gc
+    import weakref
+
+    refs = []
+    for i in range(6):
+
+        class Served:
+            def echo(self, x: int) -> int:
+                return x
+
+        obj = Served()
+        refs.append(weakref.ref(obj))
+        m = tinyray.join(f"letgo{i}", "stateful", slot=0, size=1, serves=obj)
+        m.ready()
+        del obj
+        m.leave()
+        del m
+
+    gc.collect()
+    stuck = [r for r in refs if r() is not None]
+    assert not stuck, f"leave() 之后还有 {len(stuck)}/6 个被服务的对象没被释放"
