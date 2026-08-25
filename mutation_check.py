@@ -426,6 +426,13 @@ MUTANTS = [
         "tests/test_cold_cache.py::test_a_dead_registry_does_not_stall_lookups",
     ),
     (
+        "arguments are never checked against the signature",
+        "python/tinyray/_serve.py",
+        "        sig.bind(*args, **kwargs)",
+        "        pass",
+        "tests/test_m2_validation.py::test_arguments_that_do_not_fit_are_the_callers_mistake",
+    ),
+    (
         "a body that timed out leaves the connection open",
         "python/tinyray/_serve.py",
         "                self.close_connection = True\n                return self._send(408",
