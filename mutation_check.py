@@ -412,6 +412,20 @@ MUTANTS = [
         "tests/test_m2_async.py::test_a_member_still_answers_after_the_loop_it_joined_on_stops",
     ),
     (
+        "the first lookup does not wait for the first answer",
+        PY_INIT,
+        "        deadline = time.monotonic() + _FIRST_ANSWER_S\n        while True:",
+        "        deadline = time.monotonic() + _FIRST_ANSWER_S\n        while False:",
+        "tests/test_cold_cache.py::test_first_lookup_does_not_call_a_full_pool_empty",
+    ),
+    (
+        "a silent registry is waited on anyway",
+        PY_INIT,
+        "            if self._c.silence_ms > self._lease_ms() // 2:",
+        "            if False:",
+        "tests/test_cold_cache.py::test_a_dead_registry_does_not_stall_lookups",
+    ),
+    (
         "a body that timed out leaves the connection open",
         "python/tinyray/_serve.py",
         "                self.close_connection = True\n                return self._send(408",
