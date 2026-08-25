@@ -433,6 +433,15 @@ MUTANTS = [
         "tests/test_nothing_left_behind.py::test_the_registry_ends_a_round_where_it_started",
     ),
     (
+        "a call is counted only after its answer is on the wire",
+        "python/tinyray/_serve.py",
+        "            counters.answered(failed)\n            counted = True\n"
+        "            self._send(code, body)",
+        "            self._send(code, body)\n            counters.answered(failed)\n"
+        "            counted = True",
+        "tests/test_stats.py::test_a_call_you_have_the_answer_to_is_already_counted",
+    ),
+    (
         "closing leaves the handler threads parked",
         "python/tinyray/_serve.py",
         "        for conn in list(self._srv.live):",

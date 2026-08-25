@@ -109,3 +109,29 @@ def test_a_member_without_serves_has_no_serving_counters(registry):
         got = me.stats()
         assert "calls" not in got
         assert "beats_ok" in got
+
+
+def test_a_call_you_have_the_answer_to_is_already_counted(registry):
+    """应答到了调用方手里，那次调用就必须已经在 `stats()` 里。
+
+    原来计数发生在应答**写出去之后**：服务端把字节推上 socket，然后才更新计数器。
+    于是调用方先拿到答案、再去读 `stats()`，就可能读到一个还没算上自己的数字。
+    实测普通调用 0.2%、抛异常的调用 0.8% —— 对断言它的东西是抛硬币，对读它的
+    东西是个错数。CI 上就是这么红的：五次 quick 加一次 boom，`calls` 报 5。
+
+    改法是把 `calls`/`failed` 挪到写之前。`in_flight` 和 `busy_ns` 留在写之后，
+    因为它们问的是"有几个 handler 在跑、跑了多久"，而写一个 16 MiB 的应答确实
+    占着那条线程。
+    """
+    with tinyray.join("svc", "stateful", slot=0, serves=Slow()) as me:
+        me.ready()
+        h = tinyray.pool("svc").slot(0)
+        rounds, late = 250, []
+        for i in range(rounds):
+            # 抛异常那条路上原来最容易漏（0.8% 对 0.2%）。
+            with pytest.raises(tinyray.RemoteError):
+                h.boom()
+            seen = me.stats()["calls"]
+            if seen != i + 1:
+                late.append((i + 1, seen))
+        assert not late, f"{rounds} 次调用里有 {len(late)} 次拿到答案时还没被算上：{late[:4]}"

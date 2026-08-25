@@ -246,12 +246,29 @@ class Counters:
             self.in_flight += 1
             self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
 
-    def left(self, spent_ns: int, failed: bool) -> None:
+    def answered(self, failed: bool) -> None:
+        """Recorded before the answer is written, not after.
+
+        A caller with the answer in its hands then reads stats() and must see
+        that call. Counted afterwards it sometimes did not: measured at 0.2% of
+        ordinary calls and 0.8% of raising ones, which is a coin toss for
+        anything asserting on it and a wrong number for anything reading it.
+        """
+        with self._lock:
+            self.calls += 1
+            self.failed += failed
+
+    def left(self, spent_ns: int) -> None:
+        """The rest, once the answer really is out.
+
+        `in_flight` counts handlers still running and `busy_ns` how long they
+        ran, and writing the answer is part of both -- a 16 MiB reply keeps a
+        thread busy. So these two stay on this side of the write even though
+        the count does not.
+        """
         with self._lock:
             self.in_flight -= 1
-            self.calls += 1
             self.busy_ns += spent_ns
-            self.failed += failed
 
     def refuse(self) -> None:
         with self._lock:
@@ -437,16 +454,29 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(503, {"error": "at the concurrency limit"})
         counters.entered()
         started = time.perf_counter_ns()
-        failed = True
+        counted = False
         try:
-            failed = self._dispatch(fn, name, raw)
+            code, body, failed = self._dispatch(fn, name, raw)
+            counters.answered(failed)
+            counted = True
+            self._send(code, body)
         finally:
-            counters.left(time.perf_counter_ns() - started, failed)
+            # _dispatch answers for anything the method itself can do. Getting
+            # here without having counted means something above the method came
+            # apart, and that is still a call that failed.
+            if not counted:
+                counters.answered(True)
+            counters.left(time.perf_counter_ns() - started)
             if slots is not None:
                 slots.release()
 
-    def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> bool:
-        """Returns True if the call failed, however it failed."""
+    def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> tuple[int, dict, bool]:
+        """The answer to give, and whether the call failed however it failed.
+
+        Worked out rather than written: the caller records the call and only
+        then puts the answer on the wire, so anyone holding an answer can see
+        it counted. One place writes instead of four.
+        """
         try:
             args, kwargs = _coerce(
                 fn,
@@ -455,13 +485,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self.headers.get("x-tinyray-request") or "",
             )
         except json.JSONDecodeError as e:
-            self._send(400, {"error": str(e)})
-            return True
+            return 400, {"error": str(e)}, True
         except msgspec.ValidationError as e:
             # A type mismatch is the caller's fault, so it is reported as one
             # rather than dressed up as a business failure.
-            self._send(422, {"error": f"{name}(): {e}"})
-            return True
+            return 422, {"error": f"{name}(): {e}"}, True
 
         try:
             result = fn(*args, **kwargs)
@@ -491,7 +519,7 @@ class _Handler(BaseHTTPRequestHandler):
                     # takes the branch above.
                     result = asyncio.run_coroutine_threadsafe(result, loop).result()
         except Exception as exc:
-            self._send(
+            return (
                 200,
                 {
                     "error": {
@@ -500,10 +528,9 @@ class _Handler(BaseHTTPRequestHandler):
                         "traceback": traceback.format_exc(),
                     }
                 },
+                True,
             )
-            return True
-        self._send(200, {"result": result})
-        return False
+        return 200, {"result": result}, False
 
 
 class MethodServer:
