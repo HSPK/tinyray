@@ -409,11 +409,28 @@ class _Handler(BaseHTTPRequestHandler):
             result = fn(*args, **kwargs)
             if inspect.iscoroutine(result):
                 loop = self.server.loop
-                if loop is None:
+                if loop is None or not loop.is_running():
                     result = asyncio.run(result)
                 else:
-                    # Run on the loop that existed at join() time. Never make a
-                    # new one: the user's clients are bound to theirs.
+                    # Run on the loop that existed at join() time, while it is
+                    # still turning. Never make a new one to run alongside it:
+                    # the user's clients are bound to theirs.
+                    #
+                    # What matters is that it is running *now*, not that it
+                    # existed at join(). A member that joined inside
+                    # asyncio.run() keeps serving after that block ends, and
+                    # handing work to a loop nobody turns any more never comes
+                    # back -- result() has no timeout. Measured with
+                    # max_concurrency=2: two calls to an async method and the
+                    # member answered nothing again, ever, sync methods
+                    # included, while still registered and still beating. A
+                    # loop that has been closed outright was no better, telling
+                    # the caller its method raised "Event loop is closed" when
+                    # the method had not run at all.
+                    #
+                    # A loop that stops between this check and the handover
+                    # still strands that one call, but only that one: the next
+                    # takes the branch above.
                     result = asyncio.run_coroutine_threadsafe(result, loop).result()
         except Exception as exc:
             self._send(

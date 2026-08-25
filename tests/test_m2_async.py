@@ -162,3 +162,67 @@ def test_repeated_event_loops_do_not_accumulate_clients(async_peer):
     gc.collect()
     leaked = open_fds() - before_fds
     assert leaked <= 5, f"39 more event loops leaked {leaked} file descriptors"
+
+
+STOPPED_LOOP_SERVER = textwrap.dedent(
+    """
+    import asyncio, os, sys, tinyray
+    os.environ["TINYRAY_REGISTRY"] = "{endpoint}"
+    class S:
+        async def doubled(self, x: int) -> int: return x * 2
+        def plain(self, x: int) -> int: return x + 1
+    async def setup():
+        m = tinyray.join("stopped", "stateful", slot=0, size=1, serves=S(), max_concurrency=2)
+        m.ready()
+        return m
+    if sys.argv[1] == "closed":
+        m = asyncio.run(setup())              # 循环被关掉了
+    else:
+        loop = asyncio.new_event_loop()       # 循环还在，只是没人再跑它
+        m = loop.run_until_complete(setup())
+    print("READY", flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+@pytest.mark.parametrize("how", ["closed", "idle"])
+def test_a_member_still_answers_after_the_loop_it_joined_on_stops(registry, how):
+    """`serves=` 的成员在 `asyncio.run()` 块结束之后还活着，循环却不转了。
+
+    async 方法原来是交给"join 时那个循环"跑的，只看它当初存在过，不看它现在还
+    转不转。交给一个没人转的循环，`run_coroutine_threadsafe(...).result()`
+    **没有超时**，于是永不返回。
+
+    实测 `max_concurrency=2`：两次 async 调用就把两个槽位永久占死，之后这个成员
+    对**任何**调用都答 `at its concurrency limit`，连同步方法也一样 —— 而它还在
+    注册、还在心跳、还在广告地址。循环被关掉那种也没好到哪去：调用方收到的是
+    `RemoteError: Event loop is closed`，好像是它的方法抛了异常，其实方法压根
+    没跑。
+
+    判断的依据应该是"**现在**转不转"，不转就自己开一个跑完 —— 和 join 时根本
+    没有循环时做的事一样。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", STOPPED_LOOP_SERVER.format(endpoint=registry.endpoint), how],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        p.stdout.readline()
+        with tinyray.join("asker", "churn") as me:
+            me.ready()
+            tinyray.pool("stopped").wait(count=1, timeout=15)
+            h = tinyray.pool("stopped").slot(0)
+            assert h.doubled.timeout(5)(21) == 42
+            assert h.doubled.timeout(5)(3) == 6
+            # 槽位得还回来。带着 bug 时这一句是 `at its concurrency limit`。
+            assert h.plain(1) == 2, "两次 async 调用之后，这个成员再也不答话了"
+    finally:
+        try:
+            p.stdin.write("\n")
+            p.stdin.flush()
+            p.wait(timeout=8)
+        except Exception:
+            p.kill()

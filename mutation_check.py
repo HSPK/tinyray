@@ -405,6 +405,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_loops_in_many_threads_do_not_close_each_others_pipes",
     ),
     (
+        "async work goes to the join-time loop even if it stopped",
+        "python/tinyray/_serve.py",
+        "                if loop is None or not loop.is_running():",
+        "                if loop is None:",
+        "tests/test_m2_async.py::test_a_member_still_answers_after_the_loop_it_joined_on_stops",
+    ),
+    (
         "a request the callee never read is called maybe-ran",
         PY_RPC,
         "    if status in (400, 408, 411):",
