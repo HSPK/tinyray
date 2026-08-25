@@ -177,23 +177,26 @@ def test_lookup_before_join_is_explicit():
         mod.pool("anything")
 
 
-def test_leaving_lets_go_of_what_it_was_serving(registry):
-    """`join()` 把 `member.leave` 交给了 atexit，而 atexit 从不遗忘。
+@pytest.mark.parametrize("called", [False, True])
+def test_leaving_lets_go_of_what_it_was_serving(registry, called):
+    """走了就该放手 —— 被服务的那个对象十有八九是个模型或一份数据。
 
-    留在那里，这个成员就被钉到进程结束，连同它的方法服务器和**被服务的那个
-    对象** —— 那东西十有八九是个模型或一份数据。反复 join/leave 的进程（一份
-    工作换一份工作）就这么一份份攒着。
+    三样东西各自攥着它，都实测过：
 
-    实测：8 轮 join/leave 之后 8 个方法服务器全都还活着，各自还攥着自己的对象。
+    1. `join()` 把 `member.leave` 交给了 atexit，而 atexit 从不遗忘。留着，
+       成员就被钉到进程结束：8 轮 join/leave 之后 8 个方法服务器全活着。
+    2. 关掉监听 socket 并不会结束**已经停在 keep-alive 连接上的处理线程**，
+       而它攥着服务器和派发表。什么时候放手取决于调用方什么时候关连接，那不归
+       我们管：实测 20 个成员离场，20 个对象还在，一分钟后仍然在。
+    3. 注解和签名的缓存原来拿**绑定方法**当键，而绑定方法带着实例。
 
-    （另一条是暂时的，所以不在这里断言：给服务器发过调用之后，处理线程会卡在
-    那条 keep-alive 连接上，直到 httpx 60 秒后回收空闲连接。实测 70 秒后线程
-    从 10 条降回 3 条，会自愈。所以下面不发调用。）
+    第 2 条不能靠结束线程来解决 —— 解决的是那张查找表：此刻再来的请求都会被
+    上面的围栏判成 409，表空着不花任何代价。
     """
     import gc
     import weakref
 
-    refs = []
+    refs, members = [], []
     for i in range(6):
 
         class Served:
@@ -202,12 +205,21 @@ def test_leaving_lets_go_of_what_it_was_serving(registry):
 
         obj = Served()
         refs.append(weakref.ref(obj))
-        m = tinyray.join(f"letgo{i}", "stateful", slot=0, size=1, serves=obj)
+        name = f"letgo{'c' if called else 'n'}{i}"
+        m = tinyray.join(name, "stateful", slot=0, size=1, serves=obj)
+        members.append(weakref.ref(m))
         m.ready()
+        if called:
+            assert tinyray.pool(name).slot(0).echo(1) == 1
         del obj
         m.leave()
         del m
 
     gc.collect()
+    how = "发过调用" if called else "没发过调用"
     stuck = [r for r in refs if r() is not None]
-    assert not stuck, f"leave() 之后还有 {len(stuck)}/6 个被服务的对象没被释放"
+    assert not stuck, f"{how}：leave() 之后还有 {len(stuck)}/6 个被服务的对象没被释放"
+    # 成员自己也一样。第 1 条（atexit）单看对象已经看不出来了 —— 表被清空之后
+    # 对象无论如何都会释放，可成员还钉在那儿。
+    held = [r for r in members if r() is not None]
+    assert not held, f"{how}：leave() 之后还有 {len(held)}/6 个成员没被释放"

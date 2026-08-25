@@ -131,7 +131,14 @@ def _shape(fn: Callable[..., Any]) -> tuple[dict[str, Any], inspect.Signature | 
     with no signature to read. Neither is a reason to refuse the call, so the
     checks that need them are skipped instead.
     """
-    got = _SHAPES.get(fn)
+    # Keyed by the underlying function, which belongs to the class, not by the
+    # bound method, which would hold the instance -- and the instance is the
+    # object being served. Every instance of a class answers to the same
+    # annotations and the same signature anyway, so one entry does for all of
+    # them. Measured with the bound method as the key: 20 members left and
+    # their 20 objects still held.
+    key = getattr(fn, "__func__", fn)
+    got = _SHAPES.get(key)
     if got is None:
         try:
             hints = typing.get_type_hints(fn)
@@ -141,7 +148,7 @@ def _shape(fn: Callable[..., Any]) -> tuple[dict[str, Any], inspect.Signature | 
             sig: inspect.Signature | None = inspect.signature(fn)
         except (TypeError, ValueError):
             sig = None
-        got = _SHAPES[fn] = (hints, sig)
+        got = _SHAPES[key] = (hints, sig)
     return got
 
 
@@ -519,3 +526,15 @@ class MethodServer:
     def close(self) -> None:
         self._srv.shutdown()
         self._srv.server_close()
+        # Closing the listening socket does not end a handler already parked
+        # on a keep-alive connection, and that handler holds the server, the
+        # dispatch table and through it the served object -- a model or a
+        # dataset. It only lets go when the caller's client drops the
+        # connection, which is its own business: measured at 20 members left
+        # and 20 objects still held, still held a minute later.
+        #
+        # The lookup is what has to go, not the thread. Anything arriving now
+        # is answered 409 by the fencing check above it, so an empty table
+        # costs nothing and the object is free the moment we leave.
+        self.dispatch.clear()
+        self._srv.dispatch = {}

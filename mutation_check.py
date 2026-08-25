@@ -426,6 +426,20 @@ MUTANTS = [
         "tests/test_cold_cache.py::test_a_dead_registry_does_not_stall_lookups",
     ),
     (
+        "a closed server keeps its lookup table",
+        "python/tinyray/_serve.py",
+        "        self.dispatch.clear()\n        self._srv.dispatch = {}\n",
+        "",
+        "tests/test_m1_membership.py::test_leaving_lets_go_of_what_it_was_serving",
+    ),
+    (
+        "the shape cache is keyed by the bound method",
+        "python/tinyray/_serve.py",
+        '    key = getattr(fn, "__func__", fn)',
+        "    key = fn",
+        "tests/test_m1_membership.py::test_leaving_lets_go_of_what_it_was_serving",
+    ),
+    (
         "leaving stays registered with atexit",
         PY_INIT,
         "            atexit.unregister(self.leave)\n",
