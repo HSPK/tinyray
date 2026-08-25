@@ -282,9 +282,19 @@ def _decode(status: int, raw: bytes, target: str) -> Any:
     if status == 503:
         # Refused before dispatch, so nothing ran: retry here or elsewhere.
         raise NotDelivered(f"{target} is at its concurrency limit")
-    if status == 411:
-        # The body was never read, so neither was the call.
-        raise NotDelivered(f"{target} refused the request framing: {raw[:120]!r}")
+    if status in (400, 408, 411):
+        # Every way the far side gives up before the method runs. 400 is a
+        # length it cannot read or a body it cannot parse, 408 a body that
+        # stopped arriving part way, 411 framing it will not take at all.
+        # Measured against a real callee: a body cut short was answered 408
+        # after the body timeout and a content-length of "abc" answered 400 at
+        # once, and in both the method was called zero times.
+        #
+        # 400 and 408 used to fall through to OutcomeUnknown, which tells the
+        # caller the opposite of the truth -- that it may have run, so a
+        # non-idempotent call cannot simply be sent again. A stalled upload is
+        # an ordinary thing for a large payload on a busy link.
+        raise NotDelivered(f"{target} would not take the request: HTTP {status} {raw[:120]!r}")
     if status >= 500:
         # The handler was already running when it came apart.
         raise OutcomeUnknown(f"{target} answered HTTP {status} partway through")

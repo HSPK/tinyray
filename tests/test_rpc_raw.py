@@ -10,6 +10,7 @@ import time
 
 import pytest
 import tinyray
+from tinyray import _rpc
 
 SERVER = textwrap.dedent(
     """
@@ -275,3 +276,76 @@ def test_a_chunked_request_cannot_desynchronise_the_next_one(served):
     # 更不许把 x=7 当成结果返回。
     assert b'"result": 7' not in got, f"the dropped body was answered anyway: {got[:300]!r}"
     assert b"Bad request syntax" not in got, f"the stream desynchronised: {got[:300]!r}"
+
+
+COUNTING = textwrap.dedent(
+    """
+    import sys, tinyray
+    from tinyray import _serve
+    _serve.BODY_TIMEOUT = 1.0        # 免得为了看一次 408 等满 15 秒
+    class S:
+        n = 0
+        def work(self, x: int) -> int:
+            S.n += 1
+            return x
+        def ran(self) -> int:
+            return S.n
+    m = tinyray.join("count", "stateful", slot=0, size=1, serves=S())
+    m.ready()
+    print(m._server.port, flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+@pytest.fixture
+def counting(registry):
+    p = subprocess.Popen(
+        [sys.executable, "-c", COUNTING], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    port = int(p.stdout.readline().strip())
+    try:
+        yield port
+    finally:
+        try:
+            p.stdin.write("\n")
+            p.stdin.flush()
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
+
+@pytest.mark.parametrize(
+    "label,cl,body,status",
+    [
+        ("body 只发一半", b"200", b'{"x":', 408),
+        ("content-length 不是数字", b"abc", b'{"x":1}', 400),
+        ("content-length 是负数", b"-5", b'{"x":1}', 400),
+    ],
+)
+def test_a_request_the_callee_never_read_whole_is_safe_to_send_again(
+    counting, label, cl, body, status
+):
+    """ "没送到"和"可能跑过了"差的是调用方敢不敢直接重发。
+
+    服务端在读完请求之前就放弃的所有路子 —— 读不懂的长度、发到一半停住的
+    body —— 方法都还没被调用过。下半段用计数器把这件事量出来，而不是从代码
+    读出来。
+
+    `400` 和 `408` 原来会掉进兜底的 `OutcomeUnknown`，那等于告诉调用方**反话**：
+    可能跑过了，所以非幂等的调用不能原样重发。大 payload 撞上一条忙的链路，
+    body 传到一半停住是很平常的事。
+    """
+    with tinyray.join("asker", "churn") as me:
+        me.ready()
+        tinyray.pool("count").wait(count=1, timeout=10)
+        h = tinyray.pool("count").slot(0)
+        before = h.ran()
+
+        got = _raw(counting, _post(b"/call/work", cl), body)
+        assert got.split(b"\r\n")[0].split()[1] == str(status).encode(), got[:120]
+        assert h.ran() == before, f"{label}: 服务端回了 {status}，方法却跑了"
+
+    # 上一句量到的是"什么都没跑"。这一句是客户端据此必须告诉调用方的话。
+    with pytest.raises(tinyray.NotDelivered):
+        _rpc._decode(status, b'{"error":"x"}', "count/0#1")

@@ -405,6 +405,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_loops_in_many_threads_do_not_close_each_others_pipes",
     ),
     (
+        "a request the callee never read is called maybe-ran",
+        PY_RPC,
+        "    if status in (400, 408, 411):",
+        "    if status == 411:",
+        "tests/test_rpc_raw.py::test_a_request_the_callee_never_read_whole_is_safe_to_send_again",
+    ),
+    (
         "a forked child keeps the parent's shared connection",
         PY_RPC,
         "    _sync = None\n",
