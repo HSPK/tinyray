@@ -460,3 +460,106 @@ def test_a_body_the_parser_gives_up_on_still_counts_as_a_call(counting):
             f"散架的那次没被算成失败：failed {before['failed']} -> {after['failed']}"
         )
         assert h.work(5) == 5, "之后就不答话了"
+
+
+SILENT = textwrap.dedent(
+    """
+    import sys, threading, tinyray
+    from tinyray import _serve
+    _serve.BODY_TIMEOUT = 3.0       # 沉默阶段的上限，免得等满 15 秒
+    _serve.IDLE_TIMEOUT = 9.0       # keep-alive 的空闲上限
+    class S:
+        def ping(self) -> str: return "pong"
+        def threads(self) -> int: return threading.active_count()
+    m = tinyray.join("silent", "stateful", slot=0, size=1, serves=S())
+    m.ready()
+    print(m._server.port, flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+@pytest.fixture
+def silent(registry):
+    p = subprocess.Popen(
+        [sys.executable, "-c", SILENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    port = int(p.stdout.readline().strip())
+    try:
+        yield port
+    finally:
+        try:
+            p.stdin.write("\n")
+            p.stdin.flush()
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
+
+def test_a_connection_that_says_nothing_at_all_releases_its_thread(silent):
+    """`BODY_TIMEOUT` 只管到 body。同一个攻击**早一个阶段** —— 连上来一个字节
+    都不发，或者只发半个头部 —— 从前完全没人管：`BaseHTTPRequestHandler` 读
+    请求行用的是 `self.timeout`，而它默认是 None。
+
+    实测（真实常量下）：
+
+        100 条"连上就沉默"        +100 线程
+        再加 100 条"半个头部"     +200 线程
+        等 16 秒（>BODY_TIMEOUT） 仍然 +200，永不释放
+
+    对照文件里自己写的 body 那一档："500 条停滞连接稳定在 125 线程"，因为
+    那一档有上限。修后同样的场景 16 秒后回到 +0。
+    """
+    before = tinyray_call(silent, b"/call/threads")
+    holders = [socket.create_connection(("127.0.0.1", silent), timeout=30) for _ in range(15)]
+    for i, s in enumerate(holders):
+        if i % 2:
+            s.sendall(b"POST /call/ping HTTP/1.1\r\nHost: x\r\n")  # 半个头部
+    time.sleep(1.2)
+    during = tinyray_call(silent, b"/call/threads")
+    assert during >= before + 10, f"线程没被占住，测试本身失效了: {before} -> {during}"
+
+    time.sleep(4.0)  # 超过上面设的 3.0s
+    after = tinyray_call(silent, b"/call/threads")
+    assert after <= before + 2, f"沉默的连接没有放开线程: {before} -> {during} -> {after}"
+    for s in holders:
+        s.close()
+
+
+def test_the_silence_bound_does_not_cut_a_keep_alive_connection_short(silent):
+    """给沉默连接设上限，不能顺手把 keep-alive 掐了：调用方就是靠握着连接
+    等下一次调用的，而 httpx 自己要到 60 秒才丢弃闲置连接。服务端必须比它
+    等得久，否则两边会抢着关同一个 socket。"""
+    s = socket.create_connection(("127.0.0.1", silent), timeout=30)
+    try:
+        s.sendall(_post(b"/call/ping", b"2") + b"{}")
+        assert b"200" in s.recv(8192).split(b"\r\n")[0]
+
+        time.sleep(4.0)  # 超过头部上限 3.0s，但没到空闲上限 9.0s
+
+        s.sendall(_post(b"/call/ping", b"2") + b"{}")
+        again = s.recv(8192)
+        assert b"200" in again.split(b"\r\n")[0], again[:120]
+        assert b"pong" in again, again[:200]
+    finally:
+        s.close()
+
+
+def test_the_server_outwaits_the_client_on_an_idle_connection():
+    """服务端的空闲上限必须比调用方自己的丢弃期限长，否则两边会抢着关同一个
+    socket：调用方以为连接还在、正要发请求，服务端刚好把它关掉 —— 一次本该
+    成功的调用变成 NotDelivered。
+
+    这是两个常量之间的约定，而约定没人守着就会烂。它们分处两个文件，改任何
+    一个都不会惊动另一个。
+    """
+    from tinyray import _rpc, _serve
+
+    expiry = _rpc._LIMITS.keepalive_expiry
+    assert expiry is not None, "调用方不再声明丢弃期限了，这条约定要重新想"
+    assert _serve.IDLE_TIMEOUT > expiry, (
+        f"服务端 {_serve.IDLE_TIMEOUT}s 等不过调用方的 {expiry}s：闲置连接会由服务端先关"
+    )
+    assert _serve.BODY_TIMEOUT < _serve.IDLE_TIMEOUT, (
+        "还没说过话的连接不该比 keep-alive 拿到更长的宽限"
+    )

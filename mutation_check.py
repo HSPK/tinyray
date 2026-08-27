@@ -919,6 +919,13 @@ MUTANTS = [
         "        )",
         "tests/test_waiting.py::test_the_budget_is_a_deadline_not_an_allowance_on_top",
     ),
+    (
+        "a connection that says nothing keeps its thread for good",
+        "python/tinyray/_serve.py",
+        "        self.connection.settimeout(BODY_TIMEOUT)\n\n    def log_message",
+        "        pass\n\n    def log_message",
+        "tests/test_rpc_raw.py::test_a_connection_that_says_nothing_at_all_releases_its_thread",
+    ),
 ]
 
 

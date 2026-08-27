@@ -33,6 +33,12 @@ import msgspec
 # with no body behind it, moved the serving process's RSS not at all.
 BODY_TIMEOUT = 15.0
 
+# A caller that has been served once holds its connection open for the next
+# call, and that wait has to outlast the client's own idle expiry (httpx is
+# told 60s) or the two would race to close the same socket and an ordinary
+# call would sometimes land on a socket the server had just dropped.
+IDLE_TIMEOUT = 90.0
+
 
 class CallContext:
     """Who is calling, as they described themselves.
@@ -329,6 +335,17 @@ class _Handler(BaseHTTPRequestHandler):
     disable_nagle_algorithm = True
     _headers_buffer: list[bytes]
 
+    def setup(self) -> None:
+        super().setup()
+        # The first read is the one a silent connection never returns from, and
+        # only the *body* was bounded before, so the same attack one stage
+        # earlier was free: measured 100 connections that said nothing at all
+        # and 100 that sent half a header, holding 200 threads that were still
+        # there after 16s -- against a body-stalling attack that self-limits at
+        # 125 threads for 500 connections. Read here rather than declared as
+        # the class's `timeout`, so there is one knob and it is the same one.
+        self.connection.settimeout(BODY_TIMEOUT)
+
     def log_message(self, *args: Any) -> None:  # keep the test output readable
         pass
 
@@ -377,6 +394,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(500, {"error": f"{type(e).__name__}: {e}"})
             except Exception:
                 pass
+        # Past this point the connection has been used, so waiting on it is
+        # keep-alive rather than an opening that never came, and it gets the
+        # longer budget.
+        try:
+            self.connection.settimeout(IDLE_TIMEOUT)
+        except OSError:
+            pass
 
     def do_POST(self) -> None:
         # Read the body before anything else can return. An early reply that
@@ -419,7 +443,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return self._send(408, {"error": "body never arrived"})
             finally:
-                self.connection.settimeout(None)
+                self.connection.settimeout(IDLE_TIMEOUT)
 
         if not self.path.startswith("/call/"):
             return self._send(404, {})
