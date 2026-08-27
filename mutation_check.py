@@ -935,6 +935,24 @@ MUTANTS = [
         "tests/test_roster_fingerprint.py"
         "::test_the_clients_own_fingerprint_agrees_with_the_registrys",
     ),
+    (
+        "the header names a different tenure than the member holds",
+        PY_INIT,
+        "    _rpc.set_identity(_identity(pool, slot, ident, incarnation))",
+        "    _rpc.set_identity(_identity(pool, slot, ident, incarnation - 1))",
+        "tests/test_identity_and_fencing.py::test_one_spelling_of_the_fencing_token",
+    ),
+    (
+        "taking a seat does not release the parked beat of the member losing it",
+        RS_STATE,
+        "        for w in self.waiters.drain(..) {\n"
+        "            if let Some(bell) = w.upgrade() {\n"
+        "                bell.notify_one();\n"
+        "            }\n"
+        "        }",
+        "        self.waiters.clear();",
+        "tests/test_seats.py::test_a_superseded_process_stops_answering",
+    ),
 ]
 
 
@@ -1117,6 +1135,13 @@ def main() -> int:
             path.write_text(original)
             if rel.endswith(".rs"):
                 build()
+    # Named at the end, not only where they happened. A run is long enough that
+    # it gets watched through `| tail`, and a count on its own is a dead end:
+    # 117 of 118 once, 118 of 118 on the next run, and no way back to which one
+    # flaked. A flaky entry is as useless as a toothless one, so it has to be
+    # possible to say which.
+    for label in bad:
+        print(f"  MISSED  {label}")
     print(f"\n{len(MUTANTS) - len(bad)} of {len(MUTANTS)} caught")
     return 1 if bad else 0
 

@@ -215,8 +215,7 @@ class Handle:
 
     @property
     def identity(self) -> str:
-        seat = self.slot if self.slot is not None else self.id
-        return f"{self.pool}/{seat}#{self.incarnation}"
+        return _identity(self.pool, self.slot, self.id, self.incarnation)
 
     def __getattr__(self, name: str) -> BoundMethod:
         # Only names the pool actually serves. An earlier design proxied
@@ -1010,14 +1009,20 @@ class Member:
         slot: int | None,
         incarnation: int,
         server: _MethodServer | None = None,
-        ident: int | None = None,
+        ident: int = 0,
     ):
         self._c = client
         self._server = server
         self.pool = pool_name
         self.slot = slot
         self.incarnation = incarnation
-        self._ident = slot if ident is None else ident
+        # Seat or id, never neither: this is what the fencing token is built
+        # from, and a member with no seat is keyed by its id. The parameter
+        # used to default to None and fall back to `slot`, which typed as
+        # `int | None` and would have spelled the token `pool/None#tenure` --
+        # a token nothing can ever match. join() is the only caller and always
+        # passes an id, so say so.
+        self._ident = ident
         self._state: dict[str, Any] = {}
         # Merging into the published state is a read-modify-write, and two
         # publishers racing through it lose each other's keys. Not reachable
@@ -1033,8 +1038,7 @@ class Member:
     def identity(self) -> str:
         """The same string a peer holding a Handle to this process would use,
         and the same one that rides on every call this process makes."""
-        seat = self.slot if self.slot is not None else self._ident
-        return f"{self.pool}/{seat}#{self.incarnation}"
+        return _identity(self.pool, self.slot, self._ident, self.incarnation)
 
     def _mine(self) -> None:
         if os.getpid() != self._pid:
@@ -1447,9 +1451,8 @@ def join(
     server = None
     methods: list[str] = []
     if serves is not None:
-        seat = slot if slot is not None else ident
         server = _MethodServer(
-            serves, f"{pool}/{seat}#{incarnation}", max_concurrency=max_concurrency
+            serves, _identity(pool, slot, ident, incarnation), max_concurrency=max_concurrency
         )
         methods = server.methods
         url = url or server.url(_advertise())
@@ -1543,7 +1546,7 @@ def join(
             OldRegistryWarning,
             stacklevel=2,
         )
-    _rpc.set_identity(f"{pool}/{slot if slot is not None else ident}#{incarnation}")
+    _rpc.set_identity(_identity(pool, slot, ident, incarnation))
     member = Member(c, pool, slot, incarnation, server, ident)
     # A process that exits normally should say goodbye, so the seat frees up
     # immediately instead of waiting out the lease. SIGKILL still falls back
@@ -1687,6 +1690,22 @@ def _taken_over(seat: int, was: str | None) -> Callable[[Snapshot], bool]:
         return now is not None and now.identity != was
 
     return taken
+
+
+def _identity(pool: str, slot: int | None, ident: int, incarnation: int) -> str:
+    """The fencing token: which pool, which seat, which tenure.
+
+    Written once. It used to be spelled out in three places -- the handle a
+    peer holds, the member's view of itself, and the header that rides on every
+    call -- and those three have to agree letter for letter or a superseded
+    member passes a check it should fail. The same argument `frozen()` makes
+    about the roster hash: a second implementation drifts silently, and this
+    one drifts into the security check.
+
+    A member with no seat is keyed by its own id instead, and `slot` is tested
+    against None rather than for truth because seat 0 is a seat.
+    """
+    return f"{pool}/{slot if slot is not None else ident}#{incarnation}"
 
 
 def _seat_of(identity: str) -> int:

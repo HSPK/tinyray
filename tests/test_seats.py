@@ -146,6 +146,37 @@ def test_a_superseded_process_stops_answering(registry):
     )
     try:
         assert second.stdout.readline().startswith("HELD")
+
+        # Hammer *now*, before anything else. The old process is alive and
+        # still listening, and only the registry's answer to its own heartbeat
+        # tells it otherwise -- but that heartbeat is parked, and taking the
+        # seat drains the pool's waiters before the taker's reply is even
+        # built, so it learns at once. Measured over nine runs: the window
+        # between the takeover completing and the ghost refusing was 0ms in
+        # eight and 1ms in the ninth, and across ~100 calls per run through the
+        # stale handle not one reached the ghost.
+        #
+        # The count is what discriminates, not the clock. With the wake taken
+        # out of bump() the window is 79-92ms -- long enough to look instant,
+        # short enough that any bound loose enough not to flake would pass --
+        # and 28 to 32 calls land on the ghost. This used to poll for 20
+        # seconds *after* waiting for gen-2 to become visible, which spent the
+        # whole window before it started looking.
+        answered = 0
+        refused = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.0:
+            try:
+                stale.whoami()
+                answered += 1
+            except tinyray.Fenced as exc:
+                refused = exc
+                break
+        assert refused is not None, (
+            f"the ghost kept serving its old identity for {answered} call(s)"
+        )
+        assert answered <= 2, f"{answered} call(s) reached the ghost before it noticed"
+
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             live = tinyray.pool("ghost").all()
@@ -153,20 +184,6 @@ def test_a_superseded_process_stops_answering(registry):
                 break
             time.sleep(0.05)
         assert tinyray.pool("ghost").slot(0).whoami() == "gen-2"
-
-        # The old process is alive and still listening on that address. It only
-        # learns it is a ghost from the registry's answer to its own heartbeat,
-        # so "stops answering" is within a beat, not instantly.
-        refused = None
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            try:
-                stale.whoami()
-            except tinyray.Fenced as exc:
-                refused = exc
-                break
-            time.sleep(0.05)
-        assert refused is not None, "the ghost kept serving its old identity"
     finally:
         _release(second)
         _release(first)

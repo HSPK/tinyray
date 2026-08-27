@@ -328,3 +328,54 @@ def test_a_non_ascii_request_id_is_refused_too(peer):
     with pytest.raises(ValueError, match="printable ASCII"):
         with tinyray.request_id("批次-42"):
             pass
+
+
+@pytest.mark.parametrize(
+    "kw,seated",
+    [
+        ({"policy": "stateful", "slot": 0, "size": 1}, True),
+        ({"policy": "stateful", "slot": 3, "size": 4}, True),
+        ({"policy": "churn"}, False),
+    ],
+    ids=["seat-0", "seat-3", "no-seat"],
+)
+def test_one_spelling_of_the_fencing_token(registry, kw, seated):
+    """围栏令牌从前在四个地方各拼了一遍：对端手里的 handle、成员对自己的说法、
+    每次调用带出去的头、以及交给方法服务端做比对的那一份。四者必须逐字相同，
+    否则一个已被顶替的成员会通过本该拦下它的检查。
+
+    `frozen()` 的文档为名单指纹讲过同一个道理："第二份实现会悄悄跑偏"。这里
+    跑偏的地方是安全检查。
+
+    合成一份之后，这条测试守的不再是"四份写法一致"（那已经由构造保证），而是
+    每个调用点确实用的是那一份、而且交出去的是这一任而不是别的一任。
+
+    顺带纠一个我一开始写错的说法：seat 0 并不是这里的坑。有座位时 `ident` 本身
+    就等于 `slot`（`ident = slot if slot is not None else random`），所以连
+    `slot or ident` 都恰好是对的 —— 实测那个变异体三例全过。
+    """
+    from tinyray import _rpc
+
+    class S:
+        def whoami(self) -> str:
+            return "served"
+
+    me = tinyray.join("tok", serves=S(), **kw)
+    try:
+        me.ready()
+        me.flush()
+        pool = tinyray.pool("tok")
+        pool.until(lambda s: bool(s.ready()), timeout=10)
+        handle = pool.all()[0]
+
+        assert me.identity == handle.identity, "成员自己的说法和对端手里的不一样"
+        assert me.identity == _rpc._identity, "调用头里带的和成员自己的不一样"
+        assert me.identity == me._server._srv.identity, "服务端用来比对的和成员自己的不一样"
+
+        seat = me.identity.partition("/")[2].partition("#")[0]
+        if seated:
+            assert seat == str(kw["slot"]), f"座位号丢了: {me.identity}"
+        else:
+            assert seat.isdigit() and int(seat) > 0, f"无座位的该用自己的 id: {me.identity}"
+    finally:
+        me.leave()
