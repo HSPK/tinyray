@@ -785,6 +785,43 @@ MUTANTS = [
         "tests/test_agent_pool_domain.py"
         "::test_a_cancelled_attempt_cannot_be_finished_by_a_survivor",
     ),
+    (
+        "a watcher resuming from since= baselines its digest on today",
+        PY_INIT,
+        "            self._digest = _NO_DIGEST",
+        "            self._digest = self._c.field_digest(pool._name, self._fields, False)",
+        "tests/test_watch_lifecycle.py"
+        "::test_a_watch_on_fields_does_not_lose_what_happened_before_since",
+    ),
+    (
+        "until subscribes from now instead of from the snapshot it looked at",
+        PY_INIT,
+        "self.changes(since=snap.revision if since is None else since",
+        "self.changes(since=None if since is None else since",
+        "tests/test_waiting.py::test_until_hands_the_revision_over_without_leaving_a_gap",
+    ),
+    (
+        "auntil subscribes from now instead of from the snapshot it looked at",
+        PY_INIT,
+        "self.achanges(since=snap.revision if since is None else since",
+        "self.achanges(since=None if since is None else since",
+        "tests/test_waiting.py::test_auntil_hands_the_revision_over_as_well",
+    ),
+    (
+        "flush blames the registry for a seat that was taken",
+        PY_INIT,
+        '            if not self._c.accepted:\n'
+        '                raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")',
+        '            if False:\n                raise SeatTaken("")',
+        "tests/test_seats.py::test_flush_says_the_seat_was_taken_rather_than_blaming_the_registry",
+    ),
+    (
+        "a wait parks even when the cache has already moved past it",
+        RS_LIB,
+        "            if *rev != since {\n                return *rev;\n            }",
+        "            if false {\n                return *rev;\n            }",
+        "tests/test_event_driven.py::test_a_wait_handed_a_revision_already_passed_returns_at_once",
+    ),
 ]
 
 

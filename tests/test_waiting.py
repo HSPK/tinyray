@@ -17,6 +17,7 @@ import asyncio
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -329,3 +330,87 @@ def test_await_ready_holds_no_executor_thread(long_lease):
 
     cost = asyncio.run(body())
     assert cost < 500, f"取消 40 个 await_ready 之后，一次 to_thread 等了 {cost:.0f}ms"
+
+
+def test_until_hands_the_revision_over_without_leaving_a_gap(registry):
+    """这个文件开头说"第二件做错最有意思"，但一直没人测它。
+
+    缺口不是理论上的一瞬：`predicate` 是调用方写的，跑多久由调用方说了算，
+    所以"先看一眼"和"订阅"之间的距离就是 predicate 的耗时。这里让第一次
+    predicate 跑 1.5s，池子在这期间动。
+
+    实测：交回 revision 的版本 1500ms 就返回（predicate 自己睡完立刻拿到）；
+    把 `since=snap.revision` 换成 `since=None`，同一个场景 7501ms 抛 TimeoutError
+    —— 条件其实已经成立了 6 秒。
+    """
+    with tinyray.join("p", "churn") as me:
+        me.ready(step=0)
+        me.flush()
+        pool = tinyray.pool("p")
+        pool.until(lambda s: bool(s.ready()) and s.ready()[0].state.get("step") == 0, timeout=5)
+
+        predicate_running = threading.Event()
+
+        def mover():
+            predicate_running.wait(5)
+            me.update(step=1)
+            me.flush()
+
+        t = threading.Thread(target=mover, daemon=True)
+        t.start()
+
+        first = [True]
+
+        def stepped(snap):
+            if first[0]:
+                first[0] = False
+                predicate_running.set()
+                time.sleep(1.5)  # 调用方的 predicate 本身就是那个缺口
+            return any(h.state.get("step") == 1 for h in snap)
+
+        t0 = time.monotonic()
+        snap = pool.until(stepped, timeout=6.0, describe="step==1")
+        elapsed = time.monotonic() - t0
+        t.join(timeout=5)
+
+        assert any(h.state.get("step") == 1 for h in snap)
+        # 白等满超时是这个 bug 的样子，1.5s 的 predicate 之后应该立刻拿到。
+        assert elapsed < 4.0, f"条件在 predicate 跑的时候就成立了，却等了 {elapsed:.1f}s"
+
+
+def test_auntil_hands_the_revision_over_as_well(registry):
+    """异步那条是同一行代码抄的第二遍，所以也是同一个缺口。
+
+    发现方式是变异门的锚点检查报了"匹配 2 次"：一条 mutant 打算钉住的地方，
+    实际上有两处。第二处一样没人看着。
+    """
+
+    async def body() -> float:
+        me = tinyray.join("ap", "churn")
+        try:
+            me.ready(step=0)
+            me.flush()
+            apool = tinyray.apool("ap")
+            await apool.auntil(
+                lambda s: bool(s.ready()) and s.ready()[0].state.get("step") == 0, timeout=5
+            )
+
+            first = [True]
+
+            def stepped(snap):
+                if first[0]:
+                    first[0] = False
+                    # 缺口在这里：predicate 是同步的，跑多久由调用方说了算
+                    me.update(step=1)
+                    me.flush()
+                return any(h.state.get("step") == 1 for h in snap)
+
+            t0 = time.monotonic()
+            snap = await apool.auntil(stepped, timeout=6.0, describe="step==1")
+            assert any(h.state.get("step") == 1 for h in snap)
+            return time.monotonic() - t0
+        finally:
+            me.leave()
+
+    elapsed = asyncio.run(body())
+    assert elapsed < 4.0, f"条件在 predicate 跑的时候就成立了，却等了 {elapsed:.1f}s"

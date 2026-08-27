@@ -587,6 +587,61 @@ def test_a_watch_on_fields_notices_a_seat_changing_hands(registry):
                     p_.kill()
 
 
+def test_a_watch_on_fields_does_not_lose_what_happened_before_since(registry):
+    """`since=` 的承诺是"接着往下看"，`fields=` 不该把这个承诺吃掉。
+
+    `_seen` 来自过去（调用方交回来的 revision），digest 却是构造时现取的，于是
+    间隙里对订阅字段的改动被自己的基线抵消，watcher 永远不会为它醒来。实测：
+    不带 fields= 0ms 就拿到，带 fields=["step"] 等满 2000ms 一无所获。
+
+    没有基线时只能选一边错：多产一个重复快照，还是漏掉一次变化。重复的调用方
+    能自己去重，漏掉的没人救得回来。
+    """
+    with tinyray.join("p", "churn") as me:
+        me.ready(step=0)
+        me.flush()
+        pool = tinyray.pool("p")
+        pool.until(lambda s: bool(s.ready()) and s.ready()[0].state.get("step") == 0, timeout=5)
+        rev = pool.snapshot().revision
+
+        # 调用方拿着 revision 走开去干活，期间订阅的字段变了
+        me.update(step=1)
+        me.flush()
+        time.sleep(0.3)
+
+        with pool.changes(since=rev, fields=["step"], timeout=3.0) as w:
+            got = next(w, None)
+
+        assert got is not None, "since= 之前发生的字段变化被自己的基线吞掉了"
+        assert any(h.state.get("step") == 1 for h in got.members)
+
+
+def test_the_missing_baseline_costs_one_snapshot_not_a_stream(registry):
+    """补偿只该发生一次。永远产出等于把 fields= 退化成没有。"""
+    with tinyray.join("p", "churn") as me:
+        me.ready(step=0, other=0)
+        me.flush()
+        pool = tinyray.pool("p")
+        pool.until(lambda s: bool(s.ready()) and s.ready()[0].state.get("step") == 0, timeout=5)
+        rev = pool.snapshot().revision
+
+        me.update(other=1)  # 间隙里动的是**没订阅**的字段
+        me.flush()
+        time.sleep(0.3)
+
+        with pool.changes(since=rev, fields=["step"], timeout=1.5) as w:
+            assert next(w, None) is not None, "没有基线时第一次要产出"
+
+            got: list = []
+            _drain_into(w, got)
+            for i in range(2, 5):
+                me.update(other=i)
+                time.sleep(0.1)
+            me.flush()
+            time.sleep(0.5)
+            assert got == [], f"补偿之后又为无关字段产出了 {len(got)} 个快照"
+
+
 def test_a_watch_on_fields_still_sees_people_come_and_go(registry):
     """成员进出永远算数，不管订阅了哪些字段 —— 否则"谁在池子里"就成了盲区。"""
     with tinyray.join("p", "churn") as me:

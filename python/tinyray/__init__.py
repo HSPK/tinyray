@@ -499,6 +499,11 @@ class RegistryInfo:
         return f"<RegistryInfo {who} protocol={self.protocol}>"
 
 
+_NO_DIGEST = object()
+"""Stands for "we have no baseline", which `None` cannot: field_digest returns
+None for a pool the cache has never heard of, so None is an answer."""
+
+
 class _Watching:
     """The bookkeeping behind changes() and achanges().
 
@@ -519,6 +524,10 @@ class _Watching:
         "__weakref__",
     )
 
+    # `int | None` from field_digest, or `_NO_DIGEST` when there is no baseline
+    # to compare against; widened here so the sentinel is not a type error.
+    _digest: object
+
     def __init__(
         self,
         pool: Pool,
@@ -528,14 +537,27 @@ class _Watching:
     ):
         self._pool = pool
         self._c = pool._c
-        self._seen = pool.snapshot().revision if since is None else since
         self._deadline = None if timeout is None else time.monotonic() + timeout
         self._closed = False
         self._tick = 0
         self._fields = None if fields is None else list(fields)
-        self._digest = (
-            None if self._fields is None else self._c.field_digest(pool._name, self._fields, False)
-        )
+        if self._fields is None:
+            self._digest = None
+        elif since is None:
+            # Read the digest before the revision, never after. Whichever way a
+            # change lands between the two reads, this order costs a duplicate
+            # snapshot instead of a lost one.
+            self._digest = self._c.field_digest(pool._name, self._fields, False)
+        else:
+            # `since` names a moment we have no digest for. Taking today's
+            # instead used to swallow every change in the gap -- measured: a
+            # field that moved between the caller's snapshot and this call
+            # yielded nothing for the full timeout, while the same watcher
+            # without fields= yielded it in 0ms. Not knowing has to mean
+            # yielding once, because a duplicate is recoverable and a miss is
+            # not.
+            self._digest = _NO_DIGEST
+        self._seen = pool.snapshot().revision if since is None else since
         _live_watches.add(self)
 
     def close(self) -> None:

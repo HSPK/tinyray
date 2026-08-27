@@ -341,3 +341,44 @@ def test_the_revision_is_the_pools_own_and_not_a_local_tick(registry):
         "revision 必须是池子的版本号，不是客户端自己的拍数"
     )
     me.leave()
+
+
+def test_a_wait_handed_a_revision_already_passed_returns_at_once(long_lease):
+    """这是上面所有等待站着的那块地基，却一直没人钉。
+
+    Python 层每个等待循环都长这样：先 `cache_revision()`，做点事，再
+    `wait_revision(rev, ms)`。中间那段就是窗口 —— `_step` 里是 pool_info 加
+    field_digest 加一次 snapshot（5,000 成员时 8.78ms），`epoch()` 里是
+    pool_info 加 frozen。一拍心跳落在这段里，边沿就错过了。
+
+    电平触发把"错过边沿就睡满一拍"变成"看见电平就立刻返回"。实测（间隔
+    5000ms，池子已安静 3 秒）：
+
+        有 `if *rev != since` 的版本   0ms
+        换成 `if false`               2181ms（要等到下一拍）
+
+    全量 389 条测试对这个改动全部通过 —— 默认 2s 租约下铃每 500ms 响一次，
+    把它盖住了。所以这条测试要长租约。
+    """
+    with tinyray.join("q", "churn") as me:
+        me.ready()
+        me.flush()
+        c = tinyray._client
+        assert c is not None
+        assert c.stats()["interval_ms"] >= 2000, "这条测试需要一个稀疏的心跳才有意义"
+
+        # 等池子彻底安静，否则"立刻返回"可能只是下一次变化恰好赶上
+        last, quiet_since = c.cache_revision(), time.monotonic()
+        while time.monotonic() - quiet_since < 2.0:
+            time.sleep(0.05)
+            if c.cache_revision() != last:
+                last, quiet_since = c.cache_revision(), time.monotonic()
+
+        t0 = time.monotonic()
+        got = c.wait_revision(last - 1, 15000)
+        elapsed = time.monotonic() - t0
+
+        assert got == last, f"应该报告当前位置 {last}，却给了 {got}"
+        assert elapsed < 1.0, (
+            f"缓存早就越过了这个位置，却睡了 {elapsed * 1000:.0f}ms —— 边沿错过就得等下一拍"
+        )

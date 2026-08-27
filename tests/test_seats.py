@@ -171,3 +171,38 @@ def test_a_superseded_process_stops_answering(registry):
         _release(second)
         _release(first)
         me.leave()
+
+
+def test_flush_says_the_seat_was_taken_rather_than_blaming_the_registry(registry):
+    """被抢座的成员会停止心跳，所以 flush() 等的那两拍永远不会来。
+
+    没有这个守卫，它就一直等到超时，然后报 TimeoutError 说"注册表不收这份
+    state"—— 而注册表好得很，`last_error` 是空的，等于什么都没说。实测同一场景：
+
+        有守卫  SeatTaken   92ms   "seat 0 was taken while publishing"
+        无守卫  TimeoutError 10000ms "waited 10.0s for the registry to take this
+                                     state; last error was ''"
+
+    快 100 倍只是顺带的，真正的差别是把锅扣在对的地方。
+    """
+    me = tinyray.join("seat", "stateful", slot=0)
+    later = None
+    try:
+        me.ready(who="mine")
+        me.flush()
+
+        later = _hold("default", "later")  # 后来者拿走这个座位
+
+        me.update(who="mine-again")
+        t0 = time.monotonic()
+        with pytest.raises(tinyray.SeatTaken, match="taken while publishing"):
+            me.flush(timeout=10.0)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 5.0, f"应该在下一拍就知道，却等了 {elapsed:.1f}s"
+    finally:
+        if later is not None:
+            _release(later)
+        try:
+            me.leave()
+        except Exception:
+            pass
