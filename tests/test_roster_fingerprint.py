@@ -7,10 +7,15 @@
 from __future__ import annotations
 
 import json
+import random
+import subprocess
+import sys
+import textwrap
 import time
 
 import httpx
 import pytest
+import tinyray
 
 
 class _Wire:
@@ -148,3 +153,96 @@ def test_the_maintained_fingerprint_matches_a_fresh_one(registry, wire):
         assert d["roster"] == expected(ids[:2]), "有人离开后指纹与重算的不一致"
     finally:
         obs.cli.close()
+
+
+CHURNER = textwrap.dedent(
+    """
+    import sys, tinyray
+    m = tinyray.join("r", "churn")
+    m.ready(who=sys.argv[1], n=0)
+    print("UP", flush=True)
+    n = 0
+    while True:
+        line = sys.stdin.readline()
+        if not line or line.strip() == "bye":
+            break
+        n += 1
+        m.update(who=sys.argv[1], n=n)
+    m.leave()
+    """
+)
+
+
+def test_the_clients_own_fingerprint_agrees_with_the_registrys(registry):
+    """上面那条钉的是注册表这一侧：维护出来的指纹要等于重算的。客户端那一侧
+    是同一个论证再来一遍，而且没人钉过。
+
+    `frozen()` 拿本地缓存里的成员、用客户端自己的 `roster_hash` 算一个指纹，
+    再把注册表随 delta 发来的 `roster` 一并交回。`epoch()` 就是比这两个数决定
+    "这份名单作不作数"。两边是两个进程、两套代码：注册表增量维护 XOR，客户端
+    逐条 apply 之后重算。没有任何东西强制它们一致。
+
+    require_ready=False 时这两个数必须**恒等**。实测在进出、更新、被杀（只能
+    靠租约过期）和一次注册表重启的混合下对账 720 次，0 次不一致。
+    """
+    me = tinyray.join("watch", "churn")
+    me.ready()
+    c = tinyray._client
+    assert c is not None
+    c.watch(["r"])
+
+    peers: list[subprocess.Popen] = []
+
+    def spawn(name: str) -> None:
+        p = subprocess.Popen(
+            [sys.executable, "-c", CHURNER, name],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert p.stdout.readline().strip() == "UP"
+        peers.append(p)
+
+    def farewell(p: subprocess.Popen) -> None:
+        try:
+            p.stdin.write("bye\n")
+            p.stdin.flush()
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
+    checks = 0
+    rng = random.Random(7)
+    try:
+        for i in range(14):
+            act = rng.random()
+            if act < 0.4 or not peers:
+                spawn(f"p{i}")
+            elif act < 0.6:
+                farewell(peers.pop(rng.randrange(len(peers))))
+            elif act < 0.85:
+                p = peers[rng.randrange(len(peers))]
+                try:
+                    p.stdin.write("x\n")
+                    p.stdin.flush()
+                except Exception:
+                    pass
+            else:
+                p = peers.pop(rng.randrange(len(peers)))
+                p.kill()  # 没有告别，只能靠租约过期
+                p.wait(timeout=5)
+            for _ in range(8):
+                got = c.frozen("r", False)
+                if got is not None:
+                    raw, ours, whole, version = got
+                    checks += 1
+                    assert ours == whole, (
+                        f"第 {i} 轮 version={version}：客户端算出 {ours}，"
+                        f"注册表说 {whole}，缓存里 {len(json.loads(raw))} 个成员"
+                    )
+                time.sleep(0.02)
+        assert checks >= 50, f"只对上了 {checks} 次账，这条测试没测到东西"
+    finally:
+        for p in peers:
+            farewell(p)
+        me.leave()

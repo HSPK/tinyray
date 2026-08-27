@@ -8,6 +8,7 @@ names the test that must go red for it.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -926,6 +927,14 @@ MUTANTS = [
         "        pass\n\n    def log_message",
         "tests/test_rpc_raw.py::test_a_connection_that_says_nothing_at_all_releases_its_thread",
     ),
+    (
+        "the client's own fingerprint is not the registry's hash",
+        RS_LIB,
+        "let mine = members.iter().fold(0u64, |acc, m| acc ^ m.roster_hash());",
+        "let mine = members.iter().fold(0u64, |acc, m| acc.wrapping_add(m.roster_hash()));",
+        "tests/test_roster_fingerprint.py"
+        "::test_the_clients_own_fingerprint_agrees_with_the_registrys",
+    ),
 ]
 
 
@@ -950,11 +959,85 @@ def check_anchors() -> list[str]:
     return wrong
 
 
+def check_selectors() -> list[str]:
+    """A named test that no longer exists reads as CAUGHT, for good.
+
+    `caught = returncode != 0`, and pytest answers 4 for a selector that picks
+    nothing -- the same 4 it gives a module the mutant broke on import, so the
+    exit code cannot tell those apart afterwards. Measured: a misspelt name,
+    a missing file, a syntax error and an import-time raise all come back 4,
+    while a test that genuinely fails comes back 1.
+
+    So the check has to happen here, before anything is mutated, where the
+    question is simply whether the name exists. One collect of the whole suite
+    answers it for every entry at once: 442 tests in 0.15s.
+    """
+    named = {t for *_, t in MUTANTS if not t.startswith("cargo:")}
+    if not named:
+        return []
+    out = subprocess.run(
+        [
+            str(PY),
+            "-m",
+            "pytest",
+            "tests/",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:randomly",
+            "-o",
+            "addopts=",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    ids = {line.strip() for line in out.stdout.splitlines() if "::" in line}
+    if not ids:
+        return ["could not collect the suite, so no selector could be checked"]
+    missing = []
+    for label, *_, test in MUTANTS:
+        if test.startswith("cargo:"):
+            continue
+        # Three shapes are all valid: a whole file, one test, or one test whose
+        # cases collect as `file::name[case]`.
+        if not (
+            test in ids
+            or any(i.startswith(test + "[") for i in ids)
+            or any(i.startswith(test + "::") for i in ids)
+        ):
+            missing.append(f"{label}: no test named {test}")
+    return missing + check_cargo_packages()
+
+
+def check_cargo_packages() -> list[str]:
+    """The same trap on the Rust side: `cargo test -p nosuch-package` exits
+    101, which the run reads as CAUGHT. Measured against the real one, which
+    exits 0 with five tests passing. Renaming a crate would leave every entry
+    aimed at it green for ever.
+
+    `cargo metadata --no-deps` answers in 0.021s, so this is free.
+    """
+    wanted = {t.split(":", 1)[1] for *_, t in MUTANTS if t.startswith("cargo:")}
+    if not wanted:
+        return []
+    out = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode:
+        return ["cargo metadata failed, so no crate name could be checked"]
+    have = {p["name"] for p in json.loads(out.stdout)["packages"]}
+    return [f"no crate named {w}" for w in sorted(wanted - have)]
+
+
 def main() -> int:
     if "--count" in sys.argv:
         print(len(MUTANTS))
         return 0
-    ambiguous = check_anchors()
+    ambiguous = check_anchors() + check_selectors()
     for line in ambiguous:
         print(f"BROKEN  {line}")
     if ambiguous:
@@ -963,10 +1046,12 @@ def main() -> int:
     for label, rel, find, repl, test in MUTANTS:
         path = ROOT / rel
         original = path.read_text()
-        if find not in original:
-            print(f"SKIP  {label}\n      anchor not found in {rel}")
-            bad.append(label)
-            continue
+        # No "anchor not found" branch here: check_anchors() flags anything
+        # other than exactly one match, zero included, and main() has already
+        # returned by then. Restores are exact -- the finally below writes back
+        # the text read at the top of this iteration -- so no earlier entry can
+        # take an anchor away from a later one. The branch that used to stand
+        # here could not fire.
         path.write_text(original.replace(find, repl, 1))
         # Two mutants that shorten the same file by the same number of bytes,
         # written inside one second, are indistinguishable to the bytecode
@@ -978,7 +1063,16 @@ def main() -> int:
         # mutant's bytecode broke the test would leave a toothless test looking
         # covered. Not worth reasoning about the invalidation rules; just make
         # sure there is nothing to load.
-        for stale in (ROOT / "python/tinyray/__pycache__").glob("*.pyc"):
+        #
+        # It cleared only python/tinyray, while the list also mutates
+        # examples/agent_pool/pool.py and several files under tests/, each with
+        # a __pycache__ of its own. Measured on pool.py: write one mutant, run
+        # it, then inside the same second write a second mutant of exactly the
+        # same length -- Python ran the *first* one's bytecode, and the run
+        # would have reported on a mutant that was not on disk. Clearing next
+        # to whatever is being mutated costs nothing and needs no case analysis
+        # about which files import which.
+        for stale in (path.parent / "__pycache__").glob("*.pyc"):
             stale.unlink()
         try:
             if rel.endswith(".rs") and not build():
