@@ -73,3 +73,26 @@ def test_the_shortest_allowed_ttl_keeps_a_member_continuously_visible():
             os.environ.pop("TINYRAY_REGISTRY", None)
         else:
             os.environ["TINYRAY_REGISTRY"] = env_before
+
+
+@pytest.mark.parametrize("ttl", ["-5", "abc", "12.5", ""])
+def test_a_lease_that_is_not_a_length_of_time_is_refused_cleanly(ttl):
+    """上面那条测试早就写着"操作员打错参数不该看到 traceback"，但它只试了
+    合法的整数。**唯一**真的会 traceback 的那个写法没被试到。
+
+    `--ttl-ms -5` 通过 argparse（`type=int` 收负数），一路送到 pyo3，那里拒绝
+    把负数变成 u64，抛 OverflowError —— 它不是 OSError/ValueError/RuntimeError
+    中的任何一个，于是从 except 之间漏了出去：
+
+        OverflowError: can't convert negative int to unsigned
+    """
+    p = subprocess.run(
+        [str(BIN), "--listen", f"127.0.0.1:{free_port()}", "--ttl-ms", ttl],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    out = p.stderr + p.stdout
+    assert p.returncode != 0, f"--ttl-ms {ttl!r} 被接受了"
+    assert "Traceback" not in out, out[-400:]
+    assert "is not a length of time" in out, out[-400:]

@@ -860,6 +860,13 @@ MUTANTS = [
         "",
         "cargo:tinyray-proto",
     ),
+    (
+        "a negative lease reaches pyo3 and comes out as a traceback",
+        "python/tinyray/registry.py",
+        '    ap.add_argument("--ttl-ms", type=_lease_ms, default=20_000,',
+        '    ap.add_argument("--ttl-ms", type=int, default=20_000,',
+        "tests/test_ttl_floor.py::test_a_lease_that_is_not_a_length_of_time_is_refused_cleanly",
+    ),
 ]
 
 
