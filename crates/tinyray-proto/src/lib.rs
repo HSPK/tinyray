@@ -63,12 +63,37 @@ pub const MAX_WATCH: usize = 64;
 ///
 /// Booleans stay strict: `True == 1` is Python's anomaly, and letting
 /// `free=1` match `free=true` would surprise more than it helps.
+///
+/// Integers compare as integers, i64 or u64, before f64 is considered at all.
+/// Going straight to f64 for anything that is not an i64 made every u64 above
+/// i64::MAX round to the same double: measured with a member publishing
+/// `tag=2**63`, every filter value within 1024 of it matched, so `pick()`
+/// handed back a member whose tag was not the one asked for. f64 is reached
+/// now only when one side really is a float, which is the case the rule above
+/// exists for.
+///
+/// The rule follows the value down. It used to stop at the top, so the very
+/// example it was written for came back one level in: a member publishing
+/// `cfg={"shard": 3}` was found by `cfg={"shard": 3}` and not by
+/// `cfg={"shard": 6/2}`. Shape stays exact -- same length, same keys -- so
+/// nothing but numbers is relaxed at any depth.
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
             (Some(i), Some(j)) => i == j,
-            _ => x.as_f64() == y.as_f64(),
+            _ => match (x.as_u64(), y.as_u64()) {
+                (Some(i), Some(j)) => i == j,
+                _ => x.as_f64() == y.as_f64(),
+            },
         },
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_value(p, q))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| same_value(v, w)))
+        }
         _ => a == b,
     }
 }
@@ -172,3 +197,82 @@ pub struct BeatAck {
 ///   1  honours `Beat.hold_ms`: parks a reply that has nothing to say and
 ///      answers the moment a watched pool moves
 pub const PROTOCOL: u32 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn member_with(state: Value) -> Member {
+        Member {
+            id: 1,
+            slot: None,
+            incarnation: 1,
+            url: None,
+            state,
+            ready: true,
+        }
+    }
+
+    #[test]
+    fn big_integers_compare_as_integers_not_as_doubles() {
+        // 2**63 is a u64 and not an i64, which used to send both sides through
+        // f64. At that magnitude a double steps by 2048, so everything within
+        // 1024 collapsed onto the same value.
+        let m = member_with(json!({ "tag": 9_223_372_036_854_775_808u64 }));
+        assert!(m.matches(&json!({ "tag": 9_223_372_036_854_775_808u64 })));
+        for off in [1u64, 2, 1024, 2048] {
+            let other = 9_223_372_036_854_775_808u64 + off;
+            assert!(
+                !m.matches(&json!({ "tag": other })),
+                "tag+{off} matched a member whose tag it is not"
+            );
+        }
+        assert!(!m.matches(&json!({ "tag": u64::MAX })));
+    }
+
+    #[test]
+    fn a_whole_float_still_matches_the_integer_it_names() {
+        let m = member_with(json!({ "shard": 3, "rank": 2.0 }));
+        assert!(m.matches(&json!({ "shard": 3.0 })));
+        assert!(m.matches(&json!({ "rank": 2 })));
+        assert!(!m.matches(&json!({ "shard": 3.5 })));
+    }
+
+    #[test]
+    fn a_negative_is_not_a_large_unsigned() {
+        let m = member_with(json!({ "n": -1 }));
+        assert!(m.matches(&json!({ "n": -1 })));
+        assert!(!m.matches(&json!({ "n": u64::MAX })));
+        let big = member_with(json!({ "n": u64::MAX }));
+        assert!(!big.matches(&json!({ "n": -1 })));
+    }
+    #[test]
+    fn the_number_rule_follows_the_value_down() {
+        // 3 vs 6/2 是这条规则当初的招牌例子，从前它在第一层就失效。
+        let m = member_with(json!({ "cfg": { "shard": 3 }, "tags": [3] }));
+        assert!(m.matches(&json!({ "cfg": { "shard": 3.0 } })));
+        assert!(m.matches(&json!({ "tags": [3.0] })));
+        assert!(!m.matches(&json!({ "cfg": { "shard": 3.5 } })));
+
+        let deep = member_with(json!({ "a": { "b": { "c": [ { "d": 7 } ] } } }));
+        assert!(deep.matches(&json!({ "a": { "b": { "c": [ { "d": 7.0 } ] } } })));
+        assert!(!deep.matches(&json!({ "a": { "b": { "c": [ { "d": 8 } ] } } })));
+    }
+
+    #[test]
+    fn only_numbers_are_relaxed_shape_is_still_exact() {
+        let m = member_with(json!({ "cfg": { "zone": "a", "rank": 1 }, "tags": [1, 2] }));
+        // 少一个键、多一个键、键名不同，都不算同一个标签
+        assert!(!m.matches(&json!({ "cfg": { "zone": "a" } })));
+        assert!(!m.matches(&json!({ "cfg": { "zone": "a", "rank": 1, "x": 0 } })));
+        assert!(!m.matches(&json!({ "cfg": { "zone": "a", "rankk": 1 } })));
+        // 数组按顺序、按长度
+        assert!(!m.matches(&json!({ "tags": [2, 1] })));
+        assert!(!m.matches(&json!({ "tags": [1] })));
+        assert!(m.matches(&json!({ "tags": [1.0, 2.0] })));
+        // 布尔仍然不是数字，任何深度都一样
+        let b = member_with(json!({ "cfg": { "free": true } }));
+        assert!(!b.matches(&json!({ "cfg": { "free": 1 } })));
+    }
+}

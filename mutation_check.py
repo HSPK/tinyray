@@ -836,6 +836,30 @@ MUTANTS = [
         "tests/test_seats.py"
         "::test_a_superseded_member_stops_beating_instead_of_hammering_the_registry",
     ),
+    (
+        "a filter compares big integers as doubles",
+        RS_PROTO,
+        "            _ => match (x.as_u64(), y.as_u64()) {\n"
+        "                (Some(i), Some(j)) => i == j,\n"
+        "                _ => x.as_f64() == y.as_f64(),\n"
+        "            },",
+        "            _ => x.as_f64() == y.as_f64(),",
+        "cargo:tinyray-proto",
+    ),
+    (
+        "the number rule stops at the top level",
+        RS_PROTO,
+        "        (Value::Array(x), Value::Array(y)) => {\n"
+        "            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_value(p, q))\n"
+        "        }\n"
+        "        (Value::Object(x), Value::Object(y)) => {\n"
+        "            x.len() == y.len()\n"
+        "                && x.iter()\n"
+        "                    .all(|(k, v)| y.get(k).is_some_and(|w| same_value(v, w)))\n"
+        "        }\n",
+        "",
+        "cargo:tinyray-proto",
+    ),
 ]
 
 
