@@ -283,6 +283,7 @@ COUNTING = textwrap.dedent(
     import sys, tinyray
     from tinyray import _serve
     _serve.BODY_TIMEOUT = 1.0        # 免得为了看一次 408 等满 15 秒
+    M = []
     class S:
         n = 0
         def work(self, x: int) -> int:
@@ -290,7 +291,10 @@ COUNTING = textwrap.dedent(
             return x
         def ran(self) -> int:
             return S.n
+        def counts(self) -> dict:
+            return M[0].stats()
     m = tinyray.join("count", "stateful", slot=0, size=1, serves=S())
+    M.append(m)
     m.ready()
     print(m._server.port, flush=True)
     sys.stdin.readline()
@@ -393,3 +397,66 @@ def test_a_body_the_server_gave_up_on_takes_the_connection_with_it(
             assert left == b"", f"{label}: 之后服务端又在同一条连接上推了一个回复 {left[:60]!r}"
         finally:
             c.close()
+
+
+@pytest.mark.parametrize(
+    "path,label",
+    [
+        (b"/abcd/work", "长度对得上、前缀不对"),
+        (b"/health", "别的服务上常见的路径"),
+        (b"/", "光秃秃一个斜杠"),
+    ],
+)
+def test_only_the_call_path_reaches_a_method(counting, path, label):
+    """方法名是从路径上**逐字截**下来的，所以前缀必须是精确匹配。
+
+    截取的写法是 `self.path[len("/call/"):]` —— 它不检查前面那六个字符是什么。
+    把前缀判断拿掉，`POST /abcd/work` 就会执行 `work()`：实测调用次数从 1 变 2。
+
+    路由不精确本身不是越权（能 POST 到这个端口的人本来就能 POST `/call/work`），
+    但"只有一条路能到达方法"是这一层唯一说得清的事，模糊了就没法再说清了。
+    """
+    with tinyray.join("asker", "churn") as me:
+        me.ready()
+        tinyray.pool("count").wait(count=1, timeout=10)
+        h = tinyray.pool("count").slot(0)
+        before = h.ran()
+
+        got = _raw(counting, _post(path, b"2"), b"{}")
+        assert got.split(b"\r\n")[0].split()[1] == b"404", f"{label}: {got[:80]!r}"
+        assert h.ran() == before, f"{label}: 走 {path!r} 居然把方法执行了"
+
+
+def test_a_body_the_parser_gives_up_on_still_counts_as_a_call(counting):
+    """派发那一层自己散架的时候，这次调用也得算数。
+
+    它算得出来的每一种失败都会自己回话并记账。散架是剩下的那种：解析器在
+    `_dispatch` 里抛出一个它没打算接的异常，回话的活落到上一层，而记账**没有
+    人接手**。
+
+    够得到吗？够得到：`json.loads` 碰上嵌套四万层的 body 会抛 `RecursionError`
+    —— 不是 `JSONDecodeError`，所以那个 except 接不住。实测 78 KiB 的这么一坨
+    得到 500，`failed` 加一，服务端之后照常工作。
+
+    不记账的后果不是崩，是**账本悄悄地不准**：`calls` 和 `busy_ms` 正是用来判断
+    要不要给这些调用单开一条传输通道的，而最会散架的那批恰好被漏掉。
+    """
+    with tinyray.join("asker", "churn") as me:
+        me.ready()
+        tinyray.pool("count").wait(count=1, timeout=10)
+        h = tinyray.pool("count").slot(0)
+        before = h.counts()
+
+        deep = b'{"args":[' + b"[" * 40_000 + b"]" * 40_000 + b'],"kwargs":{}}'
+        got = _raw(counting, _post(b"/call/work", str(len(deep)).encode()), deep)
+        assert got.split(b"\r\n")[0].split()[1] == b"500", got[:80]
+
+        after = h.counts()
+        # counts() 自己也是一次调用，所以 calls 至少 +2：坏的那次和这一次。
+        assert after["calls"] - before["calls"] >= 2, (
+            f"散架的那次调用没被算进去：calls {before['calls']} -> {after['calls']}"
+        )
+        assert after["failed"] - before["failed"] == 1, (
+            f"散架的那次没被算成失败：failed {before['failed']} -> {after['failed']}"
+        )
+        assert h.work(5) == 5, "之后就不答话了"

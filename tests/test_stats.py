@@ -122,11 +122,16 @@ def test_a_call_you_have_the_answer_to_is_already_counted(registry):
     改法是把 `calls`/`failed` 挪到写之前。`in_flight` 和 `busy_ns` 留在写之后，
     因为它们问的是"有几个 handler 在跑、跑了多久"，而写一个 16 MiB 的应答确实
     占着那条线程。
+
+    次数是算出来的，不是拍的。单次撞上那个窗口的概率约 0.8%，250 次全踩空的概率
+    是 13% —— 实测就这么漏过一次：隔离跑 13 次全抓到，整轮门禁里漏了一次。900 次
+    把它压到千分之几，代价是 1.29 秒。**会飘的门禁条目和没牙的测试一样糟**：两者
+    都会在你需要它说话的时候保持沉默。
     """
     with tinyray.join("svc", "stateful", slot=0, serves=Slow()) as me:
         me.ready()
         h = tinyray.pool("svc").slot(0)
-        rounds, late = 250, []
+        rounds, late = 900, []
         for i in range(rounds):
             # 抛异常那条路上原来最容易漏（0.8% 对 0.2%）。
             with pytest.raises(tinyray.RemoteError):
