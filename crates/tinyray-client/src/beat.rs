@@ -481,7 +481,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
 
 /// Send one beat synchronously, used by join() and leave() so that arrival and
 /// departure are visible immediately instead of at the next tick.
-pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
+pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>, budget: Duration) -> bool {
     let s = shared.clone();
     rt.block_on(async move {
         let http: HttpClient = Client::builder(TokioExecutor::new())
@@ -489,10 +489,11 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
             .http2_only(true)
             .build_http();
         let mut beat = s.compose();
-        // One-shot, with a caller waiting: never parked, and given a fixed
-        // budget rather than the loop's.
+        // One-shot, with a caller waiting: never parked, and given the
+        // caller's budget rather than the loop's. A fixed five seconds here
+        // meant join(timeout=) could not make the call shorter -- only longer.
         beat.hold_ms = 0;
-        let out = match post(&http, &s.endpoint, &beat, Duration::from_secs(5)).await {
+        let out = match post(&http, &s.endpoint, &beat, budget).await {
             Ok(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.hold_ms

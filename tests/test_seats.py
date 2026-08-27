@@ -249,3 +249,51 @@ def test_a_superseded_member_stops_beating_instead_of_hammering_the_registry(reg
             me.leave()
         except Exception:
             pass
+
+
+def _fenced_by_a_replacement():
+    """把自己的座位让给后来者，返回 (me, holder)。"""
+    me = tinyray.join("seat", "stateful", slot=0)
+    me.ready(who="mine")
+    me.flush()
+    holder = _hold("default", "later")
+    deadline = time.monotonic() + 15
+    while tinyray._client.accepted and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not tinyray._client.accepted, "座位没有被接管，这条测试没测到东西"
+    return me, holder
+
+
+def test_every_wait_says_it_was_fenced_rather_than_blaming_the_pool(registry):
+    """`until()` 的文档把"让 Fenced 透出去、而不是当成条件还没满足"列为每个
+    等待必须做对的四件事之一。`wait()` 从前自己手写循环，是全库唯一做不到的
+    那个。实测（被围栏的进程要五个成员，预算 4 秒）：
+
+        wait()        TimeoutError 4000ms，"saw 0"
+        await_ready() Fenced 1ms
+        until()       Fenced 0ms
+
+    而且那句 "saw 0" 是双重误导：池子里有接任者，只是这个进程的缓存被冻住了。
+    池子空和"你看不见了"是两件事。
+    """
+    me, holder = _fenced_by_a_replacement()
+    try:
+        pool = tinyray.pool("seat")
+        t0 = time.monotonic()
+        with pytest.raises(tinyray.Fenced, match="lost its seat"):
+            pool.wait(count=5, timeout=4.0)
+        assert time.monotonic() - t0 < 2.0, "被围栏了还等满超时"
+
+        with pytest.raises(tinyray.Fenced):
+            pool.until(lambda s: len(s) >= 5, timeout=4.0)
+
+        import asyncio
+
+        with pytest.raises(tinyray.Fenced):
+            asyncio.run(tinyray.apool("seat").await_ready(count=5, timeout=4.0))
+    finally:
+        _release(holder)
+        try:
+            me.leave()
+        except Exception:
+            pass

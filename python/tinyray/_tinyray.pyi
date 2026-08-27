@@ -19,7 +19,7 @@ class Client:
     def accepted(self) -> bool: ...
     @property
     def silence_ms(self) -> int: ...
-    def start(self) -> bool:
+    def start(self, budget_ms: int = 5_000) -> bool:
         """Sends one beat and blocks on it. False means it did not land."""
 
     def watch(self, pools: list[str]) -> None:

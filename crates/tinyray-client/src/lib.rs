@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tinyray_proto::{Member, MAX_WATCH};
 
 #[pyclass]
@@ -100,11 +101,13 @@ impl Client {
 
     /// Blocks for one beat so the caller is registered on return, then hands
     /// the loop to the tokio threads.
-    fn start(&self, py: Python<'_>) -> PyResult<bool> {
+    #[pyo3(signature = (budget_ms = 5_000))]
+    fn start(&self, py: Python<'_>, budget_ms: u64) -> PyResult<bool> {
         let rt = spawn(self.shared.clone());
         let s = self.shared.clone();
         // Release the GIL: this is a network round trip.
-        let ok = py.allow_threads(|| beat_once(&rt, &s));
+        let budget = Duration::from_millis(budget_ms.max(1));
+        let ok = py.allow_threads(|| beat_once(&rt, &s, budget));
         *self.rt.lock().unwrap() = Some(rt);
         Ok(ok)
     }
@@ -340,7 +343,15 @@ impl Client {
         let rt = self.rt.lock().unwrap().take();
         if let Some(rt) = rt {
             let s = self.shared.clone();
-            py.allow_threads(|| beat_once(&rt, &s));
+            // Nothing to say goodbye about if nothing ever got through, and a
+            // registry that has not answered will not answer this either. It
+            // used to try anyway, for another full budget: join(timeout=0.5)
+            // against a registry that accepts and never replies took 10502ms,
+            // five of them spent on a farewell for a member that was never
+            // there.
+            if s.beats_ok.load(Ordering::Relaxed) > 0 {
+                py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5)));
+            }
             rt.shutdown_background();
         }
     }

@@ -414,3 +414,44 @@ def test_auntil_hands_the_revision_over_as_well(registry):
 
     elapsed = asyncio.run(body())
     assert elapsed < 4.0, f"条件在 predicate 跑的时候就成立了，却等了 {elapsed:.1f}s"
+
+
+@pytest.mark.parametrize("flavour", ["sync", "async"])
+def test_the_budget_is_a_deadline_not_an_allowance_on_top(registry, flavour):
+    """`until()` 算了 `deadline` 却把原始的 `timeout` 转手交给 `changes()`，
+    于是那个变量只是错误消息里的一个装饰 —— 真正生效的是 watch 自己重算的
+    一份全新预算。settle 池子和跑 predicate 都发生在 `timeout` 里面，却不计入。
+
+    实测 predicate 睡 1 秒：
+
+        until(timeout=0.3)  修前 1300ms   修后 1000ms
+
+    修后那 1000ms 全是调用方自己的代码，库一分钟也没有另加。
+    首次遇到的池子同样：342ms -> 301ms（那 42ms 是 settle 的一个往返）。
+    """
+    with tinyray.join("b", "churn") as me:
+        me.ready()
+        me.flush()
+
+        def slow(_snap) -> bool:
+            time.sleep(1.0)
+            return False
+
+        pool = tinyray.pool("b")
+        t0 = time.monotonic()
+        if flavour == "sync":
+            with pytest.raises(TimeoutError):
+                pool.until(slow, timeout=0.3)
+        else:
+
+            async def body():
+                with pytest.raises(TimeoutError):
+                    await tinyray.apool("b").auntil(slow, timeout=0.3)
+
+            asyncio.run(body())
+        elapsed = time.monotonic() - t0
+
+        assert elapsed >= 1.0, "predicate 本来就要跑 1 秒"
+        assert elapsed < 1.25, (
+            f"预算 0.3s 全花在 predicate 上了，库不该再加一份：实际 {elapsed:.2f}s"
+        )

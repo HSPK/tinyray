@@ -847,8 +847,16 @@ class Pool:
         if predicate(snap):
             return snap
         # Hand over the revision this snapshot stood at, so a change that
-        # landed while the predicate was running is still delivered.
-        with self.changes(since=snap.revision if since is None else since, timeout=timeout) as w:
+        # landed while the predicate was running is still delivered. The watch
+        # gets what is *left* of the budget, not a fresh copy of it: settling
+        # the pool and running the predicate happen inside `timeout`, and
+        # handing the raw number on made `deadline` a decoration on the error
+        # message rather than a deadline. Measured with a predicate that runs
+        # 1s, until(timeout=0.3) took 1300ms.
+        with self.changes(
+            since=snap.revision if since is None else since,
+            timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+        ) as w:
             for snap in w:
                 if predicate(snap):
                     return snap
@@ -882,20 +890,33 @@ class Pool:
         return True
 
     def wait(self, count: int = 1, timeout: float = 30.0, **filt: Any) -> list[Handle]:
-        """Block until `count` members match. Bounded, and the failure names them."""
-        deadline = time.monotonic() + timeout
-        while True:
-            rev = self._c.cache_revision()
+        """Block until `count` members match. Bounded, and the failure names them.
+
+        Written on `until()`, like every other wait. Its own loop used to be
+        the only one in the library that could not say it had been fenced: a
+        process whose seat had been taken sat out the whole timeout and then
+        blamed the pool, because a frozen cache reports nobody. Measured on a
+        fenced process asking for five members with a 4s budget:
+
+            wait()          TimeoutError after 4000ms, "saw 0"
+            await_ready()   Fenced after 1ms
+            until()         Fenced after 0ms
+
+        The pool was not empty -- a replacement was in it. Only this process
+        could no longer see it, which is a different thing to be told.
+        """
+        found: list[Handle] = []
+
+        def enough(_: Snapshot) -> bool:
+            # Matching stays in Rust, where `all()` does it too: the rules are
+            # not obvious (numbers compare by value at any depth, booleans
+            # strictly) and a second implementation here would drift.
+            nonlocal found
             found = self._members(filt, require_ready=True)
-            if len(found) >= count:
-                return found
-            ms = _left_ms(deadline)
-            if ms is None:
-                raise TimeoutError(
-                    f"waited {timeout}s for {count} ready member(s) of "
-                    f"{self._name!r} matching {filt}, saw {len(found)}"
-                )
-            self._c.wait_revision(rev, ms)
+            return len(found) >= count
+
+        self.until(enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}")
+        return found
 
     def epoch(self, min: int | None = None, timeout: float = 60.0) -> Epoch:
         """Wait for the round to be complete, then freeze it.
@@ -1452,14 +1473,20 @@ def join(
         # a cheerful reply from the wrong process.
         server.still_ours = lambda: c.accepted
     c.watch([pool])
-    if not c.start():
+    deadline = time.monotonic() + timeout
+    # The budget covers reaching the registry, not just the waiting afterwards.
+    # It used to start counting only once the first beat had already spent its
+    # own fixed five seconds, so join(timeout=) could lengthen the call and
+    # never shorten it: measured against a registry that accepts connections
+    # and never replies, join(timeout=0.5) took 10502ms and join(timeout=8)
+    # took 18004ms -- always the budget plus ten.
+    if not c.start(int(timeout * 1000)):
         # Losing the registry later is survivable -- the cache carries the
         # process. Never reaching it is not: there is nothing to carry, and
         # the process would publish state nobody sees and wait for peers who
         # cannot appear. Measured against a wrong port, an unroutable address
         # and a name that does not resolve: join() returned in 0.0s to 5.0s
         # with accepted=True, zero beats through and its own pool empty.
-        deadline = time.monotonic() + timeout
         while not c.stats()["beats_ok"]:
             rev = c.cache_revision()
             if c.stats()["beats_ok"]:
@@ -1568,7 +1595,10 @@ class AsyncPool(Pool):
         snap = self.snapshot()
         if predicate(snap):
             return snap
-        watch = self.achanges(since=snap.revision if since is None else since, timeout=timeout)
+        watch = self.achanges(
+            since=snap.revision if since is None else since,
+            timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+        )
         async with watch as w:
             async for snap in w:
                 if predicate(snap):

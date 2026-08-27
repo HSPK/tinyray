@@ -22,14 +22,12 @@ RS_STATE = "crates/tinyray-registry/src/state.rs"
 RS_LIB = "crates/tinyray-client/src/lib.rs"
 PY_RPC = "python/tinyray/_rpc.py"
 
+# 同步和异步两条 until 的开头逐字相同，所以锚点必须带上后面那行才唯一。
 UNTIL_BOOTSTRAP = (
     "        snap = self.snapshot()\n"
     "        if predicate(snap):\n"
     "            return snap\n"
     "        # Hand over the revision this snapshot stood at, so a change that\n"
-    "        # landed while the predicate was running is still delivered.\n"
-    "        with self.changes("
-    "since=snap.revision if since is None else since, timeout=timeout) as w:"
 )
 AWAIT_READY = (
     "        await self.auntil(\n"
@@ -283,7 +281,7 @@ MUTANTS = [
         PY_INIT,
         UNTIL_BOOTSTRAP,
         "        snap = self.snapshot()\n"
-        "        with self.changes(since=since, timeout=timeout) as w:",
+        "        # Hand over the revision this snapshot stood at, so a change that\n",
         "tests/test_waiting.py::test_until_returns_at_once_when_it_is_already_true",
     ),
     (
@@ -796,15 +794,16 @@ MUTANTS = [
     (
         "until subscribes from now instead of from the snapshot it looked at",
         PY_INIT,
-        "self.changes(since=snap.revision if since is None else since",
-        "self.changes(since=None if since is None else since",
+        "        with self.changes(\n            since=snap.revision if since is None else since,",
+        "        with self.changes(\n            since=None if since is None else since,",
         "tests/test_waiting.py::test_until_hands_the_revision_over_without_leaving_a_gap",
     ),
     (
         "auntil subscribes from now instead of from the snapshot it looked at",
         PY_INIT,
-        "self.achanges(since=snap.revision if since is None else since",
-        "self.achanges(since=None if since is None else since",
+        "        watch = self.achanges(\n"
+        "            since=snap.revision if since is None else since,",
+        "        watch = self.achanges(\n            since=None if since is None else since,",
         "tests/test_waiting.py::test_auntil_hands_the_revision_over_as_well",
     ),
     (
@@ -866,6 +865,59 @@ MUTANTS = [
         '    ap.add_argument("--ttl-ms", type=_lease_ms, default=20_000,',
         '    ap.add_argument("--ttl-ms", type=int, default=20_000,',
         "tests/test_ttl_floor.py::test_a_lease_that_is_not_a_length_of_time_is_refused_cleanly",
+    ),
+    (
+        "wait() runs its own loop and cannot report a lost seat",
+        PY_INIT,
+        '        self.until(enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}")',
+        "        deadline = time.monotonic() + timeout\n"
+        "        while True:\n"
+        "            rev = self._c.cache_revision()\n"
+        "            if enough(None):\n"
+        "                return found\n"
+        "            ms = _left_ms(deadline)\n"
+        "            if ms is None:\n"
+        '                raise TimeoutError(f"waited {timeout}s, saw {len(found)}")\n'
+        "            self._c.wait_revision(rev, ms)",
+        "tests/test_seats.py::test_every_wait_says_it_was_fenced_rather_than_blaming_the_pool",
+    ),
+    (
+        "join's budget starts only after the first beat has spent its own",
+        PY_INIT,
+        "    if not c.start(int(timeout * 1000)):",
+        "    if not c.start():",
+        "tests/test_join_needs_the_registry.py"
+        "::test_the_budget_covers_reaching_the_registry_not_just_the_wait",
+    ),
+    (
+        "leave() says goodbye for a member that was never there",
+        RS_LIB,
+        "            if s.beats_ok.load(Ordering::Relaxed) > 0 {\n"
+        "                py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5)));\n"
+        "            }",
+        "            py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5)));",
+        "tests/test_join_needs_the_registry.py"
+        "::test_the_budget_covers_reaching_the_registry_not_just_the_wait",
+    ),
+    (
+        "until hands the watch a fresh budget instead of what is left",
+        PY_INIT,
+        "            timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),\n"
+        "        ) as w:",
+        "            timeout=timeout,\n        ) as w:",
+        "tests/test_waiting.py::test_the_budget_is_a_deadline_not_an_allowance_on_top",
+    ),
+    (
+        "auntil hands the watch a fresh budget instead of what is left",
+        PY_INIT,
+        "        watch = self.achanges(\n"
+        "            since=snap.revision if since is None else since,\n"
+        "            timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),\n"
+        "        )",
+        "        watch = self.achanges(\n"
+        "            since=snap.revision if since is None else since, timeout=timeout\n"
+        "        )",
+        "tests/test_waiting.py::test_the_budget_is_a_deadline_not_an_allowance_on_top",
     ),
 ]
 

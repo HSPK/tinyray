@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import textwrap
@@ -132,3 +133,45 @@ def test_a_longer_timeout_outlasts_a_late_registry():
         t.join()
         for p in started:
             p.terminate()
+
+
+@pytest.mark.parametrize("want", [0.5, 2.0])
+def test_the_budget_covers_reaching_the_registry_not_just_the_wait(want):
+    """上面那条测试用的是"没人监听"的端口 —— 连接立刻被拒，所以两个写死的
+    五秒预算根本没走到。真正会走到的是**接受连接却从不回话**的注册中心：
+    挂死的进程、accept 之后黑洞的防火墙、后端全不健康的负载均衡器。
+
+    修前实测（预算恒等于要求值加十秒）：
+
+        join(timeout=0.5) 10502ms    join(timeout=3) 13003ms
+        join(timeout=1.0) 11004ms    join(timeout=8) 18004ms
+
+    十秒是两个五秒：第一拍一个，失败路径上 leave() 的告别一个 —— 而那是在
+    替一个从来没注册上的成员道别。
+    """
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(16)
+    held: list[socket.socket] = []
+    stop = threading.Event()
+
+    def accept_and_say_nothing():
+        while not stop.is_set():
+            try:
+                held.append(srv.accept()[0])
+            except OSError:
+                return
+
+    t = threading.Thread(target=accept_and_say_nothing, daemon=True)
+    t.start()
+    try:
+        kind, secs, msg = _run(f"127.0.0.1:{port}", join_timeout=want, timeout=60)
+        assert kind == "UNREACHABLE", msg
+        assert secs < want + 1.5, f"要求等 {want}s，实际 {secs}s —— 预算之外还有固定开销"
+    finally:
+        stop.set()
+        srv.close()
+        for c in held:
+            c.close()
