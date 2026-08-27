@@ -225,12 +225,34 @@ def _coerce(
         # raised, and which `except TypeError` does not catch.
         raise msgspec.ValidationError(str(e)) from None
 
+    # Which parameter each value belongs to, `*args` and `**kwargs` included.
+    # The rule used to be "the i-th value takes the i-th name's annotation",
+    # and `*nums: int` is one name, so it converted exactly one value and left
+    # the rest raw: `var("1", "2", "3")` reached the method as (1, '2', '3').
+    # Half-converted is the worst of the three possible answers -- it looks
+    # like the annotation was honoured. `**opts: int` was not converted at all.
+    kinds = inspect.Parameter
+    positional = [
+        p
+        for p in sig.parameters.values()
+        if p.kind in (kinds.POSITIONAL_ONLY, kinds.POSITIONAL_OR_KEYWORD)
+    ]
+    var_pos = next((p for p in sig.parameters.values() if p.kind is kinds.VAR_POSITIONAL), None)
+    var_kw = next((p for p in sig.parameters.values() if p.kind is kinds.VAR_KEYWORD), None)
+
+    def wanted(name: str | None) -> Any:
+        want = hints.get(name) if name else None
+        return None if want is CallContext else want
+
     for i, value in enumerate(args):
-        if i < len(names) and names[i] in hints:
-            args[i] = msgspec.convert(value, hints[names[i]], strict=False)
+        slot = positional[i] if i < len(positional) else var_pos
+        want = wanted(slot.name if slot else None)
+        if want is not None:
+            args[i] = msgspec.convert(value, want, strict=False)
     for key, value in kwargs.items():
-        if key in hints and hints[key] is not CallContext:
-            kwargs[key] = msgspec.convert(value, hints[key], strict=False)
+        want = wanted(key if key in sig.parameters else (var_kw.name if var_kw else None))
+        if want is not None:
+            kwargs[key] = msgspec.convert(value, want, strict=False)
     return args, kwargs
 
 

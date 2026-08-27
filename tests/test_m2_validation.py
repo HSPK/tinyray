@@ -33,6 +33,12 @@ SERVER = textwrap.dedent(
             return a + b
         def untyped(self, whatever):
             return repr(whatever)
+        def gather(self, *shards: int) -> list:
+            return [type(x).__name__ for x in shards]
+        def opts(self, **kw: int) -> list:
+            return sorted(f"{k}={type(v).__name__}" for k, v in kw.items())
+        def head_then_rest(self, first: int, *rest: int) -> list:
+            return [type(first).__name__] + [type(x).__name__ for x in rest]
 
     me = tinyray.join("typed", "stateful", slot=0, serves=Dispatcher())
     me.ready()
@@ -341,3 +347,22 @@ def test_a_proxy_that_answers_with_a_class_is_not_serving_a_method():
             raise AttributeError(name)
 
     assert set(_serve.scan(Proxy())) == {"real"}
+
+
+def test_the_annotation_covers_every_value_it_names(typed):
+    """ "类型标注即校验表"对 `*args` 和 `**kwargs` 从前不成立。
+
+    转换是按"第 i 个值取第 i 个**参数名**的注解"做的，而 `*nums: int` 只占
+    一个名字 —— 于是它转掉第一个值，剩下的原样送进方法。实测 `gather("1",
+    "2", "3")` 收到的是 `(1, '2', '3')`：**看着像标注生效了，其实只生效了
+    一个**，三种可能的结果里最糟的一种。`**kw: int` 则一个都不转。
+
+    这条走真实的调用链，不是直接戳 `_coerce`：注解要一路活到对面。
+    """
+    assert typed.gather("1", "2", "3") == ["int", "int", "int"]
+    assert typed.head_then_rest("1", "2", "3") == ["int", "int", "int"]
+    assert typed.opts(a="1", b=2) == ["a=int", "b=int"]
+
+    # 放宽的只是形式，不是类型：转不过去的照样是调用方的错，且方法没跑过。
+    with pytest.raises(TypeError):
+        typed.gather("1", "not a number")

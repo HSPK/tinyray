@@ -985,6 +985,14 @@ MUTANTS = [
         "        if not callable(attr):",
         "tests/test_m2_validation.py::test_a_class_on_the_served_object_is_not_a_method",
     ),
+    (
+        "only the first of a *args run gets its annotation",
+        "python/tinyray/_serve.py",
+        "        slot = positional[i] if i < len(positional) else var_pos\n"
+        "        want = wanted(slot.name if slot else None)",
+        "        want = wanted(names[i]) if i < len(names) else None",
+        "tests/test_m2_validation.py::test_the_annotation_covers_every_value_it_names",
+    ),
 ]
 
 
