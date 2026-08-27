@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import subprocess
 import sys
@@ -334,3 +335,101 @@ def test_publishing_never_makes_the_loop_fall_back_to_a_timer(long_lease):
         time.sleep(1.0)
         got = me.stats()["short_polls"]
         assert got == 0, f"发布了二十次之后，循环有 {got} 次是等在定时器上而不是等在注册中心上"
+
+
+def _held_beat_as(registry, who: int, hold_ms: int, seen: dict, timeout: float):
+    """同 `_held_beat`，但由调用方指定身份 —— 抖动是按 id 取模的。"""
+    return _held_beat(registry, hold_ms, seen, timeout, who=who, watch="quiet")
+
+
+def _held_beat(
+    registry, hold_ms: int, seen: dict, timeout: float, who: int = 5150, watch: str = "cap"
+) -> tuple[float, dict]:
+    body = json.dumps(
+        {
+            "pool": "cap",
+            "id": who,
+            "incarnation": 9,
+            "policy": "churn",
+            "ttl_ms": registry.ttl_ms,
+            "ready": True,
+            "state": {},
+            "methods": [],
+            "watch": [watch],
+            "seen": seen,
+            "hold_ms": hold_ms,
+            "leaving": False,
+            "exclusive": False,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"http://{registry.endpoint}/v1/beat",
+        data=body,
+        headers={"content-type": "application/json"},
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return time.monotonic() - started, json.load(r)
+
+
+def test_a_beat_is_never_parked_longer_than_half_a_lease(registry):
+    """一个成员的租约是被它自己的心跳**送达**续上的。
+
+    所以挂起它的时间不能超过半个租约 —— 挂久了就是拿它的座位去换一次长轮询。
+    我们自己的客户端只会要 ttl/4，永远够不到这个上限，所以这条只有手写心跳能试，
+    而它防的正是别的客户端：协议是公开的，`hold_ms` 是调用方填的。
+
+    实测租约 2000ms 时：要求挂 500ms 得到 557ms，要求挂 60000ms 得到 1057ms ——
+    封在 1000ms 加上不超过八分之一预算的抖动。没有这个上限，那次请求会挂满一分
+    钟，而它的租约两秒就过期了。
+    """
+    _, first = _held_beat(registry, 0, {}, timeout=10)
+    at = first["pools"]["cap"]["version"]
+    half = registry.ttl_ms / 2
+
+    took, _ = _held_beat(registry, 60_000, {"cap": at}, timeout=half / 1000 + 4)
+    assert took < half / 1000 * 1.3, (
+        f"要求挂 60s、租约只有 {registry.ttl_ms}ms，却被挂了 {took:.2f}s —— "
+        f"上限应该是半个租约（{half:.0f}ms）加一点抖动"
+    )
+
+    # 上限不该把一个短请求撑长。
+    short, _ = _held_beat(registry, 300, {"cap": at}, timeout=10)
+    assert short < half / 1000, f"只要求挂 300ms，却被挂了 {short:.2f}s"
+
+
+def test_parked_watchers_do_not_all_come_back_at_once(registry):
+    """一池子观察者不该在同一毫秒醒来。
+
+    有变更的时候，铃一响大家一起走，那没问题 —— 那一下是真有事要说。要打散的是
+    **没等到东西**的那一批：预算到点了，所有人同时超时、同时重新订阅，就是一个
+    自己造出来的尖峰。注释里量过：4 万个挂在同一个池子上时，一次变更花掉 1.75
+    核·秒，而挤在一起正是它从"肩"变成"峰"的原因。
+
+    抖动按调用方的 id 取模，所以对它自己是稳定的（重试不会越推越晚），对整体是
+    散开的，上限是预算的八分之一。
+
+    实测租约 4s（预算 2000ms、抖动上限 250ms）：40 个观察者在 2003ms 到 2255ms
+    之间回来，跨度 251ms。抖动去掉就全挤在 2000ms 上。
+    """
+    budget = registry.ttl_ms / 2
+    spread_cap = budget / 8
+
+    def parked(i: int) -> float:
+        # id 之间隔开，好让取模的结果铺开而不是撞在一起。
+        who = 7000 + i * 6
+        first = _held_beat_as(registry, who, 0, {}, timeout=10)[1]
+        at = first["pools"].get("quiet", {}).get("version", 0)
+        return _held_beat_as(registry, who, registry.ttl_ms, {"quiet": at}, timeout=30)[0]
+
+    with concurrent.futures.ThreadPoolExecutor(20) as pool:
+        took = sorted(pool.map(parked, range(20)))
+
+    spread = (took[-1] - took[0]) * 1000
+    assert spread > spread_cap / 3, (
+        f"20 个观察者在 {spread:.0f}ms 内全回来了 —— 抖动上限是 {spread_cap:.0f}ms，"
+        f"挤成这样说明根本没打散"
+    )
+    assert took[-1] * 1000 < budget + spread_cap * 1.2, (
+        f"最晚的一个等了 {took[-1] * 1000:.0f}ms，超过了预算 {budget:.0f}ms 加抖动上限"
+    )

@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.request
 
 import pytest
@@ -158,7 +159,12 @@ def test_version_and_roster_answer_different_questions(registry):
 
 def test_full_says_to_drop_what_you_had(registry):
     """Two ways to get a whole roster: never having seen the pool, or falling
-    so far behind that the change log no longer reaches back to you."""
+    so far behind that the change log no longer reaches back to you.
+
+    什么时候要紧，是可以量的：让一个成员在你走神期间离场，再把它的离场记录挤出
+    日志。拿旧位置回来的时候，只有"整份重发"能让你知道它走了。实测把日志窗口那
+    条判断拆掉：答复是 `full=False changed=[1]`，观察者**永远以为它还在**。
+    """
     beat(registry.endpoint, pool="F", id=1)
     fresh = beat(registry.endpoint, pool="F", id=2, watch=["F"])["pools"]["F"]
     assert fresh["full"] is True
@@ -170,6 +176,9 @@ def test_full_says_to_drop_what_you_had(registry):
     ]["F"]
     assert near["full"] is False
 
+    # id=3 走了，然后把它的离场挤出日志的另一头。
+    beat(registry.endpoint, pool="F", id=3, leaving=True)
+
     # Past the end of it: the registry gives up on catching us up piecemeal.
     # LOG_CAP is 4096 entries, and each state change is one entry.
     for i in range(4200):
@@ -178,7 +187,9 @@ def test_full_says_to_drop_what_you_had(registry):
         "pools"
     ]["F"]
     assert far["full"] is True
-    assert len(far["changed"]) == 3
+    left = sorted(m["id"] for m in far["changed"])
+    assert left == [1, 2], f"整份名册应该只剩 1 和 2，拿到的是 {left}"
+    assert 3 not in left, "3 号的离场掉出了日志，观察者却还以为它在"
 
 
 def test_expires_at_never_crosses_the_wire(registry):
@@ -238,3 +249,32 @@ def test_every_epoch_field_is_populated(peer):
     assert len(ep.members) == 1
     assert isinstance(ep.roster, int) and ep.roster != 0
     assert ep.valid is True
+
+
+def test_a_departure_stops_mattering_once_its_lease_would_have_run_out(registry):
+    """说过再见的任期要记住一阵子，但**只是一阵子**。
+
+    记住是为了挡住迟到的心跳：调用方那边已经超时放弃，请求却还在路上，说着
+    `leaving=false`、带着刚刚告别的那个任期，一到就能把成员塞回去，白占一个租约。
+
+    忘掉则是为了两件事。一是这张表按成员 id 存，而 churn 成员每次加入都换一个
+    随机 id —— 不忘就是无界增长：实测 5 万轮 churn，会忘记时 RSS 涨 312 kB，
+    不忘时涨 **2200 kB**（每轮 45 字节对 6 字节）。二是下面这条更直接：租约都过完
+    了，同一个任期本来就该能重新加入。
+
+    断言的是后者，因为它是确定的 —— 不用去数一个谁也没暴露出来的表。
+    """
+    assert beat(registry.endpoint, pool="G", id=77, incarnation=500)["accepted"] is True
+    assert beat(registry.endpoint, pool="G", id=77, incarnation=500, leaving=True)["accepted"]
+
+    # 迟到的心跳：同一个任期，刚说完再见就回来，不能复活它。
+    late = beat(registry.endpoint, pool="G", id=77, incarnation=500)
+    assert late["accepted"] is False, "刚告别的任期被一个迟到的心跳原地复活了"
+
+    # 租约过完之后，这条记录就没有意义了。
+    time.sleep(registry.ttl_ms / 1000 + 1.5)
+    again = beat(registry.endpoint, pool="G", id=77, incarnation=500)
+    assert again["accepted"] is True, (
+        "过了一整个租约，同一个任期还是被挡着 —— 离场记录没有被忘掉，"
+        "而它是按每个 id 存的，churn 成员每次都换 id"
+    )

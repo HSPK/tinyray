@@ -227,6 +227,16 @@ impl Shared {
             // beat: 4,300 rapid updates moved the version by 8. It stays
             // reachable at scale, where a large pool can move that far during
             // a stall shorter than a lease, so the clear stays.
+            // Kept without a mutant aimed at it, which wants saying. The
+            // registry now answers a position it never issued with a full
+            // roster, and clearing the cache above drops the `seen` we would
+            // have asked from, so the next beat asks fresh and is answered in
+            // full either way. Tried to build a case where this line is what
+            // saves us and could not: a restart with the watcher's position
+            // below the new version, which is the only path left, still ends
+            // with the whole roster. It stays because an older registry
+            // answers such a position incrementally and this is the only thing
+            // that would notice.
             if restarted && !d.full {
                 continue;
             }
@@ -502,4 +512,56 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>) -> bool {
         s.ring();
         out
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::beat_timeout;
+
+    /// The deadline for a beat that is not being parked has to follow the
+    /// interval, not sit at a constant.
+    ///
+    /// Nothing in the Python suite notices if it does: everything there talks
+    /// to a registry on loopback, and 200ms is plenty for that. On a real link
+    /// with a 4s lease the interval is 1s and the budget should be 750ms; a
+    /// flat 200ms turns an ordinary slow answer into a failed beat, and enough
+    /// failed beats cost the seat. That is the whole point of making the
+    /// deadline proportional, and it needs asserting where it can be seen.
+    ///
+    /// `hold_ms == 0` is reached twice over: the first beat, before any ack
+    /// has said what the lease is, and every beat right after a watch
+    /// cancelled the held one.
+    #[test]
+    fn an_unparked_beat_follows_the_interval() {
+        assert_eq!(beat_timeout(1000, 0).as_millis(), 750);
+        assert_eq!(beat_timeout(500, 0).as_millis(), 375);
+        assert_eq!(beat_timeout(200, 0).as_millis(), 150);
+        // Strictly increasing, which a constant would not be.
+        assert!(beat_timeout(1000, 0) > beat_timeout(500, 0));
+        assert!(beat_timeout(500, 0) > beat_timeout(200, 0));
+        // Clamped at both ends so a nonsense interval cannot make the deadline
+        // nonsense too.
+        assert_eq!(beat_timeout(1, 0).as_millis(), 37);
+        assert_eq!(beat_timeout(1_000_000, 0).as_millis(), 22_500);
+    }
+
+    /// A parked beat is allowed to take as long as it was asked to park for,
+    /// with room for the registry's jitter on top. Proportional, never a flat
+    /// margin: a constant put the deadline past the lease at short leases --
+    /// 2.6s of waiting against a 2s lease -- so one dropped packet cost the
+    /// seat.
+    #[test]
+    fn a_parked_beat_is_given_the_hold_plus_half() {
+        assert_eq!(beat_timeout(500, 500).as_millis(), 950);
+        assert_eq!(beat_timeout(500, 2000).as_millis(), 3200);
+        // 0.44 of the lease whatever the lease, so it never outlives one.
+        for ttl_ms in [1_000u64, 2_000, 8_000, 30_000] {
+            let hold = (ttl_ms / 4).clamp(50, 30_000);
+            let budget = beat_timeout(ttl_ms / 4, hold).as_millis() as u64;
+            assert!(
+                budget < ttl_ms,
+                "budget {budget} outlives the {ttl_ms}ms lease"
+            );
+        }
+    }
 }

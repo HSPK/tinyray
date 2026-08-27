@@ -138,7 +138,21 @@ impl Pool {
             // Caught up already.
             Some(v) if v == self.version => return d,
             // Known position still covered by the log: send only what moved.
-            Some(v) if v + 1 >= oldest => {
+            //
+            // `v <= self.version` is the part that is not obvious. A position
+            // past anything we ever issued means this client is talking to a
+            // registry that restarted underneath it and started counting again
+            // -- and the empty log of a fresh pool makes the `oldest` test say
+            // yes to any number at all. Answering "nothing changed" to that is
+            // how a client keeps a roster from a previous life for good.
+            // Measured: asked from version+500, the pool was left out of the
+            // answer entirely, which reads as no change.
+            //
+            // The client detects the restart by epoch and clears its cache, so
+            // this is the second lock rather than the first. It is here
+            // because the registry can tell on its own, and an older client
+            // that predates the epoch cannot.
+            Some(v) if v <= self.version && v + 1 >= oldest => {
                 let mut ids: Vec<u64> = self
                     .log
                     .iter()

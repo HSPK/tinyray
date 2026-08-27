@@ -50,13 +50,6 @@ MUTANTS = [
         "tests/test_m1_membership.py",
     ),
     (
-        "an incremental delta is applied across a registry restart",
-        RS_BEAT,
-        "            if restarted && !d.full {\n                continue;\n            }",
-        "",
-        "tests/test_registry_restart.py",
-    ),
-    (
         "the cached version is never advanced",
         RS_BEAT,
         "            c.version = d.version;",
@@ -69,6 +62,57 @@ MUTANTS = [
         "            p.gone\n                .insert(b.id, (b.incarnation, Instant::now() + self.ttl));",
         "",
         "tests/test_review_fixes.py::test_a_beat_still_in_flight_cannot_undo_a_leave",
+    ),
+    (
+        "an unparked beat gets a flat deadline instead of the interval",
+        "crates/tinyray-client/src/beat.rs",
+        "    if hold_ms == 0 {",
+        "    if false {",
+        "cargo:tinyray-client",
+    ),
+    (
+        "a beat body is read whatever size it announces",
+        "crates/tinyray-registry/src/server.rs",
+        "const MAX_BODY: usize = 512 << 10;",
+        "const MAX_BODY: usize = 1 << 40;",
+        "tests/test_admission.py::test_a_body_too_big_to_be_a_beat_is_refused_before_it_is_read",
+    ),
+    (
+        "every parked watcher is woken at the same instant",
+        "crates/tinyray-registry/src/server.rs",
+        "    let jitter = beat.id % (budget / 8 + 1);",
+        "    let jitter = 0;",
+        "tests/test_long_poll.py::test_parked_watchers_do_not_all_come_back_at_once",
+    ),
+    (
+        "a beat is parked for as long as it asks",
+        "crates/tinyray-registry/src/server.rs",
+        "    let budget = beat.hold_ms.min(reg.ttl.as_millis() as u64 / 2);",
+        "    let budget = beat.hold_ms;",
+        "tests/test_long_poll.py::test_a_beat_is_never_parked_longer_than_half_a_lease",
+    ),
+    (
+        "a departure is remembered for good",
+        RS_STATE,
+        "            p.gone.retain(|_, (_, forget_at)| *forget_at > now);\n",
+        "",
+        "tests/test_field_coverage.py::"
+        "test_a_departure_stops_mattering_once_its_lease_would_have_run_out",
+    ),
+    (
+        "a position past the end of the log is answered incrementally",
+        RS_STATE,
+        "            Some(v) if v <= self.version && v + 1 >= oldest => {",
+        "            Some(v) if v <= self.version => {",
+        "tests/test_field_coverage.py::test_full_says_to_drop_what_you_had",
+    ),
+    (
+        "a position the registry never issued is answered incrementally",
+        RS_STATE,
+        "            Some(v) if v <= self.version && v + 1 >= oldest => {",
+        "            Some(v) if v + 1 >= oldest => {",
+        "tests/test_registry_restart.py::"
+        "test_asking_from_a_version_the_registry_never_issued_gets_the_whole_roster",
     ),
     (
         "a beat is taken whatever is in it",
@@ -357,7 +401,7 @@ MUTANTS = [
         RS_PROTO,
         "    #[serde(default)]\n    pub protocol: u32,",
         "    pub protocol: u32,",
-        "crates/tinyray-proto/tests/wire.rs",
+        "cargo:tinyray-proto",
     ),
     (
         "an unknown feature name answers False instead of raising",
@@ -535,7 +579,7 @@ MUTANTS = [
     (
         "an unreadable content-length leaves the connection open",
         "python/tinyray/_serve.py",
-        '            self.close_connection = True\n'
+        "            self.close_connection = True\n"
         '            return self._send(400, {"error": "content-length is not a number"})',
         '            return self._send(400, {"error": "content-length is not a number"})',
         "tests/test_rpc_raw.py::test_a_body_the_server_gave_up_on_takes_the_connection_with_it",
@@ -543,7 +587,7 @@ MUTANTS = [
     (
         "a negative content-length leaves the connection open",
         "python/tinyray/_serve.py",
-        '            self.close_connection = True\n'
+        "            self.close_connection = True\n"
         '            return self._send(400, {"error": "content-length is negative"})',
         '            return self._send(400, {"error": "content-length is negative"})',
         "tests/test_rpc_raw.py::test_a_body_the_server_gave_up_on_takes_the_connection_with_it",
@@ -751,9 +795,14 @@ def main() -> int:
                 # is the thing that noticed.
                 print(f"CAUGHT  {label}  (did not compile)")
                 continue
-            if test.endswith(".rs"):
+            if test.startswith("cargo:"):
+                # Some things are only visible from the Rust side. A beat's
+                # deadline is one: every registry the Python suite talks to is
+                # on loopback, so a deadline that stopped following the
+                # interval would cost nothing there and everything on a real
+                # link.
                 r = subprocess.run(
-                    ["cargo", "test", "-q", "-p", "tinyray-proto"],
+                    ["cargo", "test", "-q", "-p", test.split(":", 1)[1]],
                     cwd=ROOT,
                     capture_output=True,
                     text=True,

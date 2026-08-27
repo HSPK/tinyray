@@ -517,6 +517,7 @@ TinyrayError
 └── SeatTaken            座位被人占着（exclusive）或被更晚的任期拿走
 
 NotFound(LookupError)    没人匹配
+TypeError                参数装不进被调方法的签名 —— 方法没跑，是调用方写错了
 PolicyError(ValueError)  策略、座位、size 组合不成立
 OversizeWarning(UserWarning)     超过 1 MB 提示线（只是提示，东西照送）
 OldRegistryWarning(UserWarning)  注册中心比本包旧，某个功能不可用
@@ -525,6 +526,14 @@ OldRegistryWarning(UserWarning)  注册中心比本包旧，某个功能不可�
 **只有 `NotDelivered` 可以盲目重试。** `OutcomeUnknown` 意味着对面可能已经做过
 一遍 —— 这是唯一需要 request id 的情形。`RemoteError` tinyray 绝不替你重试，
 能不能重做只有你知道。
+
+分到哪一类，看的是**被调方把这个请求读完了没有**，不是它回了什么状态码。它在读完
+之前放弃的每一条路 —— content-length 读不懂、body 发到一半停住、并发到顶 ——
+方法都还没被调用过，所以都是 `NotDelivered`。
+
+参数装不进签名（位置参数太多、少给必填、关键字名字不认识、同一个参数给两次、类型
+不匹配）也一样没跑过，但那是**调用方写错了**，所以走 `TypeError` 而不是
+`Unreachable`：重试同样的调用不会有别的结果。
 
 `NotDelivered` 和 `OutcomeUnknown` 都是 `Unreachable` 的子类，所以既有的
 `except Unreachable` 不受影响。

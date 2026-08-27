@@ -386,3 +386,63 @@ def test_a_frozen_owner_waking_after_a_restart_does_not_take_the_seat_back(regis
 
     said = [ln.split()[1] for ln in first.stdout.read().splitlines() if ln.startswith("ACC")]
     assert said and said[-1] == "False", f"A 醒来之后仍然认为自己持有座位；它报的是 {said[-6:]}"
+
+
+def _raw_beat(registry, seen: dict[str, int]) -> dict:
+    """一个手写的心跳，绕开客户端。老客户端看到的就是这个。"""
+    body = json.dumps(
+        {
+            "pool": "probe",
+            "id": 987654321,
+            "incarnation": (int(time.time() * 1000) << 20) | 1,
+            "policy": "churn",
+            "ttl_ms": registry.ttl_ms,
+            "ready": True,
+            "state": {},
+            "methods": [],
+            "watch": ["future"],
+            "seen": seen,
+            "hold_ms": 0,
+            "leaving": False,
+            "exclusive": False,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"http://{registry.endpoint}/v1/beat",
+        data=body,
+        headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
+def test_asking_from_a_version_the_registry_never_issued_gets_the_whole_roster(registry):
+    """问一个"未来"的版本号，只可能是因为注册中心在你脚下重启过。
+
+    重启之后池子的计数从 0 重来，而新池子的日志是空的 —— 空日志会让"你的位置还
+    在日志覆盖范围内吗"这个判断对**任何**数字都说是。于是客户端问"第 500 版之后
+    有什么变化"，得到的答复是"没有变化"，然后就一直守着上辈子的名册。
+
+    实测修之前：从 version+500 问，那个池子干脆不出现在答复里，读起来就是"没变
+    化"。
+
+    我们自己的客户端靠 epoch 认出重启并清空缓存，所以这是第二道锁而不是第一道。
+    它值得存在，是因为注册中心自己就能判断，而一个早于 epoch 的老客户端不能。
+    """
+    with tinyray.join("future", "churn") as me:
+        me.ready(tag="here")
+        current = _raw_beat(registry, {})["pools"]["future"]["version"]
+
+        ahead = _raw_beat(registry, {"future": current + 500})["pools"].get("future")
+        assert ahead is not None, (
+            "从一个从没发出过的版本号问过去，答复里连这个池子都没有 —— "
+            "对调用方来说就是没有任何变化，于是陈旧名册永远留着"
+        )
+        assert ahead["full"], f"应该重发整份名册，拿到的却是增量：{ahead}"
+        assert len(ahead["changed"]) == 1, ahead
+
+        # 落后一点仍然走增量 —— 这个修复不该把每次落后都变成全量。
+        behind = _raw_beat(registry, {"future": max(0, current - 1)})["pools"].get("future")
+        assert behind is not None and not behind["full"], (
+            f"普通的落后一版被当成了全量重发：{behind}"
+        )

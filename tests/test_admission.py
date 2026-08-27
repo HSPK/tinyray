@@ -100,3 +100,26 @@ def test_malformed_bodies_are_rejected_without_killing_anything(registry):
         assert e.value.code == 400
     # Still serving afterwards.
     assert beat(ep, pool="after", id=1)["accepted"] is True
+
+
+def test_a_body_too_big_to_be_a_beat_is_refused_before_it_is_read(registry):
+    """一个心跳能有多大是有上限的，而且上限在读之前就生效。
+
+    没有它，任何人都能声明一个任意大的请求体，注册中心会一路读进内存 —— 这正是
+    这个文件开头那句"一个坏 peer 不能让内存无界增长"。
+
+    我们自己的客户端撞不到：状态受 `MAX_STATE`（16 KiB）管着，watch 列表最多 64
+    个名字。所以这条只有手写请求能试，而它防的就是手写请求。
+
+    实测（上限 512 KiB）：1 KiB 正常受理；400 KiB 进得来但因为状态超标被拒
+    （`accepted=False`，是内容的问题不是尺寸的问题）；600 KiB 拿到 **413**。
+    再大就会在写到一半时收到 Broken pipe —— 服务端不肯把剩下的读完只为了礼貌地
+    回一句，这是 HTTP 服务器的常规做法，所以这里断言的是那个还能干净回话的尺寸。
+    """
+    # 尺寸之内、内容超标：413 之外的另一条路，确认这两件事没有混为一谈。
+    fat_state = beat(registry.endpoint, pool="big", state={"pad": "x" * (400 << 10)})
+    assert fat_state["accepted"] is False, "400 KiB 的状态该因为内容被拒"
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        beat(registry.endpoint, pool="big", state={"pad": "x" * (600 << 10)})
+    assert e.value.code == 413, f"超过上限的请求体应该是 413，拿到的是 {e.value.code}"
