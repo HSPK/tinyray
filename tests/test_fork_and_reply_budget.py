@@ -409,3 +409,42 @@ def test_a_forked_child_does_not_share_the_synchronous_connection(registry):
     assert "PARENT 0 []" in out and "CHILD carried=False 0 []" in out, (
         f"父子共用了同一条同步连接：stdout={out!r} stderr={err[-600:]!r}"
     )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
+def test_a_forked_child_exiting_normally_says_nothing(registry):
+    """子进程什么都没做错的时候，就不该在 stderr 上留下东西。
+
+    `join()` 把告别交给 atexit，好让正常退出的进程当场腾出座位（实测 0.06s，
+    对比被 SIGKILL 的 3.15s 走租约）。可 fork 把退出钩子连同别的一切复制过去，
+    于是子进程退出时也会去跑它 —— 而子进程**不该**替父进程说再见。
+
+    `leave()` 拒绝得没错，但它是靠抛异常拒绝的，atexit 会把这个异常打出来：
+    **7 行 traceback**，而子进程什么都没做错。
+
+    比听起来窄，记在这里是因为我一开始说反了。它需要**手写的 `os.fork()`**，
+    而且子进程走正常的解释器收尾：实测 `sys.exit(0)` 7 行，跑到脚本末尾也 7 行；
+    `os._exit()` 跳过 atexit，0 行。而 multiprocessing 用的正是 `os._exit()`，
+    所以 `Pool` 和 `DataLoader` 根本碰不到 —— 修复前实测 5 轮 × 4 个 worker，
+    stderr 0 行。
+
+    钩子只该对注册它的那个进程有效。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-c", FORK_THEN_EXIT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = p.communicate(timeout=45)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        out, err = p.communicate(timeout=10)
+        raise AssertionError("fork 之后的子进程退出时挂住了") from None
+
+    assert "CHILD_EXITED 0" in out, f"stdout={out!r}"
+    assert err == "", (
+        f"子进程正常退出却在 stderr 上留下了 {len(err.splitlines())} 行：{err[:400]!r}"
+    )

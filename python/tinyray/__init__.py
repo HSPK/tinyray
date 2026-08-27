@@ -1226,6 +1226,25 @@ class Member:
         """
         return self._c.last_error()
 
+    def _leave_at_exit(self) -> None:
+        """What atexit gets, which is not the same thing as `leave`.
+
+        A fork copies the exit hooks along with everything else, and a child
+        must not say goodbye on the parent's behalf -- `leave()` refuses, and
+        refusing is right, but it refuses by raising and atexit prints that:
+        seven lines of traceback for doing nothing wrong.
+
+        Narrower than it sounds, and worth writing down because I first
+        claimed otherwise. It needs a hand-written `os.fork()` whose child
+        leaves through the ordinary interpreter shutdown -- measured at seven
+        lines for `sys.exit(0)` and seven for falling off the end of the
+        script. `os._exit()` skips atexit and prints nothing, and that is what
+        multiprocessing uses, so a Pool or a DataLoader never sees this: zero
+        lines from four workers over five rounds, before the fix.
+        """
+        if os.getpid() == self._pid:
+            self.leave()
+
     def leave(self) -> None:
         self._mine()
         if not self._left:
@@ -1235,7 +1254,7 @@ class Member:
             # process, and through it the served object -- which is a model or
             # a dataset as often as not. Measured: eight join/leave rounds
             # left eight servers alive, each still holding its object.
-            atexit.unregister(self.leave)
+            atexit.unregister(self._leave_at_exit)
             # A watcher blocked on a client that is about to go would wait out
             # its whole timeout, and a non-daemon thread iterating one kept the
             # process alive indefinitely.
@@ -1480,7 +1499,7 @@ def join(
     # A process that exits normally should say goodbye, so the seat frees up
     # immediately instead of waiting out the lease. SIGKILL still falls back
     # to lease expiry -- both paths work, they just differ in speed.
-    atexit.register(member.leave)
+    atexit.register(member._leave_at_exit)
     return member
 
 

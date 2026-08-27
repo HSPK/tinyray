@@ -308,3 +308,81 @@ def test_a_restart_whose_counter_climbs_past_ours_still_leaves_a_whole_roster(re
         _stop(observer)
         for p in placed:
             _stop(p)
+
+
+FROZEN_OWNER = textwrap.dedent(
+    """
+    import os, sys, time, tinyray
+    class S:
+        def whoami(self) -> str: return sys.argv[1]
+    m = tinyray.join("seat", "stateful", slot=0, size=1, serves=S())
+    m.ready(who=sys.argv[1])
+    print("UP " + m.identity, flush=True)
+    while True:
+        print("ACC " + str(m.accepted), flush=True)   # 自己认为还持不持有座位
+        time.sleep(0.2)
+    """
+)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGSTOP"), reason="needs SIGSTOP to freeze a process")
+def test_a_frozen_owner_waking_after_a_restart_does_not_take_the_seat_back(registry):
+    """重启抹掉了"这个座位最后归谁"的记忆，独占却不能跟着一起丢。
+
+    最坏的一种情形：座位的主人被冻住（GC 停顿、被换出、SIGSTOP），久到租约过期，
+    别人顶上来 —— 而它**从没机会知道自己被顶掉了**。这时注册中心再重启一次，
+    高水位记忆归零。它醒过来，还以为自己是主人。
+
+    对一个围栏层来说，两个活着的成员同时认定自己独占同一个座位是最坏的结局。
+
+    挡住它的是**客户端的锁存**，不是注册中心那边的检查 —— 这一条是量出来的，
+    不是读出来的：把"当前占用者在场就拒绝"和"任期低于高水位就拒绝"两条**都**
+    拆掉，这个场景的结果一点不变；而把锁存改成不锁（`accepted` 还能变回 true），
+    A 立刻就把座位抢了回去，3/3 复现。
+
+    也就是说：一个成员一旦被告知失去了座位，就再也不会忘记这件事，而注册中心
+    重启**收不回**这句话。座位记忆丢在服务端，判断留在客户端手里。
+    """
+    watcher = tinyray.join("obs", "churn")
+    watcher.ready()
+    first = subprocess.Popen(
+        [sys.executable, "-c", FROZEN_OWNER, "A"], stdout=subprocess.PIPE, text=True
+    )
+    second = None
+    try:
+        was = first.stdout.readline().split()[1]
+        tinyray.pool("seat").wait(count=1, timeout=15)
+
+        os.kill(first.pid, signal.SIGSTOP)  # 冻住：错过接下来发生的一切
+        time.sleep(registry.ttl_ms / 1000 + 1.0)  # 租约过期
+
+        second = subprocess.Popen(
+            [sys.executable, "-c", FROZEN_OWNER, "B"], stdout=subprocess.PIPE, text=True
+        )
+        now = second.stdout.readline().split()[1]
+        assert now != was
+        tinyray.pool("seat").until(
+            lambda s: s.slot(0) is not None and s.slot(0).identity == now,
+            timeout=20,
+            describe="B 接手座位",
+        )
+
+        registry.stop()
+        registry.start()  # 高水位记忆归零
+        os.kill(first.pid, signal.SIGCONT)  # A 醒了，还以为自己是主人
+        time.sleep(3.0)
+
+        held = tinyray.pool("seat").snapshot().slot(0)
+        assert held is not None and held.identity == now, (
+            f"注册中心重启之后座位被抢回去了：现在是 {held and held.identity!r}，应该是 {now!r}"
+        )
+    finally:
+        first.kill()
+        first.wait(timeout=5)
+        if second is not None:
+            second.kill()
+            second.wait(timeout=5)
+        watcher.leave()
+
+    said = [ln.split()[1] for ln in first.stdout.read().splitlines() if ln.startswith("ACC")]
+    assert said and said[-1] == "False", f"A 醒来之后仍然认为自己持有座位；它报的是 {said[-6:]}"
