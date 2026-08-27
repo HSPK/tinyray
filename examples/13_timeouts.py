@@ -73,13 +73,13 @@ def run_client(_: list[str]) -> None:
         # And it does not collide with the callee's own parameter.
         print(f"[client] {svc.with_own_timeout.timeout(3.0)(timeout=99)}", flush=True)
 
-        # Giving up is not knowing: a timeout is Unreachable, never RemoteError,
-        # because we cannot tell whether the work ran.
+        # Giving up is not knowing: a timeout is OutcomeUnknown, never
+        # RemoteError, because we cannot tell whether the work ran.
         try:
             svc.takes.timeout(0.15)(1.0)
-        except tinyray.Unreachable as exc:
+        except tinyray.OutcomeUnknown as exc:
             assert not isinstance(exc, tinyray.RemoteError)
-            print("[client] a timeout is Unreachable: we cannot say if it ran", flush=True)
+            print("[client] a timeout is OutcomeUnknown: it may have run in full", flush=True)
 
 
 def driver() -> int:

@@ -73,8 +73,14 @@ class AgentPool:
         record = self.attempts[attempt_id]
         if record.worker != worker:
             raise ValueError(f"{attempt_id} belongs to {record.worker}, not {worker}")
+        if record.state in ("completed", "cancelled"):
+            # A terminal state is terminal. The worker's own "was I cancelled?"
+            # check only works if the kill arrived, and the kill is the one call
+            # here that may fail without saying whether it ran. So the record
+            # decides, not the survivor.
+            return {"state": record.state, "outstanding": self.outstanding()}
         record.state, record.result = "completed", result
-        return {"outstanding": self.outstanding()}
+        return {"state": record.state, "outstanding": self.outstanding()}
 
     def cancel(self, attempt_id: str, detail: str) -> dict:
         record = self.attempts[attempt_id]
@@ -88,8 +94,11 @@ class AgentPool:
         if record.worker:
             try:
                 tinyray.pool("agent").pick(worker=record.worker).kill(attempt_id)
-            except (tinyray.NotFound, tinyray.Unreachable, tinyray.Fenced):
-                pass  # gone already, which is the outcome we wanted
+            except tinyray.NotDelivered:
+                pass  # it never left, and the worker it was for is gone
+            except (tinyray.NotFound, tinyray.OutcomeUnknown, tinyray.Fenced):
+                pass  # we do not know whether it landed; submit_result refuses
+                # the attempt either way, so a survivor cannot finish it
         return {"state": record.state}
 
     def outstanding(self) -> int:

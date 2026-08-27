@@ -777,6 +777,14 @@ MUTANTS = [
         "else f\"{_identity or 'anon'}-1\"",
         "tests/test_identity_and_fencing.py::test_every_call_carries_a_request_id_that_names_that_attempt",
     ),
+    (
+        "a cancelled attempt is terminal even if the kill never landed",
+        "examples/agent_pool/pool.py",
+        '        if record.state in ("completed", "cancelled"):\n            # A terminal state is terminal.',
+        "        if False:\n            # A terminal state is terminal.",
+        "tests/test_agent_pool_domain.py"
+        "::test_a_cancelled_attempt_cannot_be_finished_by_a_survivor",
+    ),
 ]
 
 

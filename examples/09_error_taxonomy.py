@@ -1,8 +1,9 @@
-"""Three failures that need three different reactions.
+"""Six failures that need six different reactions.
 
-Only "never arrived" is safe to retry blindly. Whether a business failure can
-be repeated is something only the application knows, so tinyray never decides
-that for you.
+Only NotDelivered is safe to retry blindly, because nothing ran. Every other
+failure leaves "did it run?" open: a call that timed out may have been carried
+out in full. Whether a business failure can be repeated is something only the
+application knows, so tinyray never decides that for you.
 
     python examples/09_error_taxonomy.py
 """
@@ -52,7 +53,8 @@ def run_client(_: list[str]) -> None:
             results["RemoteError"] = f"{exc.type}: {exc.message}"
             assert "rubric" in exc.traceback
 
-        # 2. It never arrived. Safe to retry if the operation can be repeated.
+        # 2. It never arrived: the connection was refused, so nothing ran.
+        #    This is the only one that can be sent again as it stands.
         gone = tinyray.Handle(
             "svc",
             {
@@ -66,8 +68,8 @@ def run_client(_: list[str]) -> None:
         )
         try:
             gone.ok(1)
-        except tinyray.Unreachable as exc:
-            results["Unreachable"] = str(exc)[:48]
+        except tinyray.NotDelivered as exc:
+            results["NotDelivered"] = str(exc)[:48]
 
         # 3. It arrived, but a later tenure owns that seat. Look it up again.
         stale = tinyray.Handle(
@@ -80,17 +82,25 @@ def run_client(_: list[str]) -> None:
         except tinyray.Fenced as exc:
             results["Fenced"] = str(exc)[:48]
 
-        # A timeout is an Unreachable: we do not know whether it ran.
+        # 4. We stopped waiting. The call may have been carried out in full --
+        #    this is the one case that needs a request id or an idempotent
+        #    operation, and the one the old advice got wrong.
         try:
             svc.slow.timeout(0.2)(2.0)
-        except tinyray.Unreachable:
-            results["timeout"] = "Unreachable (we cannot know if it ran)"
+        except tinyray.OutcomeUnknown:
+            results["OutcomeUnknown"] = "we stopped waiting; it may have run"
 
-        # Typos and bad arguments are the caller's fault, not the network's.
+        # 5. A method that is not there at all. Not a network error: the
+        #    process answered, and the answer was "no such method".
         try:
             svc.nope()
         except AttributeError as exc:
             results["AttributeError"] = str(exc)[:48]
+
+        # 6. Bad arguments are the caller's fault, not the network's. Every way
+        #    of getting them wrong lands here -- too many, too few, a keyword
+        #    the method has no parameter for, one value given twice, or the
+        #    wrong type. None of them ran.
         try:
             svc.ok("not an int")
         except TypeError as exc:
@@ -98,18 +108,24 @@ def run_client(_: list[str]) -> None:
 
         for kind in (
             "RemoteError",
-            "Unreachable",
+            "NotDelivered",
             "Fenced",
-            "timeout",
+            "OutcomeUnknown",
             "AttributeError",
             "TypeError",
         ):
             print(f"[client] {kind:<15} {results[kind]}", flush=True)
 
         print("[client] retry policy:", flush=True)
-        print("           Unreachable -> retry if the operation is repeatable", flush=True)
-        print("           Fenced      -> re-resolve, then retry", flush=True)
-        print("           RemoteError -> never retried for you", flush=True)
+        print("           NotDelivered   -> send it again as it stands", flush=True)
+        print("           OutcomeUnknown -> same request id, or be idempotent", flush=True)
+        print("           Fenced         -> re-resolve, then retry", flush=True)
+        print("           RemoteError    -> yours to decide, never automatic", flush=True)
+        print("           AttributeError -> fix the name; retrying cannot help", flush=True)
+        print("           TypeError      -> fix the call; retrying cannot help", flush=True)
+        print("         (both of the first two are Unreachable, so an existing", flush=True)
+        print("          `except Unreachable` still catches them -- but it", flush=True)
+        print("          cannot tell you which of the two you have.)", flush=True)
 
 
 def driver() -> int:
