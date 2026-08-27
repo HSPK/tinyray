@@ -87,6 +87,7 @@ impl Client {
             registry_version: Mutex::new(String::new()),
             started: std::time::Instant::now(),
             wake: tokio::sync::Notify::new(),
+            acked: tokio::sync::Notify::new(),
             revision: Mutex::new(0),
             bell: std::sync::Condvar::new(),
             wakeups: AtomicU64::new(0),
@@ -107,7 +108,7 @@ impl Client {
         let s = self.shared.clone();
         // Release the GIL: this is a network round trip.
         let budget = Duration::from_millis(budget_ms.max(1));
-        let ok = py.allow_threads(|| beat_once(&rt, &s, budget));
+        let ok = py.allow_threads(|| beat_once(&rt, &s, budget, true));
         *self.rt.lock().unwrap() = Some(rt);
         Ok(ok)
     }
@@ -350,7 +351,7 @@ impl Client {
             // five of them spent on a farewell for a member that was never
             // there.
             if s.beats_ok.load(Ordering::Relaxed) > 0 {
-                py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5)));
+                py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5), false));
             }
             rt.shutdown_background();
         }

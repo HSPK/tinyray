@@ -8,9 +8,11 @@ both bugs in here were found.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -230,6 +232,19 @@ def test_the_first_beat_deadline_survives_a_lossy_link(registry):
     )
 
 
+JOIN_AND_WAIT_FOR_SIGINT = textwrap.dedent(
+    """
+    import sys, tinyray
+    print("go", flush=True)
+    try:
+        tinyray.join("s", "churn", timeout=60.0)
+    except KeyboardInterrupt:
+        sys.exit(3)
+    sys.exit(4)
+    """
+)
+
+
 TIMED_JOIN = textwrap.dedent(
     """
     import sys, time, tinyray
@@ -250,10 +265,17 @@ def test_the_first_beat_is_retried_rather_than_waited_out(registry):
     变成 17:06。
 
     首拍改成只拿 `min(timeout, 5s)` 之后，丢了的那一拍由循环每个间隔重发：
-    同样 12 次启动中位 **5.1s**、合计 85s，失败仍是 0。
+    同样 12 次启动中位 **5.1s**、合计 85s，失败仍是 0。后来首拍又学会了听循环
+    的 ack（见 `test_join_returns_when_the_loop_registers_...`），同样六个种子
+    中位降到 **1.75s**、最慢 4.26s。
 
     这条测试盯的是比率而不是有无，所以取中位数：一次长等的中位会贴着预算，
     快速重试的中位贴着一次往返。
+
+    它自己没有变异体，是有意的：15s 这个界现在离常态有八倍余量，能翻红的只有
+    "丢包链路上 join 整体垮掉"这种粗故障，而"该快不快"的锐利断言在上面那条
+    确定性测试里。随机丢包的界收紧到贴着中位只会换来抖动——它在满量跑里已经
+    红过一次。
     """
     took = []
     for seed in range(400, 406):
@@ -275,3 +297,79 @@ def test_the_first_beat_is_retried_rather_than_waited_out(registry):
     took.sort()
     median = took[len(took) // 2]
     assert median < 15.0, f"首拍在把预算等满而不是重试：中位 {median:.1f}s，全部 {took}"
+
+
+def test_join_returns_when_the_loop_registers_not_when_the_first_beat_gives_up(registry):
+    """首拍和后台循环是**并发**的，所以注册成功可能来自首拍不知道的那一拍。
+
+    首拍存在的理由只有一个：返回时调用者已经在册。一旦循环替它做到了，继续
+    等下去就是纯粹的空等。实测 40% 丢包、`join(timeout=30)` 跑六个种子：循环
+    在 **0.01s** 就拿到了 ack，首拍照样把 5s 预算等满，六次里占了三次；另有一
+    次循环 1.75s 成功而首拍等到 5.0s，白白多花 3.25s。
+
+    这里把链路先整个黑掉再放开，让"循环成功"必然发生在首拍之外：黑洞期间首拍
+    的字节被吞掉，它只能等满 min(timeout, 5s)；放开后循环下一次重试就成功。
+    等满的那种实测 5.0s，被叫醒的这种 1.75s。
+    """
+    proxy = FaultyProxy(registry.endpoint, drop_rate=1.0)
+    opener = threading.Timer(1.2, lambda: setattr(proxy, "drop_rate", 0.0))
+    try:
+        env = dict(os.environ, TINYRAY_REGISTRY=proxy.endpoint)
+        opener.start()
+        out = subprocess.run(
+            [sys.executable, "-c", TIMED_JOIN],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert out.returncode == 0, out.stderr[-500:]
+        took = float(out.stdout.strip())
+    finally:
+        opener.cancel()
+        proxy.close()
+    assert took < 4.0, f"首拍在等满自己的预算而不是听循环的：{took:.2f}s"
+
+
+def test_ctrl_c_during_join_is_not_swallowed_until_the_timeout(registry):
+    """首拍在 Rust 里释放 GIL 阻塞，期间 Python 收不到信号——所以它拿多久的
+    预算，就是 Ctrl-C 最坏要等多久。
+
+    `join(timeout=)` 是给"等多久算失败"用的，不是给"多久之后才理你"用的。一个
+    等着 300s 预算的 join 对 Ctrl-C 无动于衷 300s，看起来就是卡死。
+
+    实测：链路整个黑掉、`join(timeout=60)`、两秒后 SIGINT —— 首拍只拿
+    `min(timeout, 5s)` 时进程 **3.07s** 后退出；把整份预算交给首拍则要
+    **58.06s**。
+
+    这条测的是切片，不是重试：`test_join_returns_when_the_loop_registers_...`
+    之后，丢包链路上的等待已经由循环兜住了，只有信号还必须穿过首拍。
+    """
+    proxy = FaultyProxy(registry.endpoint, drop_rate=1.0)
+    try:
+        env = dict(os.environ, TINYRAY_REGISTRY=proxy.endpoint)
+        child = subprocess.Popen(
+            [sys.executable, "-c", JOIN_AND_WAIT_FOR_SIGINT],
+            env=env,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert child.stdout.readline().strip() == "go"
+            time.sleep(2.0)
+            sent = time.monotonic()
+            child.send_signal(signal.SIGINT)
+            try:
+                child.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                pytest.fail("join() swallowed Ctrl-C for at least 90s")
+            waited = time.monotonic() - sent
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.stdout.close()
+    finally:
+        proxy.close()
+    assert child.returncode == 3, f"没走到 KeyboardInterrupt：rc={child.returncode}"
+    assert waited < 15.0, f"Ctrl-C 被首拍吞了 {waited:.1f}s"

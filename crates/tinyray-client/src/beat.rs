@@ -77,6 +77,11 @@ pub struct Shared {
     /// pool or declaring readiness costs a full heartbeat interval of silence,
     /// which is long enough for short-lived peers to come and go unseen.
     pub wake: Notify,
+    /// Rung when a beat from the loop has been acked. The synchronous first
+    /// beat waits on this as well as on its own request, because either one
+    /// landing means the caller is registered -- which is the only thing it
+    /// was blocking for.
+    pub acked: Notify,
     /// Rung once per beat, after the cache has been written. Waiters block on
     /// this instead of polling: every wait in the Python layer was a sleep
     /// loop, the tightest of them turning 500 times a second per pool.
@@ -434,6 +439,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                     let alive = shared.apply(&ack);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     shared.mark_ok();
+                    shared.acked.notify_one();
                     if !alive {
                         // Superseded. Beating on would only be waiting for the
                         // replacement to die so we could take the seat back.
@@ -481,9 +487,25 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
 
 /// Send one beat synchronously, used by join() and leave() so that arrival and
 /// departure are visible immediately instead of at the next tick.
-pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>, budget: Duration) -> bool {
+///
+/// `stop_when_registered` is for join(): the loop is already beating alongside
+/// this call, so the caller can be registered by an ack this request knows
+/// nothing about. Measured on a 40%-loss link, `join(timeout=30)` six times:
+/// the loop was acked at 0.01s and this call still sat there until its 5s
+/// budget ran out, three times out of six. leave() passes false -- its beat
+/// carries `leaving`, and no other beat can say that for it.
+pub fn beat_once(
+    rt: &tokio::runtime::Runtime,
+    shared: &Arc<Shared>,
+    budget: Duration,
+    stop_when_registered: bool,
+) -> bool {
     let s = shared.clone();
     rt.block_on(async move {
+        // Already done by the loop before we even started: nothing to send.
+        if stop_when_registered && s.beats_ok.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
         let http: HttpClient = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
             .http2_only(true)
@@ -493,7 +515,24 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>, budget: Dur
         // caller's budget rather than the loop's. A fixed five seconds here
         // meant join(timeout=) could not make the call shorter -- only longer.
         beat.hold_ms = 0;
-        let out = match post(&http, &s.endpoint, &beat, budget).await {
+        let sending = post(&http, &s.endpoint, &beat, budget);
+        tokio::pin!(sending);
+        // `notify_one` leaves a permit when nobody is waiting, so an ack that
+        // lands between the check above and this select is not missed. A
+        // permit left over from an older ack cannot mislead us: it implies
+        // beats_ok > 0, which returned already.
+        let landed = tokio::select! {
+            done = &mut sending => Some(done),
+            _ = s.acked.notified(), if stop_when_registered => None,
+        };
+        let Some(landed) = landed else {
+            // The loop got there first. Dropping the request in flight is what
+            // the loop already does to swap a parked beat for a fresher one:
+            // a beat is idempotent and the lease is renewed by the one that
+            // arrived, so there is nothing to finish.
+            return true;
+        };
+        let out = match landed {
             Ok(ack) => {
                 s.interval_ms.store(ack.ttl_ms / 4, Ordering::Relaxed);
                 s.hold_ms
@@ -507,7 +546,10 @@ pub fn beat_once(rt: &tokio::runtime::Runtime, shared: &Arc<Shared>, budget: Dur
             Err(why) => {
                 s.beats_failed.fetch_add(1, Ordering::Relaxed);
                 *s.last_error.lock().unwrap() = why;
-                false
+                // The request failed, but the loop may have landed one while
+                // it was failing -- and the caller asked to be registered,
+                // not to have this particular packet arrive.
+                stop_when_registered && s.beats_ok.load(Ordering::Relaxed) > 0
             }
         };
         s.ring();

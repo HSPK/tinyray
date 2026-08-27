@@ -894,9 +894,9 @@ MUTANTS = [
         "leave() says goodbye for a member that was never there",
         RS_LIB,
         "            if s.beats_ok.load(Ordering::Relaxed) > 0 {\n"
-        "                py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5)));\n"
+        "                py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5), false));\n"
         "            }",
-        "            py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5)));",
+        "            py.allow_threads(|| beat_once(&rt, &s, Duration::from_secs(5), false));",
         "tests/test_join_needs_the_registry.py"
         "::test_the_budget_covers_reaching_the_registry_not_just_the_wait",
     ),
@@ -958,7 +958,7 @@ MUTANTS = [
         PY_INIT,
         "    if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):",
         "    if not c.start(int(timeout * 1000)):",
-        "tests/test_network_faults.py::test_the_first_beat_is_retried_rather_than_waited_out",
+        "tests/test_network_faults.py::test_ctrl_c_during_join_is_not_swallowed_until_the_timeout",
     ),
     (
         "never joined and already left give the same message",
@@ -999,6 +999,14 @@ MUTANTS = [
         "        if given_args is not None and not isinstance(given_args, list):",
         "        if False:",
         "tests/test_rpc_raw.py::test_a_malformed_envelope_is_the_callers_fault_not_a_maybe",
+    ),
+    (
+        "the first beat ignores the loop's ack and waits out its own budget",
+        RS_BEAT,
+        "            _ = s.acked.notified(), if stop_when_registered => None,",
+        "            _ = s.acked.notified(), if false => None,",
+        "tests/test_network_faults.py"
+        "::test_join_returns_when_the_loop_registers_not_when_the_first_beat_gives_up",
     ),
 ]
 
