@@ -206,3 +206,46 @@ def test_flush_says_the_seat_was_taken_rather_than_blaming_the_registry(registry
             me.leave()
         except Exception:
             pass
+
+
+def test_a_superseded_member_stops_beating_instead_of_hammering_the_registry(registry):
+    """被顶替之后再拍下去，只是在等接任者死掉好把座位抢回来。
+
+    这条一直没人钉，而少了它不是"慢一点"：实测 ttl 2000（间隔 500ms），
+    被顶替后 6 秒内
+
+        有 `if !alive { return }`   beats_ok +0
+        没有                        beats_ok +117
+
+    每秒约 19.5 个请求，而且已经不受心跳间隔约束了 —— 注册表对一个不被接受的
+    成员不会 park 它，于是循环退化成一个不会停的压测器。
+    """
+    me = tinyray.join("seat", "stateful", slot=0)
+    later = None
+    try:
+        me.ready(who="mine")
+        me.flush()
+        c = tinyray._client
+        assert c is not None
+
+        later = _hold("default", "later")
+        deadline = time.monotonic() + 15
+        while c.accepted and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not c.accepted, "座位没有被接管，这条测试没测到东西"
+
+        before = c.stats()
+        time.sleep(2.0)  # 至少四个心跳间隔
+        after = c.stats()
+
+        sent = (after["beats_ok"] - before["beats_ok"]) + (
+            after["beats_failed"] - before["beats_failed"]
+        )
+        assert sent == 0, f"被顶替后两秒里还发了 {sent} 次心跳"
+    finally:
+        if later is not None:
+            _release(later)
+        try:
+            me.leave()
+        except Exception:
+            pass

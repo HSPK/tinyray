@@ -547,7 +547,7 @@ class _Watching:
             # Read the digest before the revision, never after. Whichever way a
             # change lands between the two reads, this order costs a duplicate
             # snapshot instead of a lost one.
-            self._digest = self._c.field_digest(pool._name, self._fields, False)
+            self._digest = self._c.field_digest(pool._name, self._fields)
         else:
             # `since` names a moment we have no digest for. Taking today's
             # instead used to swallow every change in the gap -- measured: a
@@ -614,7 +614,7 @@ class _Watching:
             # Something moved, but maybe not anything this watcher named. Ask
             # the cache directly: building the snapshot to find out would be
             # the whole cost we are trying to avoid.
-            digest = self._c.field_digest(self._pool._name, self._fields, False)
+            digest = self._c.field_digest(self._pool._name, self._fields)
             if digest != self._digest:
                 self._digest = digest
                 return self._pool.snapshot(), 0

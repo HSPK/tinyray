@@ -469,7 +469,7 @@ MUTANTS = [
     (
         "a field-scoped watch yields on everything anyway",
         PY_INIT,
-        "            digest = self._c.field_digest(self._pool._name, self._fields, False)\n"
+        "            digest = self._c.field_digest(self._pool._name, self._fields)\n"
         "            if digest != self._digest:\n"
         "                self._digest = digest\n"
         "                return self._pool.snapshot(), 0",
@@ -789,7 +789,7 @@ MUTANTS = [
         "a watcher resuming from since= baselines its digest on today",
         PY_INIT,
         "            self._digest = _NO_DIGEST",
-        "            self._digest = self._c.field_digest(pool._name, self._fields, False)",
+        "            self._digest = self._c.field_digest(pool._name, self._fields)",
         "tests/test_watch_lifecycle.py"
         "::test_a_watch_on_fields_does_not_lose_what_happened_before_since",
     ),
@@ -810,7 +810,7 @@ MUTANTS = [
     (
         "flush blames the registry for a seat that was taken",
         PY_INIT,
-        '            if not self._c.accepted:\n'
+        "            if not self._c.accepted:\n"
         '                raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")',
         '            if False:\n                raise SeatTaken("")',
         "tests/test_seats.py::test_flush_says_the_seat_was_taken_rather_than_blaming_the_registry",
@@ -821,6 +821,20 @@ MUTANTS = [
         "            if *rev != since {\n                return *rev;\n            }",
         "            if false {\n                return *rev;\n            }",
         "tests/test_event_driven.py::test_a_wait_handed_a_revision_already_passed_returns_at_once",
+    ),
+    (
+        "a superseded member keeps beating",
+        RS_BEAT,
+        "                    if !alive {\n"
+        "                        // Superseded. Beating on would only be waiting for the\n"
+        "                        // replacement to die so we could take the seat back.\n"
+        "                        shared.ring();\n"
+        "                        return;\n"
+        "                    }",
+        "                    if false {\n                        shared.ring();\n"
+        "                        return;\n                    }",
+        "tests/test_seats.py"
+        "::test_a_superseded_member_stops_beating_instead_of_hammering_the_registry",
     ),
 ]
 

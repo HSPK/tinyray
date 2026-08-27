@@ -264,7 +264,12 @@ impl Client {
     /// up in its published state. Identity is always part of the hash: a seat
     /// changing hands matters even when the new tenure publishes exactly what
     /// the old one did.
-    fn field_digest(&self, pool: &str, fields: Vec<String>, require_ready: bool) -> Option<u64> {
+    ///
+    /// Every member is hashed, ready or not. There used to be a require_ready
+    /// argument here, and both call sites always passed false -- readiness is
+    /// asked for by name, as `fields=["ready"]`, which is the same question
+    /// without a second way to spell it.
+    fn field_digest(&self, pool: &str, fields: Vec<String>) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let cache = self.shared.cache.read().unwrap();
         let c = cache.get(pool)?;
@@ -273,9 +278,6 @@ impl Client {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for id in ids {
             let m = &c.members[id];
-            if require_ready && !m.ready {
-                continue;
-            }
             m.id.hash(&mut h);
             m.incarnation.hash(&mut h);
             for f in &fields {

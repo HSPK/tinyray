@@ -32,7 +32,7 @@ class Client:
         """Publish state without touching readiness."""
 
     def is_ready(self) -> bool: ...
-    def field_digest(self, pool: str, fields: list[str], require_ready: bool) -> int | None:
+    def field_digest(self, pool: str, fields: list[str]) -> int | None:
         """A hash over only these fields of every member, plus who is present."""
 
     def registry(self) -> tuple[int, str]:
