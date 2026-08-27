@@ -1332,6 +1332,11 @@ class Member:
 # One beat plus slack: long enough for the registry's first answer, short
 # enough that a dead registry does not turn every lookup into a stall.
 _FIRST_ANSWER_S = 2.0
+# How long the one synchronous beat inside join() may spend before the loop
+# takes over. Short on purpose: a lost packet is cheaper to re-send than to
+# wait out, and the loop re-sends every interval. join(timeout=) still bounds
+# the whole call -- this only decides how the budget is spent inside it.
+_FIRST_BEAT_S = 5.0
 
 # Matches MAX_STATE in the registry: a fact about where something is, not the
 # something. See tests/test_state_budget.py for the amplification measurement.
@@ -1483,7 +1488,14 @@ def join(
     # never shorten it: measured against a registry that accepts connections
     # and never replies, join(timeout=0.5) took 10502ms and join(timeout=8)
     # took 18004ms -- always the budget plus ten.
-    if not c.start(int(timeout * 1000)):
+    #
+    # The first beat gets a short slice of it rather than all of it, because
+    # retrying beats waiting: the loop below re-sends every interval, while one
+    # long attempt has nothing behind it. Handing over the whole budget was
+    # measured on a 40%-loss link at a median join of 32.7s against a 30s
+    # budget -- every start paying the deadline in full -- and it doubled the
+    # lossy-link test from 7:22 to 17:06.
+    if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):
         # Losing the registry later is survivable -- the cache carries the
         # process. Never reaching it is not: there is nothing to carry, and
         # the process would publish state nobody sees and wait for peers who

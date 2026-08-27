@@ -228,3 +228,50 @@ def test_the_first_beat_deadline_survives_a_lossy_link(registry):
     assert len(failures) <= tolerated, (
         f"{len(failures)}/{launches} 次启动失败，超过实测到的 1/120:\n" + "\n".join(failures[:3])
     )
+
+
+TIMED_JOIN = textwrap.dedent(
+    """
+    import sys, time, tinyray
+    t0 = time.monotonic()
+    m = tinyray.join("l", "churn", timeout=30.0)
+    print(f"{time.monotonic() - t0:.2f}", flush=True)
+    m.leave()
+    """
+)
+
+
+def test_the_first_beat_is_retried_rather_than_waited_out(registry):
+    """`join(timeout=)` 是整通调用的上界，但**怎么花**这份预算是另一件事。
+
+    首拍是同步的。把整份预算交给它，丢包链路上就变成一次长等而没有任何重试：
+    实测 40% 丢包、`timeout=30`，12 次启动中位 **32.7s**，合计 317s —— 每次都
+    把截止时间花满，还得靠后台循环偷偷补上一拍才算成功。慢测试也因此从 7:22
+    变成 17:06。
+
+    首拍改成只拿 `min(timeout, 5s)` 之后，丢了的那一拍由循环每个间隔重发：
+    同样 12 次启动中位 **5.1s**、合计 85s，失败仍是 0。
+
+    这条测试盯的是比率而不是有无，所以取中位数：一次长等的中位会贴着预算，
+    快速重试的中位贴着一次往返。
+    """
+    took = []
+    for seed in range(400, 406):
+        proxy = FaultyProxy(registry.endpoint, drop_rate=0.4, seed=seed)
+        try:
+            env = dict(os.environ, TINYRAY_REGISTRY=proxy.endpoint)
+            out = subprocess.run(
+                [sys.executable, "-c", TIMED_JOIN],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert out.returncode == 0, out.stderr[-500:]
+            took.append(float(out.stdout.strip()))
+        finally:
+            proxy.close()
+
+    took.sort()
+    median = took[len(took) // 2]
+    assert median < 15.0, f"首拍在把预算等满而不是重试：中位 {median:.1f}s，全部 {took}"

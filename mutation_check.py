@@ -885,7 +885,7 @@ MUTANTS = [
     (
         "join's budget starts only after the first beat has spent its own",
         PY_INIT,
-        "    if not c.start(int(timeout * 1000)):",
+        "    if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):",
         "    if not c.start():",
         "tests/test_join_needs_the_registry.py"
         "::test_the_budget_covers_reaching_the_registry_not_just_the_wait",
@@ -952,6 +952,13 @@ MUTANTS = [
         "        }",
         "        self.waiters.clear();",
         "tests/test_seats.py::test_a_superseded_process_stops_answering",
+    ),
+    (
+        "the first beat is handed the whole budget instead of a slice",
+        PY_INIT,
+        "    if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):",
+        "    if not c.start(int(timeout * 1000)):",
+        "tests/test_network_faults.py::test_the_first_beat_is_retried_rather_than_waited_out",
     ),
 ]
 
