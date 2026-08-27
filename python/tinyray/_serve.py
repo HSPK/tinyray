@@ -87,8 +87,17 @@ def scan(obj: Any) -> dict[str, Callable[..., Any]]:
 
     A property is not a method. Neither is a `cached_property`, and neither is
     data. What they have in common is that the object found on the class is
-    not itself callable -- which is the whole test, with `classmethod` the one
-    exception, being a method that is not a callable object until it is bound.
+    not itself callable -- which is nearly the whole test, with two exceptions
+    either way: `classmethod` is a method that is not a callable object until
+    it is bound, and a *class* is a callable object that is not a method.
+
+    A class bound on the served class -- a nested one, an imported enum, a
+    dataclass kept as `Request = SomeDataclass` -- used to be published like
+    any other method. Measured on a class holding three of them: all three
+    appeared in the list. That list rides on every heartbeat, is stored per
+    pool, is what every peer is shown, and has a size limit, and calling one
+    of them builds an object on the far side that then fails to encode. None
+    of that is what the caller meant by `serves=`.
     """
     out: dict[str, Callable[..., Any]] = {}
     for name in dir(obj):
@@ -104,8 +113,11 @@ def scan(obj: Any) -> dict[str, Callable[..., Any]]:
             attr = getattr(obj, name)
         else:
             continue
-        if not callable(attr):
+        if not callable(attr) or isinstance(attr, type):
             continue
+        # 一道就够，而且是这一道：真正被调用的是 `attr`。挡在 `static` 上
+        # 那一道写过又删了 —— 实测单独去掉它，两条测试照样绿，因为类属性取出来
+        # 还是同一个类。挡在结果上还能顺带管住代理那条路。
         # The name goes in the URL path of every call, so it has to survive
         # being put there. `def 处理(self)` is legal Python and registered
         # fine, and then the call arrived asking for

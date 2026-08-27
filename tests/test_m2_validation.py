@@ -275,3 +275,69 @@ def test_arguments_that_do_not_fit_are_the_callers_mistake(typed, label, call):
     assert not isinstance(e.value, tinyray.RemoteError), (
         f"{label}: 报成了远端方法抛异常，可它根本没跑"
     )
+
+
+def test_a_class_on_the_served_object_is_not_a_method():
+    """判据本来是"类上找到的东西自己可不可调用"。类恰好可调用，于是嵌套类、
+    绑上去的枚举、留作 `Request = SomeDataclass` 的数据类，全都被当成远程方法
+    发布了出去 —— 实测一个挂了三个类的对象，三个全在列表里。
+
+    那份列表随每一拍心跳上行、按池存下来、是每个对端看到的东西，而且有体积
+    上限；调用其中一个会在对面构造一个对象，然后编码失败。`serves=` 的人要的
+    不是这些。
+
+    可调用的**实例**是另一回事，要留着：partial、staticmethod、classmethod，
+    以及自己定义了 `__call__` 的对象。
+    """
+    import enum
+    import functools
+
+    class Helper:
+        def __init__(self, a: int = 1) -> None:
+            self.a = a
+
+    class Colour(enum.Enum):
+        RED = 1
+
+    class Callable_:
+        def __call__(self) -> str:
+            return "called"
+
+    class Served:
+        # 类体不参与闭包查找，所以绑定名不能和外面那个类同名
+        helper_cls = Helper
+        colour_cls = Colour
+        instance = Callable_()
+        make = staticmethod(lambda: "static")
+        factory = functools.partial(lambda self: "partial", None)
+
+        class Nested:
+            pass
+
+        @classmethod
+        def cm(cls) -> str:
+            return "cm"
+
+        def ping(self) -> str:
+            return "pong"
+
+    got = set(_serve.scan(Served()))
+    assert got == {"ping", "cm", "make", "factory", "instance"}, sorted(got)
+
+
+def test_a_proxy_that_answers_with_a_class_is_not_serving_a_method():
+    """代理走的是另一条分支：`__dir__` 和 `__getattr__` 一起作答，类上什么也
+    没有，所以只能问实例。那条路上同样要挡住类。"""
+
+    class Proxy:
+        def __dir__(self):
+            return ["real", "a_class"]
+
+        def __getattr__(self, name: str):
+            if name == "a_class":
+                return dict  # 一个类，可调用，但不是方法
+            if name == "real":
+                return lambda: "yes"
+            raise AttributeError(name)
+
+    assert set(_serve.scan(Proxy())) == {"real"}

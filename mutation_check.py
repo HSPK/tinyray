@@ -978,6 +978,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py"
         "::test_wait_replacement_wants_exactly_one_of_slot_or_identity",
     ),
+    (
+        "a class bound on the served object is published as a method",
+        "python/tinyray/_serve.py",
+        "        if not callable(attr) or isinstance(attr, type):",
+        "        if not callable(attr):",
+        "tests/test_m2_validation.py::test_a_class_on_the_served_object_is_not_a_method",
+    ),
 ]
 
 
