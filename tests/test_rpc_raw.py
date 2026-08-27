@@ -563,3 +563,47 @@ def test_the_server_outwaits_the_client_on_an_idle_connection():
     assert _serve.BODY_TIMEOUT < _serve.IDLE_TIMEOUT, (
         "还没说过话的连接不该比 keep-alive 拿到更长的宽限"
     )
+
+
+@pytest.mark.parametrize(
+    "body,why",
+    [
+        (b'{"args": 5}', "args 不是数组"),
+        (b'{"args": "ab"}', "args 是字符串"),
+        (b'{"kwargs": 5}', "kwargs 不是对象"),
+        (b'{"kwargs": [1]}', "kwargs 是数组"),
+    ],
+    ids=["args-int", "args-str", "kwargs-int", "kwargs-list"],
+)
+def test_a_malformed_envelope_is_the_callers_fault_not_a_maybe(served, body, why):
+    """信封拆不开时，方法一步都没跑过 —— 那是调用方写错了。
+
+    从前 `list(5)` 抛的是裸 `TypeError`，而 `_dispatch` 只接
+    `JSONDecodeError` 和 `msgspec.ValidationError`，于是它从两者之间漏了出去，
+    答 **HTTP 500**；调用方把 ≥500 读作 `OutcomeUnknown`，也就是"可能已经整个
+    跑完了"。实测 `{"args": 5}` 答 500，而 `{"args": "ab"}` 答 422 —— 同一类
+    错误，两种说法。
+
+    文档对这条线说得很清楚：参数装不进签名也没跑过，但那是调用方写错了，所以
+    走 `TypeError` 而不是 `Unreachable`。信封拆不开是同一件事。
+    """
+    got = _raw(served, _post(b"/call/echo", str(len(body)).encode()), body)
+    assert got.split(b"\r\n")[0].split()[1] == b"422", (why, got[:120])
+    assert b"has to be an" in got, got[-160:]
+
+
+def test_a_malformed_envelope_does_not_poison_the_connection(served):
+    """422 之后连接还得能用 —— 拆信封失败不该让流失去同步。"""
+    s = socket.create_connection(("127.0.0.1", served), timeout=20)
+    try:
+        bad = b'{"args": 5}'
+        s.sendall(_post(b"/call/echo", str(len(bad)).encode()) + bad)
+        assert b"422" in s.recv(8192).split(b"\r\n")[0]
+
+        good = b'{"args": [7]}'
+        s.sendall(_post(b"/call/echo", str(len(good)).encode()) + good)
+        again = s.recv(8192)
+        assert b"200" in again.split(b"\r\n")[0], again[:120]
+        assert b'"result": 7' in again, again[-120:]
+    finally:
+        s.close()

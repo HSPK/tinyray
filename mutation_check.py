@@ -993,6 +993,13 @@ MUTANTS = [
         "        want = wanted(names[i]) if i < len(names) else None",
         "tests/test_m2_validation.py::test_the_annotation_covers_every_value_it_names",
     ),
+    (
+        "an envelope that cannot be unpacked comes back as maybe-ran",
+        "python/tinyray/_serve.py",
+        "        if given_args is not None and not isinstance(given_args, list):",
+        "        if False:",
+        "tests/test_rpc_raw.py::test_a_malformed_envelope_is_the_callers_fault_not_a_maybe",
+    ),
 ]
 
 

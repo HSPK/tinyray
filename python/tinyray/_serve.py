@@ -177,8 +177,24 @@ def _coerce(
 ) -> tuple[list, dict]:
     """Unpack {"args": [...], "kwargs": {...}} and check it against annotations."""
     if isinstance(payload, dict) and set(payload) <= {"args", "kwargs"}:
-        args = list(payload.get("args") or [])
-        kwargs = dict(payload.get("kwargs") or {})
+        # Checked rather than coerced, because `list(5)` raises a plain
+        # TypeError, which is neither of the two this is wrapped in -- it came
+        # back as HTTP 500 and reached the caller as OutcomeUnknown, "it may
+        # have run in full", for a request whose arguments were never
+        # unpacked. Measured: {"args": 5} answered 500 where {"args": "ab"}
+        # answered 422. A malformed envelope is the caller's mistake and
+        # nothing has run, exactly like an argument that does not fit.
+        given_args, given_kwargs = payload.get("args"), payload.get("kwargs")
+        if given_args is not None and not isinstance(given_args, list):
+            raise msgspec.ValidationError(
+                f"'args' has to be an array, got {type(given_args).__name__}"
+            )
+        if given_kwargs is not None and not isinstance(given_kwargs, dict):
+            raise msgspec.ValidationError(
+                f"'kwargs' has to be an object, got {type(given_kwargs).__name__}"
+            )
+        args = list(given_args or [])
+        kwargs = dict(given_kwargs or {})
     elif isinstance(payload, dict):
         args, kwargs = [], dict(payload)  # curl shorthand: a bare object is kwargs
     elif isinstance(payload, list):
