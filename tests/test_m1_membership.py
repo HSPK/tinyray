@@ -170,10 +170,16 @@ def test_slotted_policy_requires_a_seat(registry):
 
 
 def test_lookup_before_join_is_explicit():
+    """三种情形都抛 RuntimeError，而它们需要相反的反应：还没 join、已经 leave、
+    以及 fork 出来的子进程。`_require_client` 特意分开写了三条文案，注释里说
+    "从这里看它们长得一样"—— 那么测试就不能只认类型。
+
+    实测：把"还没 join"那条换成"已经离开了"的文案，五个文件 51 条测试全绿。
+    """
     import importlib
 
     mod = importlib.reload(tinyray)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="before looking anyone up"):
         mod.pool("anything")
 
 

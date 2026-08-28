@@ -226,13 +226,17 @@ def test_wait_replacement_names_the_new_tenure(registry, kind):
 
 
 def test_wait_replacement_wants_exactly_one_of_slot_or_identity(registry):
+    """错误里要说出**是哪个函数** —— 两条路各自把自己的名字传给
+    `_replacement_target`，而这段管线除了这里没人守。只认 TypeError 的话，
+    异步那条报成同步那条的名字也一样绿。"""
     with tinyray.join("p", slot=0, size=1) as m:
         m.ready()
         pool = tinyray.pool("p")
-        with pytest.raises(TypeError):
-            pool.wait_replacement()
-        with pytest.raises(TypeError):
-            pool.wait_replacement(slot=0, identity="p/0#1")
+        for bad in ({}, {"slot": 0, "identity": "p/0#1"}):
+            with pytest.raises(TypeError, match=r"wait_replacement\(\) takes exactly one"):
+                pool.wait_replacement(**bad)
+            with pytest.raises(TypeError, match=r"await_replacement\(\) takes exactly one"):
+                asyncio.run(tinyray.apool("p").await_replacement(**bad))
 
 
 def test_await_fenced_holds_no_executor_thread_either(long_lease):

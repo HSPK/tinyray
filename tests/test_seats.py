@@ -118,7 +118,7 @@ SURVIVOR = textwrap.dedent(
 )
 
 
-def test_a_superseded_process_stops_answering(registry):
+def test_a_superseded_process_stops_answering(long_lease):
     """The registry refuses a ghost's heartbeat, but nothing stops the ghost
     itself: it keeps running with its port open, and a caller holding the old
     handle would get a cheerful reply from the wrong process. The identity
@@ -151,31 +151,33 @@ def test_a_superseded_process_stops_answering(registry):
         # still listening, and only the registry's answer to its own heartbeat
         # tells it otherwise -- but that heartbeat is parked, and taking the
         # seat drains the pool's waiters before the taker's reply is even
-        # built, so it learns at once. Measured over nine runs: the window
-        # between the takeover completing and the ghost refusing was 0ms in
-        # eight and 1ms in the ninth, and across ~100 calls per run through the
-        # stale handle not one reached the ghost.
+        # built, so it learns without waiting for its next beat.
         #
-        # The count is what discriminates, not the clock. With the wake taken
-        # out of bump() the window is 79-92ms -- long enough to look instant,
-        # short enough that any bound loose enough not to flake would pass --
-        # and 28 to 32 calls land on the ghost. This used to poll for 20
-        # seconds *after* waiting for gen-2 to become visible, which spent the
-        # whole window before it started looking.
+        # A long lease is what makes the two cases far apart enough to tell
+        # apart. At the default 2s lease the interval is 500ms and a ghost that
+        # is *not* woken still finds out within a fraction of a second, so the
+        # only thing separating them is how many calls slip through -- and that
+        # is a rate, which moves with the machine. Calibrated on an idle box it
+        # said 0; run beside a benchmark it said 59, and the assertion was
+        # wrong rather than the code. Here the interval is 5s, so a ghost that
+        # has to wait for its own beat waits seconds, not milliseconds.
+        elapsed = None
         answered = 0
-        refused = None
         t0 = time.monotonic()
-        while time.monotonic() - t0 < 2.0:
+        while time.monotonic() - t0 < 20.0:
             try:
                 stale.whoami()
                 answered += 1
-            except tinyray.Fenced as exc:
-                refused = exc
+            except tinyray.Fenced:
+                elapsed = time.monotonic() - t0
                 break
-        assert refused is not None, (
+        assert elapsed is not None, (
             f"the ghost kept serving its old identity for {answered} call(s)"
         )
-        assert answered <= 2, f"{answered} call(s) reached the ghost before it noticed"
+        assert elapsed < 1.0, (
+            f"the ghost took {elapsed * 1000:.0f}ms and {answered} call(s) to notice, "
+            f"which is its own beat telling it rather than the seat being taken"
+        )
 
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:

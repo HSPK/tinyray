@@ -154,7 +154,17 @@ def test_a_restart_does_not_freeze_the_cache(registry):
 
 
 def test_membership_regrows_after_a_restart(registry):
-    """The plain case: soft state means nothing has to be recovered."""
+    """The plain case: soft state means nothing has to be recovered.
+
+    The tail of this used to poll until `len(all()) == 3` and then assert it,
+    which a cache that never shrank satisfies from the first look -- measured:
+    with both the client's epoch clear and the registry's position check
+    disabled, it still passed. "It grew back" and "it never moved" cannot be
+    told apart by a number that is the same either way.
+
+    So the roster has to *grow past* where it was. A newcomer that joins only
+    after the restart cannot be in anybody's stale cache.
+    """
     peers = []
     for _ in range(3):
         p = subprocess.Popen(
@@ -176,12 +186,15 @@ def test_membership_regrows_after_a_restart(registry):
         assert len(tinyray.pool("w").all()) == 3
         registry.start()
 
+        peers.append(_spawn(NEWCOMER))
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
-            if len(tinyray.pool("w").all()) == 3 and me.silence_ms < 2000:
+            if len(tinyray.pool("w").all()) == 4 and me.silence_ms < 2000:
                 break
             time.sleep(0.1)
-        assert len(tinyray.pool("w").all()) == 3
+        assert len(tinyray.pool("w").all()) == 4, (
+            "重启之后新来的成员没有出现 —— 名单没有真的重新建立起来"
+        )
     finally:
         for p in peers:
             _stop(p)

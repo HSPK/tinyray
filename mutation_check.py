@@ -960,6 +960,24 @@ MUTANTS = [
         "    if not c.start(int(timeout * 1000)):",
         "tests/test_network_faults.py::test_the_first_beat_is_retried_rather_than_waited_out",
     ),
+    (
+        "never joined and already left give the same message",
+        PY_INIT,
+        '    raise RuntimeError("call tinyray.join(...) before looking anyone up")',
+        "    raise RuntimeError(\n"
+        '        "this process has left; a lookup after leave() cannot work. "\n'
+        '        "Background threads outliving leave() are the usual cause."\n'
+        "    )",
+        "tests/test_m1_membership.py::test_lookup_before_join_is_explicit",
+    ),
+    (
+        "the async replacement wait names the synchronous one in its error",
+        PY_INIT,
+        'self._replacement_target(slot, identity, "await_replacement")',
+        'self._replacement_target(slot, identity, "wait_replacement")',
+        "tests/test_watch_lifecycle.py"
+        "::test_wait_replacement_wants_exactly_one_of_slot_or_identity",
+    ),
 ]
 
 
