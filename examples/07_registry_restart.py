@@ -66,6 +66,20 @@ def run_observer(_: list[str]) -> None:
             f"[observer] registry back: {len(peers.all())} peers, silence_ms={me.silence_ms}",
             flush=True,
         )
+
+        # Waiting for our own beat to land says nothing about the peers: they
+        # are three other processes, each with its own interval, and the
+        # registry came back empty. So wait for the roster itself.
+        #
+        # This used to assert straight after the loop above. Measured at that
+        # point on two cores: HEAD saw 1, 2 or 3 peers and needed another
+        # 20-40ms, v0.12.0 saw 3 every time. Something shifted the timing by a
+        # few tens of milliseconds; what, is not established, and the check was
+        # a race in both -- one of them just lost it more often.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and len(peers.all()) < PEERS:
+            time.sleep(0.05)
+        print(f"[observer] roster regrew to {len(peers.all())} peers", flush=True)
         assert len(peers.all()) == PEERS, "the roster did not regrow"
 
 

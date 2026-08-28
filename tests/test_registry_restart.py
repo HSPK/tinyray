@@ -459,3 +459,53 @@ def test_asking_from_a_version_the_registry_never_issued_gets_the_whole_roster(r
         assert behind is not None and not behind["full"], (
             f"普通的落后一版被当成了全量重发：{behind}"
         )
+
+
+def test_a_member_that_died_while_the_registry_was_down_is_gone_when_it_returns(registry):
+    """ "名单长回来了"和"名单从来没缩过"，用数目是分不开的。
+
+    上面那条测试轮询到 `len(all()) == 3` 为止 —— 而一份陈旧的缓存**一开始**
+    就满足它，所以它对着 bug 也一样绿。
+
+    杀掉一个成员就把时序从判据里拿掉了：它再也不会回来。陈旧缓存会永远显示
+    三个，而一个真的把位置读对了的客户端会收敛到两个。
+
+    **没有为它准备变异体，这一点需要说明。** 陈旧名单要两道锁同时失效才会
+    出现：客户端靠 epoch 察觉重启、清空缓存（第一道），注册表拒绝回答一个
+    自己从没发过的位置（第二道，state.rs 里的注释也这么写）。两道各自都够，
+    所以任何**单点**改动都被另一道兜住 —— 实测分别关掉其中一道，这条测试
+    三次全绿。两道一起关掉时它才变红，而原来那条 `test_membership_regrows_
+    after_a_restart` 即便如此仍然是绿的。
+
+    也正因为两道锁各自都够，v0.12.0 —— 只有第一道 —— 跑这条测试三次全过。
+    我一度以为 examples/07 在 v0.12.0 上是靠陈旧名单蒙混过关的，这条测试
+    证明不是。那个示例的检查在两个版本上都是竞态，只是输赢频率不同。
+    """
+    peers = [_spawn(NEWCOMER) for _ in range(3)]
+    me = tinyray.join("obs", "churn")
+    me.ready()
+    try:
+        assert len(tinyray.pool("w").wait(count=3, timeout=20)) == 3
+
+        registry.stop()
+        time.sleep(registry.ttl_ms / 1000 * 1.5)
+        # 停机期间照样能从缓存里查到 —— 这本来就是设计
+        assert len(tinyray.pool("w").all()) == 3
+
+        doomed = peers.pop()
+        doomed.kill()  # 没有告别：注册表都不在，它也没处说
+        doomed.wait(timeout=10)
+
+        registry.start()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if len(tinyray.pool("w").all()) == 2 and me.silence_ms < 2000:
+                break
+            time.sleep(0.1)
+        assert len(tinyray.pool("w").all()) == 2, (
+            "重启之后名单还是三个 —— 那是重启前的缓存，不是注册表现在知道的东西"
+        )
+    finally:
+        for p in peers:
+            _stop(p)
+        me.leave()
