@@ -37,6 +37,7 @@ nav:
   - 上手: getting-started.md
   - API 参考: api.md
   - 更新日志: changelog.md
+  - 基准: bench.md
   - 为什么: 01-why.md
   - 是什么: 02-design.md
   - 怎么做: 03-plan.md

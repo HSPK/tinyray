@@ -1,0 +1,105 @@
+{
+  "label": "HEAD",
+  "python": "3.11.15",
+  "scenarios": {
+    "async_call": {
+      "calls": 1000,
+      "max_ms": 10.832,
+      "p50_ms": 1.344,
+      "p90_ms": 1.446,
+      "p99_ms": 1.84,
+      "took_s": 1.7
+    },
+    "discovery": {
+      "changes": 10,
+      "max_ms": 52.162,
+      "p50_ms": 51.054,
+      "p90_ms": 52.162,
+      "p99_ms": 52.162,
+      "took_s": 0.9
+    },
+    "idle_beat_rate": {
+      "beats_per_s": 2.0,
+      "interval_ms": 500,
+      "took_s": 7.2
+    },
+    "join_cold_start": {
+      "max_ms": 43.55,
+      "over_15ms": 19,
+      "p50_ms": 1.72,
+      "p90_ms": 42.52,
+      "p99_ms": 43.55,
+      "starts": 40,
+      "took_s": 7.2,
+      "under_5ms": 21
+    },
+    "lookup_scaling": {
+      "10": {
+        "all_ms": 0.019,
+        "epoch_ms": 0.02,
+        "field_digest_ms": 0.001,
+        "pick_filtered_ms": 0.006,
+        "snapshot_ms": 0.017
+      },
+      "100": {
+        "all_ms": 0.14,
+        "epoch_ms": 0.146,
+        "field_digest_ms": 0.009,
+        "pick_filtered_ms": 0.025,
+        "snapshot_ms": 0.141
+      },
+      "1000": {
+        "all_ms": 1.538,
+        "epoch_ms": 1.569,
+        "field_digest_ms": 0.093,
+        "pick_filtered_ms": 0.207,
+        "snapshot_ms": 1.55
+      },
+      "took_s": 1.6
+    },
+    "publish": {
+      "flush_p50_ms": 692.92,
+      "took_s": 14.7,
+      "update_changed_us": 3.0,
+      "update_same_us": 3.0
+    },
+    "rpc_error": {
+      "ok_p50_ms": 0.789,
+      "raising_p50_ms": 0.946,
+      "took_s": 1.8
+    },
+    "rpc_latency": {
+      "calls": 2000,
+      "max_ms": 10.377,
+      "p50_ms": 0.675,
+      "p90_ms": 0.746,
+      "p99_ms": 1.039,
+      "took_s": 1.8
+    },
+    "rpc_payload_64k": {
+      "bytes": 65536,
+      "max_ms": 2.051,
+      "p50_ms": 1.374,
+      "p90_ms": 1.464,
+      "p99_ms": 1.93,
+      "took_s": 1.2
+    },
+    "rpc_throughput": {
+      "calls_per_s": 860,
+      "threads": 8,
+      "took_s": 5.8
+    },
+    "watch_wakeup": {
+      "fields_supported": true,
+      "took_s": 4.8,
+      "wakeup": {
+        "max_ms": 52.001,
+        "p50_ms": 50.928,
+        "p90_ms": 52.001,
+        "p99_ms": 52.001
+      },
+      "wakeups_for_10_unwatched_changes": 0,
+      "woken_by_the_watched_key": true
+    }
+  }
+}
