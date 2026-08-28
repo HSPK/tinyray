@@ -38,6 +38,10 @@ class Client:
     def registry(self) -> tuple[int, str]:
         """(protocol, version) as last reported by the registry."""
 
+    def publish_versions(self) -> tuple[int, int]:
+        """(published locally, acked by the registry). flush() waits for the
+        second to reach the first."""
+
     def add_wake_fd(self, fd: int) -> None:
         """Also write a byte to `fd` whenever the bell rings."""
 

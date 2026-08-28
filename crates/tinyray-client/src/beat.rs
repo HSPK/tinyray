@@ -57,6 +57,10 @@ pub struct Shared {
     /// Set when the registry refused because the pool's shape was disagreed
     /// with, as opposed to the seat being held by a later tenure.
     pub refused: Mutex<String>,
+    /// The published version the registry has acked. Only ever moves forward:
+    /// a beat composed before a change can be answered after it, and that ack
+    /// says nothing about the newer state.
+    pub confirmed: AtomicU64,
     pub interval_ms: AtomicU64,
     /// How long we let the registry sit on an answer that says nothing. Set to
     /// the interval we would otherwise have slept, so the request rate is the
@@ -121,6 +125,11 @@ pub struct Shared {
 pub struct Published {
     pub state: serde_json::Value,
     pub ready: bool,
+    /// Bumped whenever the pair above changes, under the same lock, so a beat
+    /// composed from it carries a number that says exactly which version it is
+    /// showing the registry. flush() needs that: counting beats cannot tell an
+    /// ack for the state it published from an ack for the one before it.
+    pub version: u64,
 }
 
 impl Shared {
@@ -154,7 +163,7 @@ impl Shared {
         now.saturating_sub(self.last_ok_ms.load(Ordering::Relaxed))
     }
 
-    fn compose(&self) -> Beat {
+    fn compose(&self) -> (Beat, u64) {
         let published = self.published.lock().unwrap().clone();
         let cache = self.cache.read().unwrap();
         let watch = self.watch.lock().unwrap().clone();
@@ -179,7 +188,7 @@ impl Shared {
             seen,
             hold_ms: self.hold_ms.load(Ordering::Relaxed),
         };
-        beat
+        (beat, published.version)
     }
 
     /// Returns false once the seat has been taken by a later tenure.
@@ -273,6 +282,14 @@ impl Shared {
 }
 
 type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
+
+/// hyper's connector leaves Nagle on, which pairs with the peer's delayed ACK
+/// to add a fixed stall to a small write that follows another one closely.
+fn nodelay_connector() -> hyper_util::client::legacy::connect::HttpConnector {
+    let mut c = hyper_util::client::legacy::connect::HttpConnector::new();
+    c.set_nodelay(true);
+    c
+}
 
 /// A beat is small and local; anything slower than this is a lost packet, not
 /// a slow server. Without a deadline a single dropped packet hangs the caller
@@ -369,7 +386,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             .timer(TokioTimer::new())
             .http2_only(true)
             .pool_idle_timeout(Duration::from_secs(60))
-            .build_http();
+            .build(nodelay_connector());
         let mut cancelled_last = false;
         loop {
             if shared.leaving.load(Ordering::Relaxed) && shared.beats_ok.load(Ordering::Relaxed) > 0
@@ -378,7 +395,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 return;
             }
             let started = std::time::Instant::now();
-            let mut beat = shared.compose();
+            let (mut beat, showing) = shared.compose();
             let interval = shared.interval_ms.load(Ordering::Relaxed);
             // The request that replaces a cancelled one is never parked. It
             // carries something the last one did not, so there is nothing to
@@ -439,6 +456,19 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                     let alive = shared.apply(&ack);
                     shared.beats_ok.fetch_add(1, Ordering::Relaxed);
                     shared.mark_ok();
+                    // Only an accepted beat left the state anywhere. A refusal
+                    // -- the seat taken by a later tenure, a state over the
+                    // size cap, a pool whose shape we disagree with -- comes
+                    // back as an ordinary reply with `accepted: false`, and
+                    // the registry never stored what it carried. Counting it
+                    // as confirmed made flush() report that the registry had
+                    // the state when it had refused it: measured as
+                    // test_flush_says_the_seat_was_taken returning instead of
+                    // raising, intermittently, depending on whether the loop
+                    // got a refusal in before it stopped.
+                    if alive {
+                        shared.confirmed.fetch_max(showing, Ordering::Relaxed);
+                    }
                     shared.acked.notify_one();
                     if !alive {
                         // Superseded. Beating on would only be waiting for the
@@ -509,8 +539,8 @@ pub fn beat_once(
         let http: HttpClient = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
             .http2_only(true)
-            .build_http();
-        let mut beat = s.compose();
+            .build(nodelay_connector());
+        let (mut beat, showing) = s.compose();
         // One-shot, with a caller waiting: never parked, and given the
         // caller's budget rather than the loop's. A fixed five seconds here
         // meant join(timeout=) could not make the call shorter -- only longer.
@@ -538,9 +568,14 @@ pub fn beat_once(
                 s.hold_ms
                     .store((ack.ttl_ms / 4).clamp(50, 30_000), Ordering::Relaxed);
                 s.note_registry(&ack);
-                s.apply(&ack);
+                let alive = s.apply(&ack);
                 s.beats_ok.fetch_add(1, Ordering::Relaxed);
                 s.mark_ok();
+                // Same rule as the loop: a refusal is an ordinary reply that
+                // stored nothing, so it confirms nothing.
+                if alive {
+                    s.confirmed.fetch_max(showing, Ordering::Relaxed);
+                }
                 true
             }
             Err(why) => {

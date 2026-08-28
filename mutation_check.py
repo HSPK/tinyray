@@ -1008,6 +1008,58 @@ MUTANTS = [
         "tests/test_network_faults.py"
         "::test_join_returns_when_the_loop_registers_not_when_the_first_beat_gives_up",
     ),
+    (
+        "flush counts beats instead of asking whether its state was acked",
+        PY_INIT,
+        "        mine, _ = self._c.publish_versions()\n"
+        "        deadline = time.monotonic() + timeout\n"
+        "        while True:\n"
+        "            rev = self._c.cache_revision()\n"
+        "            if self._c.publish_versions()[1] >= mine:",
+        '        mine = self._c.stats()["beats_ok"] + 2\n'
+        "        deadline = time.monotonic() + timeout\n"
+        "        while True:\n"
+        "            rev = self._c.cache_revision()\n"
+        '            if self._c.stats()["beats_ok"] >= mine:',
+        "tests/test_long_poll.py::test_flush_waits_for_its_own_state_not_for_two_more_beats",
+    ),
+    (
+        "flush is satisfied by an ack for the state before the one it published",
+        PY_INIT,
+        "            if self._c.publish_versions()[1] >= mine:",
+        "            if self._c.publish_versions()[1] >= mine - 1:",
+        "tests/test_identity_and_fencing.py::test_flush_waits_until_the_registry_has_it",
+    ),
+    (
+        "the beat connection leaves Nagle on, so a close-following beat stalls",
+        RS_BEAT,
+        "    c.set_nodelay(true);",
+        "    c.set_nodelay(false);",
+        "tests/test_long_poll.py"
+        "::test_a_beat_that_follows_close_on_the_last_one_is_not_held_by_nagle",
+    ),
+    (
+        "a refused beat counts as confirmation of the state it carried",
+        RS_BEAT,
+        "                    if alive {\n"
+        "                        shared.confirmed.fetch_max(showing, Ordering::Relaxed);\n"
+        "                    }",
+        "                    shared.confirmed.fetch_max(showing, Ordering::Relaxed);",
+        "tests/test_seats.py::test_a_refused_beat_confirms_nothing",
+    ),
+    (
+        "constructing a Pool does not subscribe, so priming buys nothing",
+        PY_INIT,
+        "    def __init__(self, name: str, client: _Client):\n"
+        "        self._name = name\n"
+        "        self._c = client\n"
+        "        client.watch([name])",
+        "    def __init__(self, name: str, client: _Client):\n"
+        "        self._name = name\n"
+        "        self._c = client",
+        "tests/test_async_lookup_cost.py"
+        "::test_priming_a_pool_keeps_the_first_async_lookup_off_the_loop",
+    ),
 ]
 
 

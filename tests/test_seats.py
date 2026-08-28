@@ -316,3 +316,45 @@ def test_every_wait_says_it_was_fenced_rather_than_blaming_the_pool(registry):
             me.leave()
         except Exception:
             pass
+
+
+def test_a_refused_beat_confirms_nothing(registry):
+    """注册中心拒绝一拍时，它**没有存下**那一拍带的 state —— 所以那一拍什么都没确认。
+
+    拒绝不是错误应答，是一次普通的回复带着 `accepted: false`：座位被后来者拿走、
+    state 超过尺寸上限、池的形状对不上，三种都长这样。把它当成确认，`flush()`
+    就会告诉调用方"注册中心收下了"，而注册中心恰恰是拒绝了它。
+
+    **为什么要跑很多次。** 带着新版本被拒绝的那一拍，一生只有一次：挂起的应答是
+    入 park 之前就算好的，所以循环要到**下一拍**才知道自己被围栏了，而那之后
+    `if !alive { return }` 就让它彻底停了。于是 `update()` 必须恰好落在
+    "最后一次被接受的心跳"和"第一次被拒绝的心跳"之间那个 50ms 的 MIN_GAP 窗口里。
+    实测单次命中率约三分之一 —— 单发的守卫有三分之二的时间是瞎的，跑全量才偶尔
+    红一次。这就是它必须重复的原因，不是保守。
+    """
+    trials = 20
+    for i in range(trials):
+        me = tinyray.join("seat", "stateful", slot=0)
+        later = None
+        try:
+            me.ready(who="mine")
+            me.flush()
+            published_before, _ = me._c.publish_versions()
+
+            later = _hold("default", f"later{i}")
+            me.update(who="mine-again")
+            assert me.wait_fenced(timeout=10), "后来者没能拿走座位"
+
+            published, confirmed = me._c.publish_versions()
+            assert published > published_before, "update() 没有推进发布版本号"
+            assert confirmed < published, (
+                f"第 {i + 1}/{trials} 次：被拒绝的心跳把没落地的 state 记成了已确认，"
+                f"published={published} confirmed={confirmed}"
+            )
+        finally:
+            if later is not None:
+                _release(later)
+            try:
+                me.leave()
+            except Exception:
+                pass

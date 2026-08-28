@@ -69,6 +69,7 @@ impl Client {
             published: Mutex::new(Published {
                 state: serde_json::Value::Object(Default::default()),
                 ready: false,
+                version: 0,
             }),
             leaving: AtomicBool::new(false),
             exclusive,
@@ -79,6 +80,7 @@ impl Client {
             beats_failed: AtomicU64::new(0),
             last_error: Mutex::new(String::new()),
             refused: Mutex::new(String::new()),
+            confirmed: AtomicU64::new(0),
             interval_ms: AtomicU64::new(1000),
             hold_ms: AtomicU64::new(0),
             last_ok_ms: AtomicU64::new(0),
@@ -158,6 +160,7 @@ impl Client {
             }
             cur.state = state;
             cur.ready = ready;
+            cur.version += 1;
         }
         self.shared.wake.notify_one();
         Ok(true)
@@ -178,9 +181,25 @@ impl Client {
                 return Ok(false);
             }
             cur.state = state;
+            cur.version += 1;
         }
         self.shared.wake.notify_one();
         Ok(true)
+    }
+
+    /// The version last published locally, and the newest one the registry has
+    /// acked. flush() waits for the second to reach the first.
+    ///
+    /// A count of beats cannot do this. It has to assume the beat in flight
+    /// was composed before the change and wait for the one after it, which
+    /// costs a whole long-poll hold that the publish already interrupted:
+    /// measured at a 2s lease, flush() took 645ms where the ack proving the
+    /// registry had the state had arrived in one round trip.
+    fn publish_versions(&self) -> (u64, u64) {
+        (
+            self.shared.published.lock().unwrap().version,
+            self.shared.confirmed.load(Ordering::Relaxed),
+        )
     }
 
     /// What the registry said it can do, and which version said it: the

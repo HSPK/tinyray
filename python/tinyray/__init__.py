@@ -1130,15 +1130,20 @@ class Member:
         "published" and "visible to peers" are a beat apart. Reading your own
         state back to find out is a round trip that says what this does.
 
-        Costs at most one extra beat: a beat already in flight was composed
-        before the change, so confirmation waits for the one after it.
+        Waits for an ack for the version it published, not for a number of
+        beats. Counting cannot tell the two apart: the beat in flight may have
+        been composed before the change, so a count has to assume it was and
+        wait for the one after -- and that one is parked for a whole interval,
+        which the publish had already cut short. Measured at a 2s lease: 645ms
+        counting, 1.4ms asking. Called once the state was already visible, the
+        count waited 1096ms for two holds it did not owe.
         """
         self._mine()
-        target = self._c.stats()["beats_ok"] + 2
+        mine, _ = self._c.publish_versions()
         deadline = time.monotonic() + timeout
         while True:
             rev = self._c.cache_revision()
-            if self._c.stats()["beats_ok"] >= target:
+            if self._c.publish_versions()[1] >= mine:
                 return self
             if not self._c.accepted:
                 raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")

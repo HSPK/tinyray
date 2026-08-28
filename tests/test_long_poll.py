@@ -433,3 +433,70 @@ def test_parked_watchers_do_not_all_come_back_at_once(registry):
     assert took[-1] * 1000 < budget + spread_cap * 1.2, (
         f"最晚的一个等了 {took[-1] * 1000:.0f}ms，超过了预算 {budget:.0f}ms 加抖动上限"
     )
+
+
+def test_flush_waits_for_its_own_state_not_for_two_more_beats(long_lease):
+    """`flush()` 要回答的是"注册中心收下了我发布的这一份没有"，那就该问这个。
+
+    它原来数拍数：`beats_ok + 2`。数不出"哪一拍带的是我这一份"，只好假设在途
+    那拍是改动之前composed的，于是等它之后的那一拍——而那一拍是驻留的，要挂满
+    一个 hold。可是 publish 刚刚才把驻留打断过，替换拍带着新状态、不驻留、一个
+    往返就被 ack 了，第二拍纯属白等。
+
+    实测（2s 租约）：数拍 645ms，问版本号 1.4ms。状态**已经可见之后**再调，数拍
+    还要等 1096ms 的两个 hold。
+
+    这里用长租约，因为要量的正是"多等了一个 hold"：20s 租约下 hold 是 5s，数拍
+    要 ~5s，问版本号仍是一个往返。短租约下这个差别只有几百毫秒，会被机器负载淹掉。
+    """
+    me = tinyray.join("fl", "churn")
+    try:
+        me.ready(step=0)
+        me.flush(timeout=30)
+        took = []
+        for i in range(5):
+            me.update(step=i + 1)
+            t0 = time.monotonic()
+            me.flush(timeout=30)
+            took.append(time.monotonic() - t0)
+        took.sort()
+        median = took[len(took) // 2]
+        assert median < 1.0, f"flush 在等它不欠的拍：中位 {median * 1000:.0f}ms，全部 {took}"
+        # 快不等于对：拿到的必须真的是注册中心手里的那一份。
+        mine = tinyray.pool("fl").snapshot().get(me.identity)
+        assert mine is not None and mine.state["step"] == 5, f"flush 早返回了：{mine}"
+    finally:
+        me.leave()
+
+
+def test_a_beat_that_follows_close_on_the_last_one_is_not_held_by_nagle(registry):
+    """连着发布两次，第二拍会撞上 Nagle 与对端 delayed ACK 的组合。
+
+    hyper 的 connector 默认不开 `TCP_NODELAY`。一次心跳是"写请求、读应答"，
+    紧接着又写一次时，Nagle 会扣住第二个小包等前一个被 ACK，而对端的 delayed
+    ACK 要等 40ms 才发。于是每一拍多出一个和代码无关的固定 40ms。
+
+    实测 publish 之后等到 ack：单发（前一拍已经安顿好）0.66ms，**连发 41ms**，
+    二十次里十九次落在 40.83–42.22 这个窄带上——固定停顿，不是抖动。开了
+    `TCP_NODELAY` 之后连发是 0.28ms。
+
+    盯连发而不是单发：单发看不见这个 bug，因为它要的是"上一次写还没被 ACK"。
+    """
+    me = tinyray.join("ng", "churn")
+    try:
+        me.ready(step=0)
+        me.flush(timeout=20)
+        took = []
+        for i in range(15):
+            me.update(step=i + 1)
+            t0 = time.monotonic()
+            me.flush(timeout=20)
+            took.append(time.monotonic() - t0)
+        took.sort()
+        median = took[len(took) // 2]
+        assert median < 10.0e-3, (
+            f"每一拍都在等 delayed ACK：中位 {median * 1000:.2f}ms，"
+            f"全部 {[round(t * 1000, 2) for t in took]}"
+        )
+    finally:
+        me.leave()
