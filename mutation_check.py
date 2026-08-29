@@ -1060,6 +1060,30 @@ MUTANTS = [
         "tests/test_async_lookup_cost.py"
         "::test_priming_a_pool_keeps_the_first_async_lookup_off_the_loop",
     ),
+    (
+        "registry_url is accepted and then ignored for the environment",
+        PY_INIT,
+        "    endpoint = _endpoint(registry_url)",
+        "    endpoint = _endpoint()",
+        "tests/test_join_needs_the_registry.py"
+        "::test_registry_url_beats_the_environment_and_does_not_touch_it",
+    ),
+    (
+        "the unreachable message re-reads the environment instead of what was dialled",
+        PY_INIT,
+        'f"no answer from the registry at {endpoint} after "',
+        'f"no answer from the registry at {_endpoint()} after "',
+        "tests/test_join_needs_the_registry.py"
+        "::test_the_unreachable_message_names_the_address_it_actually_dialled",
+    ),
+    (
+        "a list of registry addresses is composed into a URL instead of refused",
+        PY_INIT,
+        '    if "," in raw:',
+        "    if False:",
+        "tests/test_join_needs_the_registry.py"
+        "::test_a_list_of_registries_is_refused_instead_of_dialled",
+    ),
 ]
 
 

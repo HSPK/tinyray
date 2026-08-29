@@ -31,6 +31,7 @@ tinyray.join(
     exclusive: bool = False,
     max_concurrency: int | None = None,
     timeout: float = FIRST_BEAT_S,
+    registry_url: str | None = None,
 ) -> Member
 ```
 
@@ -59,6 +60,13 @@ tinyray.join(
   给调用方，不排队。默认无限制。
 - **`url=`** —— 手工指定对外地址。默认由路由表探出来；多网卡机器上可以用
   `TINYRAY_ADVERTISE` 指定。
+- **`registry_url=`** —— 去哪个注册中心报到，压过 `TINYRAY_REGISTRY`。
+  **别和上面的 `url=` 搞混**：那个是"别人怎么找到我"，这个是"我去找谁"。
+  环境变量仍是常规通道（launcher 一次给所有 rank 设好）；这个参数是给用不了
+  它的调用方 —— 嵌在别人进程里的库，为了配置一次调用去改 `os.environ`，
+  改的是整个进程，而且比这次调用活得久。
+  它选一个注册中心，不是加一个：一个进程一个成员一个注册中心，`pool()` /
+  `apool()` 跟着 `join()` 走。给一串地址会被**当场拒绝**。
 
     !!! warning "只写主机名，不要写 scheme 或端口"
         `http://` 和端口是围着它拼上去的，所以 `TINYRAY_ADVERTISE=http://10.0.0.5`
@@ -549,7 +557,7 @@ OldRegistryWarning(UserWarning)  注册中心比本包旧，某个功能不可�
 
 | 变量 | 作用 |
 |---|---|
-| `TINYRAY_REGISTRY` | 注册中心地址，默认 `127.0.0.1:8760` |
+| `TINYRAY_REGISTRY` | 注册中心地址，默认 `127.0.0.1:8760`。只接受**一个**地址；`join(registry_url=)` 可以压过它 |
 | `TINYRAY_ADVERTISE` | 对外**主机名或 IP**，只写这一个东西。多网卡机器上必须指定，否则可能登记错网卡 |
 | `TINYRAY_SLOT` / `RANK` / `SLURM_PROCID` / `OMPI_COMM_WORLD_RANK` | 座位号 |
 | `TINYRAY_SIZE` / `WORLD_SIZE` / `SLURM_NTASKS` / `OMPI_COMM_WORLD_SIZE` | 规模 |

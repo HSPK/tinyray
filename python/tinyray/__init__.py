@@ -95,12 +95,34 @@ _RANK_VARS = ("TINYRAY_SLOT", "RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK")
 _SIZE_VARS = ("TINYRAY_SIZE", "WORLD_SIZE", "SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE")
 
 
-def _endpoint() -> str:
+def _endpoint(explicit: str | None = None) -> str:
     """One registry. Losing it is survivable -- lookups keep working from cache
     and the roster regrows within one interval -- so replicas buy little and
     cost a lot: the delta cursor is per-registry, so failing over silently
-    freezes the cache."""
-    raw = os.environ.get("TINYRAY_REGISTRY", "127.0.0.1:8760").strip()
+    freezes the cache.
+
+    `join(registry_url=)` beats the environment, for callers that are a library
+    inside somebody else's process: setting TINYRAY_REGISTRY to configure one
+    call is a process-wide side effect, and it outlives the call.
+
+    Resolved once per join and then carried, so the address that failed is the
+    address the message names. Reading the environment again in the error path
+    would report whatever it says now rather than what was actually dialled.
+    """
+    raw = explicit if explicit is not None else os.environ.get("TINYRAY_REGISTRY", "127.0.0.1:8760")
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("the registry address is empty; give host:port")
+    # A list composes into a URL nobody can reach -- "http://a:1,b:2" -- and the
+    # process then reports that the registry never answered, which is true and
+    # useless. There is deliberately no failover here (see above), and the docs
+    # used to write the variable as `host:port,...`, so this was invited.
+    if "," in raw:
+        raise ValueError(
+            f"the registry address {raw!r} looks like a list, and there is only "
+            f"ever one registry: the delta cursor is per-registry, so failing "
+            f"over between them silently freezes the cache. Give one host:port."
+        )
     return raw if "://" in raw else f"http://{raw}"
 
 
@@ -1404,6 +1426,7 @@ def join(
     exclusive: bool = False,
     max_concurrency: int | None = None,
     timeout: float = FIRST_BEAT_S,
+    registry_url: str | None = None,
 ) -> Member:
     """Report in. One line per process.
 
@@ -1417,6 +1440,17 @@ def join(
     Launchers routinely start ranks before it is listening, so waiting is the
     normal case; raise it when the registry comes up late or the link is bad,
     and lower it when a wrong address should be reported straight away.
+
+    `registry_url` is where to report in, overriding TINYRAY_REGISTRY. Not to
+    be confused with `url`, which is where *peers* should reach this process.
+    The environment stays the normal channel, because a launcher sets it for
+    every rank at once and nobody wants that spelled out in code. This is for
+    the caller who cannot use it: a library inside somebody else's process,
+    where assigning to os.environ to configure one call is a process-wide side
+    effect that outlives the call.
+
+    It picks the registry, it does not add one. A process is one member with
+    one registry, so pool() and apool() follow whatever this joined.
     """
     global _client, _left, _owner_pid
     _left = False
@@ -1467,8 +1501,12 @@ def join(
         methods = server.methods
         url = url or server.url(_advertise())
 
+    # Resolved once. Every later mention -- the client, the unreachable
+    # message, the old-registry warning -- reads this and not the environment,
+    # so there is one spelling of where we actually dialled.
+    endpoint = _endpoint(registry_url)
     c = _Client(
-        endpoint=_endpoint(),
+        endpoint=endpoint,
         pool=pool,
         id=ident,
         incarnation=incarnation,
@@ -1520,7 +1558,7 @@ def join(
             if server is not None:
                 server.close()
             raise Unreachable(
-                f"no answer from the registry at {_endpoint()} after "
+                f"no answer from the registry at {endpoint} after "
                 f"{timeout:g}s and {c.stats()['beats_failed']} attempts: "
                 f"{c.last_error()}. Pass join(timeout=) to wait longer."
             )
@@ -1552,7 +1590,7 @@ def join(
     seen = RegistryInfo(*c.registry())
     if not seen.supports("long_poll"):
         warnings.warn(
-            f"the registry at {_endpoint()} reports protocol {seen.protocol} "
+            f"the registry at {endpoint} reports protocol {seen.protocol} "
             f"({seen.version or 'version not reported'}) but tinyray "
             f"{__version__} expects {RegistryInfo.FEATURES['long_poll']}. "
             f"Everything works; changes will take up to a heartbeat interval "

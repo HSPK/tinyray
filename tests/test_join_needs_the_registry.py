@@ -175,3 +175,63 @@ def test_the_budget_covers_reaching_the_registry_not_just_the_wait(want):
         srv.close()
         for c in held:
             c.close()
+
+
+def test_registry_url_beats_the_environment_and_does_not_touch_it(registry):
+    """用环境变量配置一个库，是**进程级**的副作用，而且它比这次调用活得久。
+
+    `TINYRAY_REGISTRY` 依然是常规通道 —— launcher 一次给所有 rank 设好，没人想
+    在代码里逐个写。这个参数是给用不了它的调用方：嵌在别人进程里的库，为了调一次
+    `join()` 去改 `os.environ`，改的是整个进程。
+
+    所以这里把环境变量指向一个**没人监听**的地址，再用参数指向真的那个：能报到，
+    就说明参数确实压过了环境变量；而且环境变量本身**不能被动过**。
+    """
+    dead = f"127.0.0.1:{free_port()}"
+    os.environ["TINYRAY_REGISTRY"] = dead
+    try:
+        with tinyray.join("p", "churn", registry_url=registry.endpoint, timeout=20) as me:
+            me.ready(who="mine")
+            assert me.stats()["beats_ok"] > 0, "参数没有压过环境变量"
+        assert os.environ["TINYRAY_REGISTRY"] == dead, "join() 动了调用方的环境变量"
+    finally:
+        os.environ["TINYRAY_REGISTRY"] = registry.endpoint
+
+
+def test_the_unreachable_message_names_the_address_it_actually_dialled():
+    """报错必须说出**真正拨过的**那个地址，而不是此刻环境变量里写着什么。
+
+    地址有两个来源之后，这就是最容易出的那种错：错误路径重新读一次环境变量，于是
+    `join(registry_url=X)` 失败时报的是 Y。这个代码库被"同一个事实两种拼法"咬过
+    ——围栏令牌曾经有四种写法 —— 所以地址只解析一次，之后所有人都读那一份。
+    """
+    asked = f"127.0.0.1:{free_port()}"
+    misleading = f"127.0.0.1:{free_port()}"
+    os.environ["TINYRAY_REGISTRY"] = misleading
+    try:
+        with pytest.raises(tinyray.Unreachable) as e:
+            tinyray.join("p", "churn", registry_url=asked, timeout=1.0)
+        assert asked in str(e.value), f"报错没说出实际拨的地址：{e.value}"
+        assert misleading not in str(e.value), f"报错说的是环境变量里的地址：{e.value}"
+    finally:
+        os.environ.pop("TINYRAY_REGISTRY", None)
+
+
+def test_a_list_of_registries_is_refused_instead_of_dialled():
+    """给一串地址会拼出 `http://a:1,b:2` —— 一个谁也连不上的 URL，而进程只会报
+    "注册中心没应答"，这话是真的但没用。
+
+    文档里这一条是自己挖的坑：它把变量写成 `TINYRAY_REGISTRY=host:port,...`，
+    那个逗号看起来就是可以填多个。而故意不做故障转移是有理由的（增量游标是按
+    注册中心算的，换一份会静默冻住缓存），所以正确的回答是**明确拒绝**。
+    """
+    for where in ("param", "env"):
+        with pytest.raises(ValueError, match="only ever one registry"):
+            if where == "param":
+                tinyray.join("p", "churn", registry_url="127.0.0.1:1,127.0.0.1:2")
+            else:
+                os.environ["TINYRAY_REGISTRY"] = "127.0.0.1:1,127.0.0.1:2"
+                try:
+                    tinyray.join("p", "churn")
+                finally:
+                    os.environ.pop("TINYRAY_REGISTRY", None)

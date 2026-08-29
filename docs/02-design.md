@@ -110,7 +110,8 @@ h.assign.timeout(5)(task)
 h.url
 ```
 
-注册中心的地址从 `TINYRAY_REGISTRY=host:port,...` 读，不占名字。
+注册中心的地址从 `TINYRAY_REGISTRY=host:port` 读，或者 `join(registry_url=)`。
+只接受一个地址 —— 给一串会被明确拒绝，理由见后面「为什么不做副本」。
 
 ### 数据结构：6 个
 
