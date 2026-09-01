@@ -26,7 +26,8 @@ def test_the_docs_are_all_in_the_nav():
     """写了但没挂上导航，等于没写。"""
     nav = (ROOT / "mkdocs.yml").read_text()
     missing = [
-        str(p.relative_to(ROOT / "docs")) for p in DOCS
+        str(p.relative_to(ROOT / "docs"))
+        for p in DOCS
         if str(p.relative_to(ROOT / "docs")) not in nav
     ]
     assert not missing, f"这些文档没有出现在 mkdocs.yml 的 nav 里: {missing}"
@@ -36,10 +37,7 @@ def test_no_document_still_calls_the_project_unimplemented():
     """0.5.0 已经发布，任何「未实现」的说法都是错的。"""
     stale = ("当前未实现", "代码已清空", "提案阶段")
     found = [
-        f"{p.name}: {phrase}"
-        for p in DOCS + READMES
-        for phrase in stale
-        if phrase in p.read_text()
+        f"{p.name}: {phrase}" for p in DOCS + READMES for phrase in stale if phrase in p.read_text()
     ]
     assert not found, f"文档还在说项目没实现: {found}"
 
