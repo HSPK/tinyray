@@ -64,7 +64,7 @@ python examples/01_hello_world.py
 | | What it shows |
 |---|---|
 | [async_rl_fleet](async_rl_fleet.py) | Four kinds of member at once, with one killed mid-flight |
-| [agent_pool/](agent_pool/) | rl-bridge's agent tier ported over: 532 lines of membership plumbing gone |
+| [agent_pool/](agent_pool/) | An agent tier from a real framework, ported over: 532 lines of membership plumbing gone |
 
 ## Notes
 

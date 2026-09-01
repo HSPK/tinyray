@@ -15,13 +15,20 @@ import pathlib
 import tinyray
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DOCS = sorted((ROOT / "docs").glob("*.md"))
+# Recursive on purpose. The English pages live in docs/en/, and a top-level
+# glob would leave them out of every check here -- which is exactly how a
+# document rots: nothing is looking at it.
+DOCS = sorted((ROOT / "docs").rglob("*.md"))
+READMES = [ROOT / "README.md", ROOT / "README.zh-CN.md"]
 
 
 def test_the_docs_are_all_in_the_nav():
     """写了但没挂上导航，等于没写。"""
     nav = (ROOT / "mkdocs.yml").read_text()
-    missing = [p.name for p in DOCS if p.name not in nav]
+    missing = [
+        str(p.relative_to(ROOT / "docs")) for p in DOCS
+        if str(p.relative_to(ROOT / "docs")) not in nav
+    ]
     assert not missing, f"这些文档没有出现在 mkdocs.yml 的 nav 里: {missing}"
 
 
@@ -30,7 +37,7 @@ def test_no_document_still_calls_the_project_unimplemented():
     stale = ("当前未实现", "代码已清空", "提案阶段")
     found = [
         f"{p.name}: {phrase}"
-        for p in DOCS + [ROOT / "README.md"]
+        for p in DOCS + READMES
         for phrase in stale
         if phrase in p.read_text()
     ]
@@ -39,9 +46,10 @@ def test_no_document_still_calls_the_project_unimplemented():
 
 def test_every_public_name_is_documented():
     """API 参考漏掉一个名字，使用者就只能去读源码。"""
-    reference = (ROOT / "docs" / "api.md").read_text()
-    undocumented = [name for name in tinyray.__all__ if name not in reference]
-    assert not undocumented, f"docs/api.md 里没有提到这些公开名字: {undocumented}"
+    for ref in (ROOT / "docs" / "api.md", ROOT / "docs" / "en" / "api.md"):
+        reference = ref.read_text()
+        undocumented = [name for name in tinyray.__all__ if name not in reference]
+        assert not undocumented, f"{ref.name} 里没有提到这些公开名字: {undocumented}"
 
 
 def test_the_documented_exception_tree_matches_the_real_one():

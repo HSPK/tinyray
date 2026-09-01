@@ -33,14 +33,19 @@ theme:
         name: 切换到亮色
 
 nav:
-  - 首页: index.md
-  - 上手: getting-started.md
-  - API 参考: api.md
-  - 更新日志: changelog.md
-  - 基准: bench.md
-  - 为什么: 01-why.md
-  - 是什么: 02-design.md
-  - 怎么做: 03-plan.md
+  - 中文:
+      - 首页: index.md
+      - 上手: getting-started.md
+      - API 参考: api.md
+      - 基准: bench.md
+      - 更新日志: changelog.md
+      - 为什么: 01-why.md
+      - 是什么: 02-design.md
+  - English:
+      - Home: en/index.md
+      - Getting started: en/getting-started.md
+      - API reference: en/api.md
+      - Benchmarks: en/bench.md
 
 markdown_extensions:
   - admonition
@@ -67,3 +72,4 @@ extra:
 
 not_in_nav: |
   README.md
+  README.zh-CN.md

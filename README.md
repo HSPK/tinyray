@@ -1,9 +1,12 @@
 # tinyray
 
-**一本通讯录，加一次点名。** 给异步 ML 作业用的成员关系层。
+*[中文](README.zh-CN.md)*
 
-它不启动进程、不分配 GPU、不搬运 tensor。只回答三个问题：
-**谁在？还活着吗？我该找谁？**
+**A phone book and a roll call.** A membership layer for asynchronous ML jobs.
+
+It starts no processes, allocates no GPUs and moves no tensors. It answers
+three questions: **who is here, are they still alive, and who should I talk
+to?**
 
 ```python
 import tinyray
@@ -15,71 +18,87 @@ engine = tinyray.pool("engine").pick(model_version=17)
 print(engine.url)
 ```
 
-## 现状
+## What it does
 
-**M1 + M2 + M3 已实现**，约 1,200 行。报到、租约、本地缓存、找人，以及调用层：
+Reporting in, leases, a local roster cache and lookup -- plus a call layer:
 
 ```python
 class Collector:
     def assign(self, task: str) -> dict:
         return {"took": task}
 
+
 me = tinyray.join("collector", "stateful", slot=0, serves=Collector())
 me.ready()
 
-# 另一个进程里
+# in another process
 tinyray.pool("collector").slot(0).assign("task-7")
 await tinyray.apool("collector").slot(0).assign("task-7")
 ```
 
-底下就是普通 HTTP，所以 `curl` 排障能力一点没丢：
+Underneath it is ordinary HTTP, so nothing is lost for debugging with `curl`:
 
 ```bash
 curl -X POST http://host:port/call/assign -d '{"task":"t"}'
 curl http://host:port/_methods
 ```
 
-**M3 也已实现** —— 座位、任期与冻结名单：
+Seats, tenures and a frozen roster:
 
 ```python
 me = tinyray.join("trainer", "collective", slot=RANK, size=WORLD_SIZE)
 me.ready()
 
-ep = tinyray.pool("trainer").epoch()   # 等人齐，然后冻住
-build_process_group(ep.members)        # 每个 rank 拿到的必然一样
+ep = tinyray.pool("trainer").epoch()  # wait for everyone, then freeze
+build_process_group(ep.members)       # every rank is handed the same list
 
-def watchdog():                        # 训练循环里查是没用的：卡住的 rank 到不了
-    while ep.valid:                    # 那一行。后台线程可以，因为 NCCL 阻塞时
-        time.sleep(0.5)                # 会放开 GIL。
+
+def watchdog():  # checking inside the training loop is useless: a stuck rank
+    while ep.valid:  # never reaches that line. A background thread works,
+        time.sleep(0.5)  # because NCCL releases the GIL while it blocks.
     pg._abort()
 ```
 
-## 文档
+## Documentation
 
 **<https://hspk.github.io/tinyray/>**
 
-| 文档 | 内容 |
+| Document | What is in it |
 |---|---|
-| [上手](docs/getting-started.md) | 十分钟，从装上到两个进程互相调用 |
-| [API 参考](docs/api.md) | 完整接口，对着实现写的 |
-| [为什么](docs/01-why.md) | 问题、真实代价、现有工具为何不合身 |
-| [是什么](docs/02-design.md) | API、数据结构、进程模型、策略 |
-| [怎么做](docs/03-plan.md) | 计划、未测项、已定决策 |
+| [Getting started](docs/en/getting-started.md) | Ten minutes, from install to two processes calling each other |
+| [API reference](docs/en/api.md) | The whole surface, written against the implementation |
+| [Benchmarks](docs/en/bench.md) | What it costs, measured, and the traps in measuring it |
 
-## 安装
+The design notes -- the problem, why existing tools do not fit, and the
+reasoning behind the API -- are in Chinese only:
+[为什么](docs/01-why.md) and [是什么](docs/02-design.md).
+
+## Install
 
 ```bash
-pip install tinyray                    # wheel 里带着注册中心
+pip install tinyray                    # the registry ships in the wheel
 tinyray --listen 127.0.0.1:8760
 ```
 
-## 开发
+## Development
 
 ```bash
-cargo build --release          # 需要 rustup 的 rustc，系统自带的太旧
+cargo build --release          # needs rustup's rustc; the system one is too old
 maturin develop --release
-pytest tests/ -q               # 默认集
-pytest tests/ -q -m examples   # 示例，几分钟
-cargo test --workspace         # registry 与线上消息类型
-mkdocs serve                   # 文档站，需要 pip install mkdocs-material
+pytest tests/ -q               # the default set
+pytest tests/ -q -m examples   # the examples, a few minutes
+cargo test --workspace         # the registry and the wire types
+python bench.py                # the benchmark suite
+python bench.py --check        # compare against the recorded baseline
+python mutation_check.py       # put each bug back and prove a test goes red
+mkdocs serve                   # the docs site, needs pip install mkdocs-material
 ```
+
+## How it is built
+
+Around 2,900 lines: a Rust registry and client (`crates/`) behind a Python API
+(`python/tinyray/`), wired together with pyo3 and maturin.
+
+Every behaviour in here was measured before it was changed, and every one of
+them has an entry in `mutation_check.py` -- put the bug back, and a named test
+goes red. A test that cannot fail is not a test.

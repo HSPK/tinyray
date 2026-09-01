@@ -1,6 +1,6 @@
 """Timeouts belong to the call site, not to the library.
 
-rl-bridge tunes twelve of them separately and writes down that every request
+A real framework tunes twelve of them separately and writes down that every request
 must pass one explicitly -- a rule you only make after being burnt. So the
 default is a starting point, and the modifier hangs off the method rather than
 being a keyword argument, where it would collide with a parameter of the same

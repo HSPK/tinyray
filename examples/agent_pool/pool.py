@@ -1,4 +1,4 @@
-"""The pool side of rl-bridge's agent tier, ported onto tinyray.
+"""The pool side of an agent tier from a real async RL framework, ported onto tinyray.
 
 Only the domain is left here. Who exists, who is still alive, and how to reach
 them are no longer this file's problem.

@@ -1,6 +1,6 @@
 """Annotations are the schema.
 
-rl-bridge hand-wrote a 56-line TypedDict validator because it needed typed RPC
+A real framework hand-wrote a 56-line TypedDict validator because it needed typed RPC
 and had none. Repeating that would defeat the purpose.
 """
 
