@@ -30,20 +30,30 @@ HOLD_SECONDS = 6.0
 BUSY_THREADS = 16
 
 
-def hog_the_gil(stop: threading.Event) -> list[threading.Thread]:
-    """Two hogs, because they starve a sleeper in different ways."""
+def hog_the_gil(stop: threading.Event, until: float) -> list[threading.Thread]:
+    """Two hogs, because they starve a sleeper in different ways.
+
+    Each hog watches the clock as well as the flag. The thread that would set
+    the flag is the one being starved, so making the hogs depend on it is
+    asking the victim to free itself: measured on a two-core box, `stop.set()`
+    landed 6 to 14 seconds after the hold was over, and on a CI runner that
+    ran past the driver's whole 90s budget and failed a release.
+    """
 
     def busy() -> None:
         x = 0
-        while not stop.is_set():
+        while not stop.is_set() and time.monotonic() < until:
             for _ in range(50_000):
                 x = (x * 31 + 7) % 1000003
 
     def c_level() -> None:
         # One C call, no GIL release and no interrupt check in the middle.
-        # This is the shape of a long op inside a native extension.
+        # This is the shape of a long op inside a native extension. One
+        # multiplication of this size costs 1666.8ms on an idle core here, and
+        # nothing else in the process runs for the whole of it -- which is the
+        # point of the example, and also why the hold has to end by the clock.
         big = 7**3_000_000
-        while not stop.is_set():
+        while not stop.is_set() and time.monotonic() < until:
             big * big
 
     threads = [threading.Thread(target=busy, daemon=True) for _ in range(BUSY_THREADS)]
@@ -81,11 +91,15 @@ def run_trainer(_: list[str]) -> None:
             f"with {BUSY_THREADS} busy threads and one long C call",
             flush=True,
         )
-        hogs = hog_the_gil(stop)
+        hogs = hog_the_gil(stop, time.monotonic() + HOLD_SECONDS)
         time.sleep(HOLD_SECONDS)
         stop.set()
+        # One budget for all of them, not one each: seventeen threads at five
+        # seconds apiece is eighty-five seconds of joining, which on its own
+        # is longer than the driver waits for the whole example.
+        deadline = time.monotonic() + 20.0
         for t in hogs:
-            t.join(timeout=5)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
 
         native = me.stats()["beats_ok"] - beats_before
         expected = HOLD_SECONDS / (me.stats()["interval_ms"] / 1000)
