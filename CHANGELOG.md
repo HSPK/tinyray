@@ -5,6 +5,38 @@
 
 ---
 
+## 0.13.1
+
+一个 bug 修复。取消一个 `achanges()` watcher 有可能不生效。
+
+**取消和铃声撞在同一轮 loop 迭代里时，取消会被吞掉。**
+
+异步 watcher 等的是 `_LoopBell.wait()`，而它等的方式是 `asyncio.wait_for`。
+3.11 的 `wait_for` 在等待者被取消时有这么一句：
+
+    except CancelledError:
+        if fut.done():
+            return fut.result()
+
+心跳的字节刚把 future 置位、`cancel()` 紧接着落在同一轮回调里，这句就把
+CancelledError 当成"结果已经到了"直接吞了。watcher 若无其事地转下一圈，外面的
+`await task` 永远不返回，任务停在 CANCELLING 再也出不来。压测里大约 24 轮命中
+一次，每次都卡在同一个 watch 上。
+
+改成直接 `await` 那个 future：取消落在任务真正挂起的那个 future 上，没有任何
+中间层能把它转成一个普通答案；超时则由 `call_later` 置结果送达 —— 它本来就是
+个普通答案，不该以异常的形式旅行。
+
+复现是确定性的：把响铃和取消排成同一轮里的两个 `call_soon`，修之前必吞，修之后
+必传。原来那条"超时不能以异常逃出去"的 mutant 换到了新写法上，因为超时已经根本
+不走异常了。
+
+对使用者的影响：`task.cancel()` 现在真的能停下一个 watcher。此前唯一可靠的停法
+是显式 `watch.close()`，那条路一直是对的，也仍然推荐 —— 它是同步的，哪怕 loop
+再也不调度这个任务也照样生效。
+
+---
+
 ## 0.13.0
 
 又一整轮定期巡检。规矩没变：**先写脚本量，量到了再改**；每条新行为都要验证"把
