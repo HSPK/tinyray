@@ -214,6 +214,13 @@ MUTANTS = [
         "tests/test_m2_validation.py::test_a_bare_host_is_taken_as_given",
     ),
     (
+        "the listen backlog goes back to socketserver's default of 5",
+        "python/tinyray/_serve.py",
+        "    request_queue_size = socket.SOMAXCONN",
+        "    request_queue_size = 5",
+        "tests/test_concurrency.py::test_a_fleet_connecting_at_once_does_not_wait_out_a_syn_retransmit",
+    ),
+    (
         "a method name that cannot go in a URL is served anyway",
         "python/tinyray/_serve.py",
         "        if not (name.isascii() and name.isidentifier()):",

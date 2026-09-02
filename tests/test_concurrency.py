@@ -225,3 +225,51 @@ def test_concurrent_calls_do_not_cross_between_pools_of_connections(served):
         assert big == f"big{i}." + "z" * 8192, f"第 {i} 次长回复对不上（{len(big)} 字节）"
         small = h.echo(f"small{i}")
         assert small == f"small{i}", f"第 {i} 次短回复拿到了 {small[:60]!r}"
+
+
+def test_a_fleet_connecting_at_once_does_not_wait_out_a_syn_retransmit(served):
+    """一整队 worker 同时打第一通 RPC，不能撞死在 accept 队列上。
+
+    `socketserver` 的默认 backlog 是 5。accept 队列满了之后内核是**丢包**而不是
+    拒绝，于是发起方安静地等一次 SYN 重传 —— 一秒起步。实测 64 个同时连接：
+    64 个里 55 个超过 100ms，p50 1013.70ms，最坏 2038ms；队列够用时是 5.47ms。
+
+    膝点正好落在"backlog ≥ 同时连上来的人数"上：accept 一次就要起一个线程，循环
+    根本排空不过来，所以 400 个 peer 撞 128 的 backlog 一样塌（p50 1089.84ms）。
+    这里量的是首次连接本身，不是 RPC —— 慢在握手上，跟服务端算得多快无关。
+    """
+    import socket as _socket
+    from urllib.parse import urlsplit
+
+    url = urlsplit(tinyray.pool("s").slot(0).url)
+    n = 64
+    gate = threading.Barrier(n + 1)
+    took: list[float] = []
+    errs: list[str] = []
+
+    def connect_once() -> None:
+        gate.wait()
+        t0 = time.monotonic()
+        try:
+            s = _socket.create_connection((url.hostname, url.port), timeout=15)
+        except OSError as exc:
+            errs.append(repr(exc))
+            return
+        took.append((time.monotonic() - t0) * 1000)
+        s.close()
+
+    ts = [threading.Thread(target=connect_once, daemon=True) for _ in range(n)]
+    for t in ts:
+        t.start()
+    gate.wait()
+    for t in ts:
+        t.join(timeout=30)
+
+    assert not errs, f"连接失败：{errs[:3]}"
+    assert len(took) == n, f"只有 {len(took)}/{n} 个连接回来了"
+    worst = max(took)
+    # 失败模式是一次 1s 的 SYN 重传，正常是十几毫秒。500ms 两边都离得很远。
+    assert worst < 500, (
+        f"最慢的一次连接花了 {worst:.0f}ms，像是在等 SYN 重传；"
+        f"超过 100ms 的有 {sum(1 for x in took if x > 100)}/{n} 个"
+    )

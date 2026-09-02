@@ -348,6 +348,18 @@ class _Server(ThreadingHTTPServer):
     time."""
 
     daemon_threads = True
+    # A worker fleet starts all at once, so the first RPC connections arrive as
+    # one burst, and socketserver's default backlog of 5 is nowhere near it.
+    # An overflowing accept queue is dropped, not refused, so the caller waits
+    # out a SYN retransmit: measured with 64 simultaneous connects, 55 of them
+    # over 100ms, p50 1013.70ms and a worst case of 2038ms -- against 5.47ms
+    # with room in the queue. The knee sits exactly at the size of the burst,
+    # because accepting means spawning a thread and the loop cannot drain that
+    # fast, so 400 peers overflow a backlog of 128 just the same (p50
+    # 1089.84ms). The burst is however many peers there are, which is not
+    # something this process can know, so ask for as much as the kernel is
+    # willing to give -- it caps this at net.core.somaxconn regardless.
+    request_queue_size = socket.SOMAXCONN
     dispatch: dict[str, Callable[..., Any]]
     identity: str
     still_ours: Callable[[], bool]
