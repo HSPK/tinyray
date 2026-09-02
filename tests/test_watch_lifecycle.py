@@ -340,6 +340,44 @@ def test_achanges_with_a_timeout_ends_rather_than_raises(long_lease):
     assert 0.3 <= took < 3.0, f"流在 {took:.2f}s 结束，既不像超时也不像正常收尾"
 
 
+def test_a_cancel_beats_a_bell_that_rang_in_the_same_tick(registry):
+    """铃响和取消落在同一轮 loop 迭代里时，取消必须赢。
+
+    这条曾经会挂死。`_LoopBell.wait()` 用 `asyncio.wait_for` 等铃，而 3.11 的
+    实现里有一句 `except CancelledError: if fut.done(): return fut.result()`：
+    心跳的字节刚把 future 置位、取消紧跟着落下，CancelledError 就被当成"结果
+    已经到了"吞掉，watcher 若无其事地转下一圈，外面的 `await task` 永远不返回，
+    任务停在 CANCELLING。压测里大约 24 轮命中一次。
+
+    用两个 call_soon 把响铃和取消排进同一批回调，就是那一瞬间，不用碰运气。
+    """
+
+    async def body() -> tuple[bool, bool]:
+        m = tinyray.join("p", slot=0, size=1)
+        m.ready()
+        pool = tinyray.apool("p")
+
+        async def watch() -> None:
+            async with pool.achanges() as w:
+                async for _ in w:
+                    pass
+
+        task = asyncio.create_task(watch())
+        await asyncio.sleep(0.5)  # 确实已经停在 bell.wait() 里
+        loop = asyncio.get_running_loop()
+        # watcher 等的就是这只铃：铃按 loop 存，一个 loop 只有一只。
+        bell = tinyray._loop_bell(m._c)
+        loop.call_soon(bell._fire)  # 心跳的字节
+        loop.call_soon(task.cancel)  # 关停
+        done, pending = await asyncio.wait({task}, timeout=5)
+        m.leave()
+        return not pending, task.cancelled()
+
+    ended, cancelled = asyncio.run(body())
+    assert ended, "取消被吞了：watcher 还在转，await 这个 task 永远不会返回"
+    assert cancelled, "task 结束了，但不是因为取消"
+
+
 SEAT_TAKER = textwrap.dedent(
     """
     import os, sys, tinyray

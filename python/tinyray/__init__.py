@@ -414,6 +414,11 @@ class _LoopBell:
             if not f.done():
                 f.set_result(None)
 
+    @staticmethod
+    def _expire(fut: asyncio.Future[None]) -> None:
+        if not fut.done():
+            fut.set_result(None)
+
     async def wait(self, timeout: float) -> None:
         """Return when the bell rings, or when `timeout` runs out.
 
@@ -422,14 +427,23 @@ class _LoopBell:
         synchronous `wait_revision` lets them. Letting the TimeoutError out
         instead turned `achanges(timeout=...)` into a raise where the stream
         should simply have ended.
+
+        Deliberately not `asyncio.wait_for`, which answers a cancellation that
+        arrives in the same loop iteration as the bell with `if fut.done():
+        return fut.result()` -- swallowing the CancelledError outright.
+        Measured: a watcher cancelled at that instant kept iterating and
+        `await task` never returned, leaving the task CANCELLING for good.
+        Awaiting the future itself puts the cancellation on the very future
+        the task is suspended on, where nothing can turn it into an answer,
+        and the timeout arrives as the ordinary answer it already was.
         """
         fut: asyncio.Future[None] = self._loop.create_future()
         self._waiters.append(fut)
+        timer = self._loop.call_later(timeout, self._expire, fut)
         try:
-            await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            pass
+            await fut
         finally:
+            timer.cancel()
             # Cancellation lands here too. Whatever happened, the slot in the
             # list has to go, or a caller that came and went would be woken
             # for the rest of the process's life.

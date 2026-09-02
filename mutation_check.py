@@ -344,6 +344,13 @@ MUTANTS = [
         "tests/test_watch_lifecycle.py::test_async_watchers_hold_no_executor_thread",
     ),
     (
+        "the bell waits through wait_for again, which eats a cancel that lands with it",
+        PY_INIT,
+        "        try:\n            await fut",
+        "        try:\n            await asyncio.wait_for(fut, timeout)",
+        "tests/test_watch_lifecycle.py::test_a_cancel_beats_a_bell_that_rang_in_the_same_tick",
+    ),
+    (
         "wait_replacement returns any occupant, not a new tenure",
         PY_INIT,
         "        return now is not None and now.identity != was",
@@ -440,8 +447,8 @@ MUTANTS = [
     (
         "a bell timeout escapes instead of ending the stream",
         PY_INIT,
-        "        except asyncio.TimeoutError:\n            pass",
-        "        except asyncio.TimeoutError:\n            raise",
+        "        if not fut.done():\n            fut.set_result(None)",
+        "        if not fut.done():\n            fut.set_exception(asyncio.TimeoutError())",
         "tests/test_watch_lifecycle.py::test_achanges_with_a_timeout_ends_rather_than_raises",
     ),
     (
