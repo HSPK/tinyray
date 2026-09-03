@@ -471,10 +471,41 @@ A reference to one member. Attribute access proxies to its methods.
 ```python
 h.assign("task")  # call it
 h.assign.timeout(5.0)("task")  # this call's timeout; 30 seconds by default
+h.pull_job.returns(AgentJob)()  # restore the JSON result as an AgentJob
 ```
 
-The timeout is a modifier rather than a keyword argument so that it cannot
-collide with a parameter of the same name on the far side.
+JSON does not retain Python types: a `NamedTuple` crosses the wire as an array,
+and a dataclass-shaped value as an object. `.returns(T)` declares the type to
+restore on the calling side. It recursively handles `NamedTuple`, dataclass,
+`TypedDict`, Enum, `T | None`, and containers such as `list[T]`,
+`dict[K, V]`, tuple, and set:
+
+```python
+class AgentJob(NamedTuple):
+    attempt: AttemptKey
+    proxy_url: str
+
+job = h.pull_job.returns(AgentJob)()
+jobs = await ah.pull_jobs.returns(list[AgentJob])()
+```
+
+A conversion failure raises a local `TypeError` naming the remote member,
+method, and failing JSON path. The remote method has already completed
+successfully at that point; only result restoration failed. The protocol
+remains plain JSON and never sends Python class names. The value returned by
+the server must itself be JSON-compatible -- `.returns()` restores types, it
+does not teach the server to serialize arbitrary objects.
+
+`.returns()` and `.timeout()` are per-call modifiers and compose in either
+order:
+
+```python
+h.pull_job.timeout(5).returns(AgentJob)()
+h.pull_job.returns(AgentJob).timeout(5)()
+```
+
+Modifiers are not keyword arguments so that they cannot collide with a
+parameter of the same name on the far side.
 
 `AsyncHandle` is its async twin: produced by `apool()`, its methods return
 awaitables, and it is otherwise identical.

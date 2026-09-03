@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import inspect
 import itertools
 import json
 import sys
@@ -18,6 +19,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, TypeVar
 
 import httpx
+import msgspec
 
 from ._errors import (
     Fenced,
@@ -75,6 +77,7 @@ _sync: httpx.Client | None = None
 _loops: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], httpx.AsyncClient]] = {}
 
 _T = TypeVar("_T")
+_RAW_RETURN = object()
 
 
 def _sync_client() -> httpx.Client:
@@ -340,6 +343,18 @@ async def ainvoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
     return _decode(r.status_code, r.content, handle.identity)
 
 
+def _restore_return(value: Any, want: Any, target: str) -> Any:
+    try:
+        return msgspec.convert(value, want, strict=False)
+    except (msgspec.ValidationError, TypeError) as e:
+        label = getattr(want, "__qualname__", repr(want))
+        raise TypeError(f"{target} returned JSON that does not match {label}: {e}") from e
+
+
+async def _restore_awaited(result: Any, want: Any, target: str) -> Any:
+    return _restore_return(await result, want, target)
+
+
 class BoundMethod:
     """Callable, and carries its own modifiers.
 
@@ -347,18 +362,40 @@ class BoundMethod:
     with a parameter of the same name on the far side.
     """
 
-    __slots__ = ("_handle", "_name", "_timeout", "_send")
+    __slots__ = ("_handle", "_name", "_timeout", "_send", "_return_type")
 
-    def __init__(self, handle: Any, name: str, timeout: float, send: Any = invoke):
+    def __init__(
+        self,
+        handle: Any,
+        name: str,
+        timeout: float,
+        send: Any = invoke,
+        return_type: Any = _RAW_RETURN,
+    ):
         self._handle, self._name, self._timeout, self._send = handle, name, timeout, send
+        self._return_type = return_type
 
     def timeout(self, seconds: float) -> BoundMethod:
-        return BoundMethod(self._handle, self._name, seconds, self._send)
+        return BoundMethod(self._handle, self._name, seconds, self._send, self._return_type)
+
+    def returns(self, return_type: Any) -> BoundMethod:
+        """Restore a JSON result as `return_type` for this call.
+
+        Supports the types `msgspec.convert` understands, including nested
+        NamedTuples, dataclasses, TypedDicts, unions and typed containers.
+        """
+        return BoundMethod(self._handle, self._name, self._timeout, self._send, return_type)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         # Explicit args/kwargs: a bare object cannot tell f({"a": 1}) from f(a=1).
         payload = {"args": list(args), "kwargs": kwargs}
-        return self._send(self._handle, self._name, payload, self._timeout)
+        result = self._send(self._handle, self._name, payload, self._timeout)
+        if self._return_type is _RAW_RETURN:
+            return result
+        target = f"{self._handle.identity}.{self._name}()"
+        if inspect.isawaitable(result):
+            return _restore_awaited(result, self._return_type, target)
+        return _restore_return(result, self._return_type, target)
 
     def __repr__(self) -> str:
         return f"<BoundMethod {self._handle!r}.{self._name}>"

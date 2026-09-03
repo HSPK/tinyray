@@ -406,9 +406,35 @@ pool.epoch(min=None, timeout=60.0) -> Epoch
 ```python
 h.assign("task")                    # 调用
 h.assign.timeout(5.0)("task")       # 单次调用的超时，默认 30 秒
+h.pull_job.returns(AgentJob)()      # 把 JSON 结果恢复成 AgentJob
 ```
 
-超时做成修饰符而不是关键字参数，是为了不和对面方法的同名参数撞车。
+JSON 不保存 Python 类型：`NamedTuple` 过线后是 list，dataclass 通常是 object。
+`.returns(T)` 在调用端声明要恢复成什么，递归处理 `NamedTuple`、dataclass、
+`TypedDict`、Enum、`T | None` 和 `list[T]` / `dict[K, V]` / tuple / set 等容器：
+
+```python
+class AgentJob(NamedTuple):
+    attempt: AttemptKey
+    proxy_url: str
+
+job = h.pull_job.returns(AgentJob)()
+jobs = await ah.pull_jobs.returns(list[AgentJob])()
+```
+
+转换失败抛本地 `TypeError`，消息带远端身份、方法名和出错的 JSON 路径；远端方法
+此时已经成功运行，失败只发生在结果恢复阶段。协议仍是普通 JSON，不会在线上传
+Python 类名。返回值本身必须可被 JSON 表达；`.returns()` 只恢复类型，不替服务端
+序列化任意对象。
+
+`.returns()` 和 `.timeout()` 都是单次调用的修饰符，可以任意顺序组合：
+
+```python
+h.pull_job.timeout(5).returns(AgentJob)()
+h.pull_job.returns(AgentJob).timeout(5)()
+```
+
+修饰符不用关键字参数，是为了不和对面方法的同名参数撞车。
 
 `AsyncHandle` 是它的异步孪生：由 `apool()` 产出，方法返回 awaitable，其余完全
 一样。
