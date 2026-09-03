@@ -5,6 +5,39 @@
 
 ---
 
+## 0.14.0
+
+新增一个调用修饰符：**`.returns(T)` 把 JSON 结果恢复成调用端声明的 Python
+类型。**
+
+```python
+job = h.pull_job.returns(AgentJob)()
+jobs = await ah.pull_jobs.returns(list[AgentJob])()
+```
+
+JSON 留得住值，留不住类型。四层嵌套的 `NamedTuple` 过线后只剩四层 list，以前每个
+client 都要重复写一遍拆包。现在调用端只声明目标类型，TinyRay 递归恢复
+`NamedTuple`、dataclass、`TypedDict`、Enum、Optional/Union、Literal、tuple、
+set、list/dict、datetime 和 UUID；`TypedDict` 仍是 dict，其中声明的
+`NamedTuple` 字段会恢复成真正的 `NamedTuple`。
+
+`.returns()` 和 `.timeout()` 都是单次调用修饰符，顺序任意：
+
+```python
+h.pull_job.timeout(5).returns(AgentJob)()
+h.pull_job.returns(AgentJob).timeout(5)()
+```
+
+协议仍是普通 JSON，不在线上传 Python 类名，也不替服务端序列化任意对象。转换失败
+抛本地 `TypeError`，消息带远端身份、方法名、目标类型和出错的 JSON 路径；远端方法
+此时已经成功运行，失败只发生在结果恢复阶段。
+
+实现复用服务端参数转换已经依赖的 `msgspec`，没有引入新依赖。七个端到端场景覆盖
+同步、异步和各种嵌套结构；六条新 mutant 全部被测试抓住。完整 Python 套件
+446 passed。
+
+---
+
 ## 0.13.3
 
 内容就是 0.13.2 —— **0.13.2 打了 tag 但没有发出去**，CI 的 example 关卡卡在

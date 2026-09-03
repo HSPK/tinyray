@@ -46,7 +46,7 @@ job 是什么、结果能有多大、能不能重跑。
 
 ## 状态
 
-**0.13.3 已发布**（[PyPI](https://pypi.org/project/tinyray/)），约 2,900 行。
+**0.14.0 已发布**（[PyPI](https://pypi.org/project/tinyray/)），约 2,900 行。
 提供 py3.10–3.13 的 Linux x86_64 / aarch64 与 macOS universal2 wheel。
 
 多机与规模均已实测：三个容器跨网络命名空间互相发现并调用，指纹一致；10 万成员
