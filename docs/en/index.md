@@ -57,7 +57,7 @@ safe to run twice.
 
 ## Status
 
-**0.15.0 is out** ([PyPI](https://pypi.org/project/tinyray/)), around 2,900
+**0.16.0 is out** ([PyPI](https://pypi.org/project/tinyray/)), around 2,900
 lines. Wheels for py3.10-3.13 on Linux x86_64 / aarch64 and macOS universal2.
 
 Multi-host and scale are both measured: three containers across network

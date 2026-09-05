@@ -61,7 +61,8 @@ is now 0.1 ms, not the historical 50 ms allowance.
 
 Same benchmark script, same Python 3.11.15 environment, same 24-vCPU AMD EPYC
 host, sequential runs with no tests/builds running alongside. The before build
-is the saved v0.15.0 wheel; the after build is the current working tree.
+is the saved v0.15.0 wheel; the after build is the optimized source released
+in v0.16.0, measured before its version metadata was bumped.
 Lookup figures below are warm-cache medians across three runs.
 
 | Operation | Before | After |

@@ -43,7 +43,8 @@ python bench.py --only discovery watch_wakeup --coalesce-ms 1
 ### 本次优化实测
 
 同一份脚本、Python 3.11.15、同一台 24-vCPU AMD EPYC 机器，顺序运行，不与
-测试或构建并发。修前使用保留的 v0.15.0 wheel，修后使用当前工作区。下表查询
+测试或构建并发。修前使用保留的 v0.15.0 wheel，修后使用 v0.16.0 的优化代码，
+测量时尚未更新版本号。下表查询
 数据是三次运行的热缓存中位数。
 
 | 操作 | 修前 | 修后 |
