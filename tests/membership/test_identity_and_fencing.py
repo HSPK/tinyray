@@ -379,3 +379,47 @@ def test_one_spelling_of_the_fencing_token(registry, kw, seated):
             assert seat.isdigit() and int(seat) > 0, f"无座位的该用自己的 id: {me.identity}"
     finally:
         me.leave()
+
+
+def test_tenure_differs_for_two_processes_in_the_same_millisecond():
+    """A millisecond timestamp alone collides on a fast restart, and equal
+    tenures mean the old occupant keeps the seat.
+
+    The threshold comes from the birthday bound rather than taste: with n
+    draws from the 20 random bits, expected collisions are n^2 / 2^21, so
+    5,000 draws inside one millisecond collide about twelve times. Anything
+    near that is fine; a timestamp alone would collide thousands of times.
+    """
+    n = 5000
+    src = textwrap.dedent(
+        f"""
+        import random, time
+        vals = set()
+        for _ in range({n}):
+            vals.add(((time.time_ns() // 1_000_000) << 20) | random.getrandbits(20))
+        print(len(vals))
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True)
+    unique = int(out.stdout)
+    expected_collisions = n * n / 2**21
+    assert unique >= n - expected_collisions * 5, (
+        f"{n - unique} collisions, far above the ~{expected_collisions:.0f} the "
+        f"birthday bound predicts"
+    )
+
+    # And the point of the random bits: a bare millisecond timestamp is not
+    # enough on its own.
+    bare = textwrap.dedent(
+        f"""
+        import time
+        vals = set()
+        for _ in range({n}):
+            vals.add(time.time_ns() // 1_000_000)
+        print(len(vals))
+        """
+    )
+    bare_unique = int(
+        subprocess.run([sys.executable, "-c", bare], capture_output=True, text=True).stdout
+    )
+    assert bare_unique < unique / 10, "the timestamp alone was suspiciously unique"

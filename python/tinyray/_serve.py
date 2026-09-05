@@ -203,35 +203,22 @@ def _coerce(
         args, kwargs = [payload], {}
 
     hints, sig = _shape(fn)
-    injected = [p for p, want in hints.items() if want is CallContext]
-    for param in injected:
-        kwargs[param] = CallContext(caller or "", request_id)
     if sig is None:
         return args, kwargs
-    names = list(sig.parameters)
-
-    if injected and args:
-        # The caller sends no value for an injected parameter, so its own
-        # arguments line up with the parameters it can actually fill -- and
-        # once one of those is not last, positions no longer agree with the
-        # signature. Passing them by name is the only thing that works for
-        # every order: positionally, `f(self, ctx, n)` called as `f(7)` bound
-        # 7 to ctx, tripped the type check, and blamed the caller for the
-        # callee's parameter order.
-        fillable = [p for p in names if p not in injected]
-        if len(args) > len(fillable):
-            # Same channel as a type mismatch: the caller got the shape wrong
-            # and nothing has run, so it must not come back as OutcomeUnknown.
-            raise msgspec.ValidationError(
-                f"takes {len(fillable)} argument(s) besides the injected "
-                f"{injected}, got {len(args)}"
-            )
-        for name, value in zip(fillable, args, strict=False):
-            kwargs[name] = value
-        args = []
-
+    kinds = inspect.Parameter
+    injected = {name for name in sig.parameters if hints.get(name) is CallContext}
+    for name in injected:
+        if sig.parameters[name].kind in (kinds.VAR_POSITIONAL, kinds.VAR_KEYWORD):
+            raise msgspec.ValidationError("CallContext needs a named, non-variadic parameter")
+    # Bind the caller's signature before injecting anything, preserving Python's
+    # positional-only, variadic and duplicate-argument rules.
+    public = (
+        sig.replace(parameters=[p for p in sig.parameters.values() if p.name not in injected])
+        if injected
+        else sig
+    )
     try:
-        sig.bind(*args, **kwargs)
+        bound = public.bind(*args, **{k: v for k, v in kwargs.items() if k not in injected})
     except TypeError as e:
         # The arguments do not fit the signature, so nothing has run. That is
         # the caller's mistake and goes back the same way a type mismatch
@@ -241,35 +228,33 @@ def _coerce(
         # raised, and which `except TypeError` does not catch.
         raise msgspec.ValidationError(str(e)) from None
 
-    # Which parameter each value belongs to, `*args` and `**kwargs` included.
-    # The rule used to be "the i-th value takes the i-th name's annotation",
-    # and `*nums: int` is one name, so it converted exactly one value and left
-    # the rest raw: `var("1", "2", "3")` reached the method as (1, '2', '3').
-    # Half-converted is the worst of the three possible answers -- it looks
-    # like the annotation was honoured. `**opts: int` was not converted at all.
-    kinds = inspect.Parameter
-    positional = [
-        p
-        for p in sig.parameters.values()
-        if p.kind in (kinds.POSITIONAL_ONLY, kinds.POSITIONAL_OR_KEYWORD)
-    ]
-    var_pos = next((p for p in sig.parameters.values() if p.kind is kinds.VAR_POSITIONAL), None)
-    var_kw = next((p for p in sig.parameters.values() if p.kind is kinds.VAR_KEYWORD), None)
+    for name, value in bound.arguments.items():
+        want = hints.get(name)
+        if want is None:
+            continue
+        kind = sig.parameters[name].kind
+        if kind is kinds.VAR_POSITIONAL:
+            bound.arguments[name] = tuple(msgspec.convert(v, want, strict=False) for v in value)
+        elif kind is kinds.VAR_KEYWORD:
+            bound.arguments[name] = {
+                k: msgspec.convert(v, want, strict=False) for k, v in value.items()
+            }
+        else:
+            bound.arguments[name] = msgspec.convert(value, want, strict=False)
 
-    def wanted(name: str | None) -> Any:
-        want = hints.get(name) if name else None
-        return None if want is CallContext else want
-
-    for i, value in enumerate(args):
-        slot = positional[i] if i < len(positional) else var_pos
-        want = wanted(slot.name if slot else None)
-        if want is not None:
-            args[i] = msgspec.convert(value, want, strict=False)
-    for key, value in kwargs.items():
-        want = wanted(key if key in sig.parameters else (var_kw.name if var_kw else None))
-        if want is not None:
-            kwargs[key] = msgspec.convert(value, want, strict=False)
-    return args, kwargs
+    if injected:
+        # Defaults fill positional gaps before an injected parameter, but are
+        # Python values already: only caller-provided JSON is coerced above.
+        bound.apply_defaults()
+        context = CallContext(caller or "", request_id)
+        bound = inspect.BoundArguments(
+            sig,
+            {
+                name: context if name in injected else bound.arguments[name]
+                for name in sig.parameters
+            },
+        )
+    return list(bound.args), bound.kwargs
 
 
 class Counters:
@@ -635,6 +620,7 @@ class MethodServer:
             loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
+        slots = None if max_concurrency is None else threading.Semaphore(max_concurrency)
         # Port 0: the kernel picks, and the actual one goes into the record.
         # One less configuration knob, and no port collisions.
         self._srv = _Server((host, 0), _Handler)
@@ -642,7 +628,7 @@ class MethodServer:
         self._srv.identity = identity
         self._srv.still_ours = lambda: self.still_ours()
         self._srv.loop = loop
-        self._srv.slots = None if max_concurrency is None else threading.Semaphore(max_concurrency)
+        self._srv.slots = slots
         self.counters = Counters()
         self._srv.counters = self.counters
         self.limit = max_concurrency

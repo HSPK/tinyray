@@ -64,3 +64,41 @@ def test_one_oversized_call_does_not_poison_the_member(registry):
         me.ready(step=7)
         assert me.state == {"host": "h1", "step": 7}, me.state
         me.unready()
+
+
+def _publish(member, method, state):
+    if method in ("ready", "update"):
+        return getattr(member, method)(**state)
+    return getattr(member, method)(state)
+
+
+@pytest.mark.parametrize("method", ["ready", "update", "set_ready", "replace"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_state_is_rejected_without_poisoning_the_member(registry, method, value):
+    with tinyray.join("finite") as me:
+        me.ready(good=1).flush()
+        before = me._c.publish_versions()
+        with pytest.raises(ValueError, match="JSON"):
+            _publish(me, method, {"bad": [value]})
+        assert me.state == {"good": 1}
+        assert me._c.publish_versions() == before
+        assert me.is_ready
+        me.update(step=2).flush()
+        me.unready().flush()
+        handle = tinyray.pool(me.pool).snapshot().get(me.identity)
+        assert handle.state == {"good": 1, "step": 2} and not handle.ready
+
+
+@pytest.mark.parametrize("method", ["ready", "update", "set_ready", "replace"])
+def test_native_state_rejection_also_preserves_python_state(registry, method):
+    nested = {}
+    for _ in range(150):
+        nested = {"nested": nested}
+    assert len(json.dumps(nested)) < tinyray.MAX_STATE
+    with tinyray.join("native-validation") as me:
+        me.ready(good=1).flush()
+        with pytest.raises(RuntimeError, match="recursion limit"):
+            _publish(me, method, nested)
+        assert me.state == {"good": 1}
+        me.unready().flush()
+        assert not me.is_ready

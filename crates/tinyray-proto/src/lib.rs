@@ -64,13 +64,9 @@ pub const MAX_WATCH: usize = 64;
 /// Booleans stay strict: `True == 1` is Python's anomaly, and letting
 /// `free=1` match `free=true` would surprise more than it helps.
 ///
-/// Integers compare as integers, i64 or u64, before f64 is considered at all.
-/// Going straight to f64 for anything that is not an i64 made every u64 above
-/// i64::MAX round to the same double: measured with a member publishing
-/// `tag=2**63`, every filter value within 1024 of it matched, so `pick()`
-/// handed back a member whose tag was not the one asked for. f64 is reached
-/// now only when one side really is a float, which is the case the rule above
-/// exists for.
+/// Mixed comparisons convert the float to an integer, never the reverse:
+/// rounding an integer to f64 would make 2**53+1 match the float 2**53.
+/// Bounds are checked before casting because Rust's casts saturate.
 ///
 /// The rule follows the value down. It used to stop at the top, so the very
 /// example it was written for came back one level in: a member publishing
@@ -79,12 +75,11 @@ pub const MAX_WATCH: usize = 64;
 /// nothing but numbers is relaxed at any depth.
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
-            (Some(i), Some(j)) => i == j,
-            _ => match (x.as_u64(), y.as_u64()) {
-                (Some(i), Some(j)) => i == j,
-                _ => x.as_f64() == y.as_f64(),
-            },
+        (Value::Number(x), Value::Number(y)) => match (x.is_f64(), y.is_f64()) {
+            (false, false) => x == y,
+            (true, true) => x.as_f64() == y.as_f64(),
+            (false, true) => integer_matches_float(x, y.as_f64().unwrap()),
+            (true, false) => integer_matches_float(y, x.as_f64().unwrap()),
         },
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_value(p, q))
@@ -98,6 +93,18 @@ fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
+fn integer_matches_float(integer: &serde_json::Number, float: f64) -> bool {
+    if float.fract() != 0.0 {
+        return false;
+    }
+    if float < 0.0 {
+        float >= i64::MIN as f64 && integer.as_i64() == Some(float as i64)
+    } else {
+        // u64::MAX rounds up to 2**64, the exclusive upper bound.
+        float < u64::MAX as f64 && integer.as_u64() == Some(float as u64)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Beat {
     pub pool: String,
@@ -105,6 +112,12 @@ pub struct Beat {
     pub slot: Option<u64>,
     pub id: u64,
     pub incarnation: u64,
+    /// Monotonic within one incarnation; covers state, readiness and URL.
+    /// Missing means a legacy client without publication ordering. Once a
+    /// tenure has sent a sequence, older or missing sequences only renew its
+    /// lease: delayed requests must not undo an acknowledged publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<u64>,
     pub policy: String,
     #[serde(default)]
     pub size: Option<u64>,
@@ -196,7 +209,9 @@ pub struct BeatAck {
 ///   0  everything before long polling existed (pre-0.7.0)
 ///   1  honours `Beat.hold_ms`: parks a reply that has nothing to say and
 ///      answers the moment a watched pool moves
-pub const PROTOCOL: u32 = 1;
+///   2  honours `Beat.publication`: a delayed beat cannot roll back the
+///      state, readiness or URL of the same incarnation
+pub const PROTOCOL: u32 = 2;
 
 #[cfg(test)]
 mod tests {

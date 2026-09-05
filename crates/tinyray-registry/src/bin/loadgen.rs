@@ -81,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     slot: None,
                     id: (offset + i) as u64,
                     incarnation: 1,
+                    publication: Some(0),
                     policy: "churn".into(),
                     size: None,
                     url: Some(format!("http://10.0.0.1:{}", 10000 + i)),

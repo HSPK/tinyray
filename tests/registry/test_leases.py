@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
 import time
+import urllib.request
 
 import pytest
 import tinyray
-from conftest import BIN, RegistryProc, free_port
+
+from tests.support.ordering_proxy import OrderingProxy
+from tests.support.registry import BIN, RegistryProc, free_port
 
 MEMBER = textwrap.dedent(
     """
@@ -96,3 +100,68 @@ def test_a_lease_that_is_not_a_length_of_time_is_refused_cleanly(ttl):
     assert p.returncode != 0, f"--ttl-ms {ttl!r} 被接受了"
     assert "Traceback" not in out, out[-400:]
     assert "is not a length of time" in out, out[-400:]
+
+
+@pytest.mark.parametrize("ttl_ms", [200, 1000])
+def test_delayed_downlink_does_not_stop_renewing_a_reachable_registry(ttl_ms):
+    reg = RegistryProc(ttl_ms)
+    proxy = None
+    me = None
+    reg.start()
+    try:
+        proxy = OrderingProxy(reg.endpoint, header_delay=0.35)
+        me = tinyray.join("renewal", registry_url=proxy.endpoint, timeout=2)
+        me.ready().flush(timeout=2)
+        time.sleep(0.3)
+        before = me.stats()
+        proxy.arm_reply.set()
+        assert proxy.reply_held.wait(2)
+        started = time.monotonic()
+        deadline = started + 0.8
+        samples = 0
+        while time.monotonic() < deadline:
+            with urllib.request.urlopen(f"http://{reg.endpoint}/v1/pools", timeout=2) as r:
+                count = json.load(r)[me.pool]["members"]
+            assert count == 1, "reply timeout stopped renewals beyond the lease"
+            samples += 1
+            time.sleep(0.003)
+        assert samples > 1
+        assert me.stats()["beats_failed"] > before["beats_failed"], "fault was not exercised"
+        if ttl_ms == 200:
+            with proxy.lock:
+                during = [t for t, _ in proxy.requests if started < t < started + 0.3]
+            assert during, "upstream must stay usable while replies are delayed"
+    finally:
+        if me is not None:
+            me.leave()
+        if proxy is not None:
+            proxy.close()
+        reg.stop()
+
+
+def test_headers_and_body_share_one_heartbeat_deadline():
+    reg = RegistryProc(1000)
+    proxy = None
+    me = None
+    reg.start()
+    try:
+        # The 250ms hold plus jitter and 120ms delay fit the 500ms budget.
+        # Another 250ms for the body does not; a fresh deadline would accept it.
+        proxy = OrderingProxy(reg.endpoint, header_delay=0.12, body_delay=0.25)
+        me = tinyray.join("whole_deadline", registry_url=proxy.endpoint, timeout=2)
+        me.ready().flush(timeout=2)
+        time.sleep(0.3)
+        before = me.stats()["beats_failed"]
+        proxy.arm_reply.set()
+        assert proxy.reply_held.wait(2)
+        deadline = time.monotonic() + 1
+        while me.stats()["beats_failed"] == before and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert me.stats()["beats_failed"] > before, "body collection restarted the budget"
+        assert "reply body stalled" in me.last_error
+    finally:
+        if me is not None:
+            me.leave()
+        if proxy is not None:
+            proxy.close()
+        reg.stop()

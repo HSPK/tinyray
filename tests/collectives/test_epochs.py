@@ -1,4 +1,4 @@
-"""M3 acceptance: freeze a round, and notice when it breaks."""
+"""Freeze a round and notice when it breaks."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import time
 
 import pytest
 import tinyray
+from tinyray._tinyray import Client
+
+from tests.support.faulty_net import FaultyProxy
 
 RANK = textwrap.dedent(
     """
@@ -428,3 +431,88 @@ def test_readiness_does_not_break_a_round_but_leaving_does(registry):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+def test_fencing_invalidates_epochs_even_without_a_final_cache_refresh(registry):
+    proxy = FaultyProxy(registry.endpoint)
+    try:
+        with tinyray.join(
+            "epoch-owner", "collective", slot=0, size=1, registry_url=proxy.endpoint
+        ) as me:
+            me.ready().flush()
+            pool = tinyray.pool(me.pool)
+            epoch = pool.epoch(timeout=5)
+            proxy.reset_rate = 1.0
+            failures = me.stats()["beats_failed"]
+            me.update(step=1)
+            deadline = time.monotonic() + 5
+            while me.stats()["beats_failed"] == failures and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert me.stats()["beats_failed"] > failures
+            assert epoch.valid, "Losing contact alone must not invalidate the epoch"
+
+            replacement = Client(
+                endpoint=f"http://{registry.endpoint}",
+                pool=me.pool,
+                id=0,
+                incarnation=me.incarnation + 1,
+                policy="collective",
+                slot=0,
+                size=1,
+            )
+            try:
+                assert replacement.start(2000) and replacement.accepted
+                proxy.reset_rate = 0.0
+                assert me.wait_fenced(timeout=10)
+                assert not epoch.valid
+                with pytest.raises(tinyray.Fenced, match="epoch-owner"):
+                    pool.epoch(timeout=0.1)
+                with pool.changes() as watch, pytest.raises(tinyray.Fenced):
+                    next(watch)
+            finally:
+                replacement.leave()
+    finally:
+        proxy.close()
+
+
+def test_a_watchdog_thread_survives_shutdown(registry):
+    """The documented way to use ep.valid is a background thread, so the
+    library must not blow up in that thread when the member leaves.
+
+    leave() used to hold pyo3's mutable borrow for the whole of a network
+    round trip, and anything touching the client in that window raised
+    "Already mutably borrowed". The window is sub-millisecond, so this polls
+    flat out from several threads across several cycles: with the bug present
+    that catches it every time, with it fixed, never.
+    """
+    errors: list[str] = []
+    for _ in range(6):
+        me = tinyray.join("trainer", "collective", slot=0, size=1)
+        me.ready()
+        ep = tinyray.pool("trainer").epoch(timeout=10)
+        stop = threading.Event()
+
+        def watchdog(stop: threading.Event = stop, ep: tinyray.Epoch = ep) -> None:
+            # 绑成默认参数：闭包捕获循环变量，下一轮会把它们换掉。
+            while not stop.is_set():
+                try:
+                    _ = ep.valid  # 读它就是在查注册中心，这正是要压的那条路
+                except BaseException as exc:  # noqa: BLE001 - any failure counts
+                    errors.append(repr(exc))
+                    return
+
+        threads = [threading.Thread(target=watchdog, daemon=True) for _ in range(4)]
+        for t in threads:
+            t.start()
+        try:
+            time.sleep(0.02)
+            me.leave()  # a blocking round trip, with watchdogs hammering away
+            time.sleep(0.02)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=5)
+            me.leave()
+        if errors:
+            break
+    assert not errors, f"watchdog died during shutdown: {errors[0]}"

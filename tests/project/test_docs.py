@@ -14,7 +14,8 @@ import pathlib
 
 import tinyray
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+from tests.support.registry import ROOT
+
 # Recursive on purpose. The English pages live in docs/en/, and a top-level
 # glob would leave them out of every check here -- which is exactly how a
 # document rots: nothing is looking at it.

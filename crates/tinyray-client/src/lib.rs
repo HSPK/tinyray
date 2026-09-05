@@ -65,10 +65,10 @@ impl Client {
             policy,
             size,
             methods: methods.unwrap_or_default(),
-            url: Mutex::new(url),
             published: Mutex::new(Published {
                 state: serde_json::Value::Object(Default::default()),
                 ready: false,
+                url,
                 version: 0,
             }),
             leaving: AtomicBool::new(false),
@@ -235,7 +235,15 @@ impl Client {
 
     #[pyo3(signature = (url=None))]
     fn set_url(&self, url: Option<String>) {
-        *self.shared.url.lock().unwrap() = url;
+        {
+            let mut published = self.shared.published.lock().unwrap();
+            if published.url == url {
+                return;
+            }
+            published.url = url;
+            published.version += 1;
+        }
+        self.shared.wake.notify_one();
     }
 
     /// Members of `pool` matching `filter_json`, as a JSON list.

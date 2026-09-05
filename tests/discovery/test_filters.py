@@ -134,3 +134,26 @@ def test_the_number_rule_reaches_inside_nested_values(fleet, filt, expected):
     形状仍然精确：cfg={} 匹配不到 cfg={"shard": 3}，键多一个少一个都不行。
     """
     assert len(fleet.all(**filt)) == expected, filt
+
+
+def test_public_numeric_filters_preserve_exact_values(registry):
+    cases = [
+        (2**53 + 1, float(2**53), False),
+        (-(2**53 + 1), -float(2**53), False),
+        (2**53, float(2**53), True),
+        (-(2**63), -float(2**63), True),
+        (2**63 - 1, float(2**63), False),
+        (2**63, float(2**63), True),
+        (2**64 - 1, float(2**64), False),
+        (2**64 - 2048, float(2**64 - 2048), True),
+        (3, 3.0, True),
+        (True, 1.0, False),
+    ]
+    with tinyray.join("exact_numbers") as me:
+        pool = tinyray.pool(me.pool)
+        for stored, requested, expected in cases:
+            for a, b in [(stored, requested), (requested, stored)]:
+                me.ready(tag=a, nested={"values": [a]}).flush(timeout=2)
+                assert len(pool.all(tag=a)) == 1, "exact-match control"
+                assert len(pool.all(tag=b)) == int(expected), (a, b)
+                assert len(pool.all(nested={"values": [b]})) == int(expected), (a, b)

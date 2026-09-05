@@ -9,10 +9,13 @@ import sys
 import textwrap
 import threading
 import time
+import warnings
 
+import httpx
 import pytest
 import tinyray
-from conftest import BIN, free_port
+
+from tests.support.registry import BIN, free_port
 
 PROBE = textwrap.dedent(
     """
@@ -235,3 +238,64 @@ def test_a_list_of_registries_is_refused_instead_of_dialled():
                     tinyray.join("p", "churn")
                 finally:
                     os.environ.pop("TINYRAY_REGISTRY", None)
+
+
+class Ping:
+    def ping(self):
+        return "pong"
+
+
+@pytest.mark.parametrize("failure", ["endpoint", "advertise", "native", "warning"])
+def test_failed_join_releases_every_acquired_resource(registry, monkeypatch, failure):
+    servers = []
+    original = tinyray._MethodServer
+
+    def create(*args, **kwargs):
+        server = original(*args, **kwargs)
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr(tinyray, "_MethodServer", create)
+    kwargs = {}
+    if failure == "endpoint":
+        kwargs["registry_url"] = ""
+    elif failure == "advertise":
+        monkeypatch.setenv("TINYRAY_ADVERTISE", "http://not-a-host")
+    elif failure == "native":
+        kwargs.update(policy="stateful", slot=0.5)
+    else:
+        monkeypatch.setattr(tinyray.RegistryInfo, "FEATURES", {"long_poll": 999})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", tinyray.OldRegistryWarning)
+        with pytest.raises((ValueError, TypeError, tinyray.OldRegistryWarning)):
+            tinyray.join("failed-start", serves=Ping(), **kwargs)
+    assert tinyray._client is None
+    for server in servers:
+        assert not server._thread.is_alive()
+        with httpx.Client(trust_env=False) as client, pytest.raises(httpx.ConnectError):
+            client.post(f"http://127.0.0.1:{server.port}/call/ping", json={})
+    # Constructor, post-construction and post-registration failures all permit
+    # another ordinary join in the same process.
+    monkeypatch.setenv("TINYRAY_ADVERTISE", "127.0.0.1")
+    monkeypatch.setattr(tinyray.RegistryInfo, "FEATURES", {"long_poll": 1})
+    with tinyray.join("failed-start", serves=Ping()) as me:
+        me.ready().flush()
+        assert tinyray.pool(me.pool).pick().ping() == "pong"
+
+
+def test_joining_twice_is_refused_rather_than_leaking_a_heartbeat(registry):
+    me = tinyray.join("env", "churn")
+    me.ready()
+    with pytest.raises(RuntimeError, match="already joined"):
+        tinyray.join("env", "churn")
+    me.leave()
+    again = tinyray.join("env", "churn")  # allowed once the first one left
+    again.leave()
+
+
+def test_advertised_address_is_reachable_from_elsewhere(registry):
+    """Publishing 127.0.0.1 from a multi-node job is silent misrouting."""
+    addr = tinyray._advertise()
+    assert not addr.startswith("127."), f"advertising loopback address {addr}"
+    with socket.socket() as s:
+        s.bind((addr, 0))  # it must actually be one of ours

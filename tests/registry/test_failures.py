@@ -11,7 +11,8 @@ import threading
 import time
 
 import tinyray
-from conftest import free_port
+
+from tests.support.registry import free_port
 
 PROBE = textwrap.dedent(
     """

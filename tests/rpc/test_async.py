@@ -226,3 +226,51 @@ def test_a_member_still_answers_after_the_loop_it_joined_on_stops(registry, how)
             p.wait(timeout=8)
         except Exception:
             p.kill()
+
+
+ASYNC_PEER = textwrap.dedent(
+    """
+    import sys, tinyray
+    class S:
+        def ping(self, x: int) -> int: return x
+    with tinyray.join("aconn", "stateful", slot=0, serves=S()) as me:
+        me.ready()
+        print("READY", flush=True)
+        sys.stdin.readline()
+    """
+)
+
+
+def test_async_calls_reuse_one_connection(registry):
+    """The sync path was fixed first; the async path kept sending
+    `connection: close` and burned a socket per call."""
+    me = tinyray.join("driver", "churn")
+    me.ready()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", ASYNC_PEER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout.readline().strip() == "READY"
+    tinyray.pool("aconn").wait(count=1, timeout=10)
+
+    def time_wait() -> int:
+        out = subprocess.run(["ss", "-tan"], capture_output=True, text=True).stdout
+        return out.count("TIME-WAIT")
+
+    async def drive() -> None:
+        h = tinyray.apool("aconn").slot(0)
+        for i in range(200):
+            assert await h.ping(i) == i
+
+    before = time_wait()
+    asyncio.run(drive())
+    churn = (time_wait() - before) / 200
+    try:
+        assert churn < 0.1, f"{churn:.2f} new sockets per call; keep-alive is not working"
+    finally:
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        proc.wait(timeout=5)
+        me.leave()

@@ -147,7 +147,7 @@ def test_member_accepted_and_silence_and_stats(svc):
         "pool_revision",
         "watched_pools",
         # 这个 fixture 交出来的是 driver，它没有 serves=，所以没有服务端那一半。
-        # 服务端计数器由 tests/test_stats.py 单独盯。
+        # 服务端计数器由 tests/rpc/test_stats.py 单独盯。
     }
     assert stats["beats_ok"] >= 1
 

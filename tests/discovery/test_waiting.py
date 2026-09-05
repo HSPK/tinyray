@@ -455,3 +455,49 @@ def test_the_budget_is_a_deadline_not_an_allowance_on_top(registry, flavour):
         assert elapsed < 1.25, (
             f"预算 0.3s 全花在 predicate 上了，库不该再加一份：实际 {elapsed:.2f}s"
         )
+
+
+@pytest.mark.parametrize("flavour", ["sync", "async"])
+@pytest.mark.parametrize("fields", [None, ["step"]])
+def test_watch_deadline_wins_over_available_changes(registry, flavour, fields):
+    with tinyray.join("deadline") as me:
+        me.ready(step=0).flush()
+        pool = tinyray.apool(me.pool)
+        watch = (
+            pool.changes(timeout=0.02, fields=fields)
+            if flavour == "sync"
+            else pool.achanges(timeout=0.02, fields=fields)
+        )
+        try:
+            time.sleep(0.04)
+            me.update(step=1).flush()
+            if flavour == "sync":
+                with pytest.raises(StopIteration):
+                    next(watch)
+            else:
+                with pytest.raises(StopAsyncIteration):
+                    asyncio.run(anext(watch))
+        finally:
+            watch.close()
+
+
+@pytest.mark.parametrize("flavour", ["sync", "async"])
+def test_until_does_not_reenter_a_predicate_after_expiry(registry, flavour):
+    with tinyray.join("busy-deadline") as me:
+        me.ready(step=0).flush()
+        calls = 0
+
+        def predicate(_snapshot):
+            nonlocal calls
+            calls += 1
+            assert calls == 1, "A ready change bypassed the exhausted deadline"
+            me.update(step=1).flush()
+            time.sleep(0.04)
+            return False
+
+        with pytest.raises(TimeoutError):
+            if flavour == "sync":
+                tinyray.pool(me.pool).until(predicate, timeout=0.02)
+            else:
+                asyncio.run(tinyray.apool(me.pool).auntil(predicate, timeout=0.02))
+        assert calls == 1

@@ -18,6 +18,7 @@ import threading
 import time
 import warnings
 import weakref
+from contextlib import ExitStack as _ExitStack
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
@@ -304,7 +305,7 @@ class Epoch:
         # Losing the registry does not invalidate a group that is still
         # running; it only costs fast detection. Killing the round here would
         # contradict "the registry can die without stopping training".
-        return info is None or info[1] == self.roster
+        return self._c.accepted and (info is None or info[1] == self.roster)
 
     def __len__(self) -> int:
         return len(self.members)
@@ -456,10 +457,11 @@ class _LoopBell:
         # Deregister before closing, or the bell would write a byte into
         # whatever the descriptor number gets reused for.
         self._client.drop_wake_fd(self._w)
-        try:
+        if not self._loop.is_closed():
+            # A rejoin can replace this bell before leave's wakeup is read.
+            self._fire()
             self._loop.remove_reader(self._r)
-        except Exception:
-            pass
+        self._waiters.clear()
         os.close(self._r)
         os.close(self._w)
 
@@ -471,13 +473,22 @@ _live_watches: weakref.WeakSet[_Watching] = weakref.WeakSet()
 
 
 def _loop_bell(client: _Client) -> _LoopBell:
+    if client is not _client:
+        raise RuntimeError(
+            "cannot wait on a membership that has left; use the current Member or Pool"
+        )
     # Waiting for the weak reference to die never fired: a bell holds its own
     # loop, so the entry kept that loop alive. What actually happens is the
     # loop being closed, which asyncio.run() does every time. Left unclaimed,
     # every run that touched a watch kept its pipe: measured at 101 bells and
     # 210 descriptors after 101 of them, with the heartbeat writing into all
     # 101 dead pipes on every beat.
-    return _rpc.per_loop(_bells, lambda loop: _LoopBell(client, loop), lambda bell: bell.close())
+    return _rpc.per_loop(
+        _bells,
+        lambda loop: _LoopBell(client, loop),
+        lambda bell: bell.close(),
+        reuse=lambda bell: bell._client is client,
+    )
 
 
 def _left_ms(deadline: float | None) -> int | None:
@@ -514,7 +525,7 @@ class RegistryInfo:
     #: table rather than a per-feature flag: the registry says one number and
     #: the meaning of that number lives here, in the package that depends on
     #: it, so an old client never has to be taught about a future feature.
-    FEATURES = {"long_poll": 1}
+    FEATURES = {"long_poll": 1, "publication_ordering": 2}
 
     def __init__(self, protocol: int, version: str):
         self.protocol = protocol
@@ -635,6 +646,9 @@ class _Watching:
                 f"frozen. Nothing here can recover; the process has to stop "
                 f"using whatever the seat entitled it to."
             )
+        # Expiry also wins when the pool changes faster than it is consumed.
+        if _left_ms(self._deadline) is None:
+            return None, 0
         self._tick = self._c.cache_revision()
         info = self._c.pool_info(self._pool._name)
         # The bell rings once a beat whether or not anything happened, so what
@@ -704,8 +718,11 @@ class AsyncWatch(_Watching):
         return self
 
     async def __anext__(self) -> Snapshot:
-        bell = _loop_bell(self._c)
         while True:
+            if self._closed:
+                raise StopAsyncIteration
+            # Register before checking state: fencing can be the last wakeup.
+            bell = _loop_bell(self._c)
             snap, ms = self._step()
             if snap is not None:
                 return snap
@@ -975,9 +992,11 @@ class Pool:
         them, so the fingerprint could describe occupants the list never saw.
         """
         deadline = time.monotonic() + timeout
+        self._check_fenced()
         self._settle()
         found, mismatched = 0, False
         while True:
+            self._check_fenced()
             # A stale roster is not safe to build a collective on: ranks could
             # disagree. Refuse rather than freeze something we cannot trust.
             if self._c.silence_ms > self._lease_ms():
@@ -1007,6 +1026,7 @@ class Pool:
                 members = [self._handle_cls(self._name, m, tuple(info[3])) for m in json.loads(raw)]
                 found, mismatched = len(members), ours != whole
                 if found >= target and not mismatched:
+                    self._check_fenced()
                     return Epoch(self._name, self._c, members, whole)
             ms = _left_ms(deadline)
             if ms is None:
@@ -1023,6 +1043,13 @@ class Pool:
                     f"{found} of {target} present"
                 )
             self._c.wait_revision(rev, ms)
+
+    def _check_fenced(self) -> None:
+        if not self._c.accepted:
+            raise Fenced(
+                f"cannot open a round of {self._name!r}: this process lost its "
+                f"seat and its cached roster can no longer be trusted"
+            )
 
     def _lease_ms(self) -> int:
         return max(int(self._c.stats().get("interval_ms", 1000)) * 4, 1000)
@@ -1097,8 +1124,8 @@ class Member:
             # poisoned the member for good.
             merged = {**self._state, **state}
             raw = self._encode_state(merged)
-            self._state = merged
             self._c.set_state(raw, True)
+            self._state = merged
         return self
 
     def update(self, **state: Any) -> Member:
@@ -1114,8 +1141,8 @@ class Member:
         with self._lock:
             merged = {**self._state, **state}
             raw = self._encode_state(merged)
-            self._state = merged
             self._c.set_state_only(raw)
+            self._state = merged
         return self
 
     def replace(self, state: dict[str, Any] | None = None) -> Member:
@@ -1125,12 +1152,12 @@ class Member:
         with self._lock:
             fresh = dict(state or {})
             raw = self._encode_state(fresh)
-            self._state = fresh
             self._c.set_state_only(raw)
+            self._state = fresh
         return self
 
     def _encode_state(self, state: dict[str, Any]) -> str:
-        raw = json.dumps(state)
+        raw = json.dumps(state, allow_nan=False)
         # The registry would refuse this, but silently and in a background
         # thread. Refusing here names the call that did it. The bound exists
         # because state is copied to every subscriber: 6 MB became 120 MB
@@ -1155,8 +1182,8 @@ class Member:
         with self._lock:
             fresh = dict(state or {})
             raw = self._encode_state(fresh)
-            self._state = fresh
             self._c.set_state(raw, True)
+            self._state = fresh
         return self
 
     def flush(self, timeout: float = 10.0) -> Member:
@@ -1222,9 +1249,9 @@ class Member:
         behind in the one other place that had it.
         """
         self._mine()
-        bell = _loop_bell(self._c)
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
+            bell = _loop_bell(self._c)
             if not self._c.accepted:
                 return True
             ms = _left_ms(deadline)
@@ -1380,7 +1407,7 @@ _FIRST_ANSWER_S = 2.0
 _FIRST_BEAT_S = 5.0
 
 # Matches MAX_STATE in the registry: a fact about where something is, not the
-# something. See tests/test_state_budget.py for the amplification measurement.
+# something. See tests/membership/test_state.py for the amplification measurement.
 MAX_STATE = 16 << 10
 
 # Default for join(timeout=): how long to keep trying to reach the registry.
@@ -1506,122 +1533,101 @@ def join(
     # cluster running collectives already needs.
     incarnation = ((time.time_ns() // 1_000_000) << 20) | random.getrandbits(20)
 
-    server = None
-    methods: list[str] = []
-    if serves is not None:
-        server = _MethodServer(
-            serves, _identity(pool, slot, ident, incarnation), max_concurrency=max_concurrency
-        )
-        methods = server.methods
-        url = url or server.url(_advertise())
-
     # Resolved once. Every later mention -- the client, the unreachable
     # message, the old-registry warning -- reads this and not the environment,
     # so there is one spelling of where we actually dialled.
     endpoint = _endpoint(registry_url)
-    c = _Client(
-        endpoint=endpoint,
-        pool=pool,
-        id=ident,
-        incarnation=incarnation,
-        policy=policy,
-        slot=slot,
-        size=size,
-        url=url,
-        methods=methods,
-        exclusive=exclusive,
-    )
-    if server is not None:
-        # A superseded process keeps running and keeps its port open, so the
-        # only thing that knows it is a ghost is the registry's answer to its
-        # own heartbeat. Wire that in, or a caller holding a stale handle gets
-        # a cheerful reply from the wrong process.
-        server.still_ours = lambda: c.accepted
-    c.watch([pool])
-    deadline = time.monotonic() + timeout
-    # The budget covers reaching the registry, not just the waiting afterwards.
-    # It used to start counting only once the first beat had already spent its
-    # own fixed five seconds, so join(timeout=) could lengthen the call and
-    # never shorten it: measured against a registry that accepts connections
-    # and never replies, join(timeout=0.5) took 10502ms and join(timeout=8)
-    # took 18004ms -- always the budget plus ten.
-    #
-    # The first beat gets a short slice of it rather than all of it, because
-    # retrying beats waiting: the loop below re-sends every interval, while one
-    # long attempt has nothing behind it. Handing over the whole budget was
-    # measured on a 40%-loss link at a median join of 32.7s against a 30s
-    # budget -- every start paying the deadline in full -- and it doubled the
-    # lossy-link test from 7:22 to 17:06.
-    if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):
-        # Losing the registry later is survivable -- the cache carries the
-        # process. Never reaching it is not: there is nothing to carry, and
-        # the process would publish state nobody sees and wait for peers who
-        # cannot appear. Measured against a wrong port, an unroutable address
-        # and a name that does not resolve: join() returned in 0.0s to 5.0s
-        # with accepted=True, zero beats through and its own pool empty.
-        while not c.stats()["beats_ok"]:
-            rev = c.cache_revision()
-            if c.stats()["beats_ok"]:
-                break
-            ms = _left_ms(deadline)
-            if ms is None:
-                break
-            c.wait_revision(rev, ms)
-        if not c.stats()["beats_ok"]:
-            c.leave()
-            if server is not None:
-                server.close()
-            raise Unreachable(
-                f"no answer from the registry at {endpoint} after "
-                f"{timeout:g}s and {c.stats()['beats_failed']} attempts: "
-                f"{c.last_error()}. Pass join(timeout=) to wait longer."
+    # Transfer ownership only after every initialization step succeeds.
+    # This also cleans up validation errors and warnings promoted to errors.
+    with _ExitStack() as cleanup:
+        server = None
+        methods: list[str] = []
+        if serves is not None:
+            server = _MethodServer(
+                serves, _identity(pool, slot, ident, incarnation), max_concurrency=max_concurrency
             )
-    if not c.accepted:
-        # Seats are last-writer-wins by default, because a restarting rank has
-        # to reclaim its seat while the dead one's lease is still running.
-        # exclusive= asks for the opposite, which is what an election wants.
-        #
-        # Either way a refusal has to be raised. The beat loop stops on one,
-        # so returning would hand back a member that never beats again while
-        # accepted, silence_ms and an empty pool are the only clues -- measured
-        # at beats_ok frozen at 2, last_error empty and its own pool showing
-        # zero members.
-        c.leave()
+            cleanup.callback(server.close)
+            methods = server.methods
+            url = url or server.url(_advertise())
+
+        c = _Client(
+            endpoint=endpoint,
+            pool=pool,
+            id=ident,
+            incarnation=incarnation,
+            policy=policy,
+            slot=slot,
+            size=size,
+            url=url,
+            methods=methods,
+            exclusive=exclusive,
+        )
+        cleanup.callback(c.leave)
         if server is not None:
-            server.close()
-        if c.refused():
-            raise PolicyError(c.refused())
-        if exclusive:
-            raise SeatTaken(f"seat {slot} of {pool!r} is already held")
-        raise SeatTaken(
-            f"the registry refused tenure {incarnation} for seat {slot} of "
-            f"{pool!r}: a later one holds it. A restarting process normally "
-            f"carries the newer tenure, so the usual cause is a clock that "
-            f"went backwards on this node."
-        )
-    _client = c
-    _owner_pid = os.getpid()
-    seen = RegistryInfo(*c.registry())
-    if not seen.supports("long_poll"):
-        warnings.warn(
-            f"the registry at {endpoint} reports protocol {seen.protocol} "
-            f"({seen.version or 'version not reported'}) but tinyray "
-            f"{__version__} expects {RegistryInfo.FEATURES['long_poll']}. "
-            f"Everything works; changes will take up to a heartbeat interval "
-            f"to show up instead of a round trip, and this process will beat "
-            f"far more often. Upgrade the registry, or silence this with "
-            f"warnings.filterwarnings('ignore', "
-            f"category=tinyray.OldRegistryWarning).",
-            OldRegistryWarning,
-            stacklevel=2,
-        )
-    _rpc.set_identity(_identity(pool, slot, ident, incarnation))
-    member = Member(c, pool, slot, incarnation, server, ident)
-    # A process that exits normally should say goodbye, so the seat frees up
-    # immediately instead of waiting out the lease. SIGKILL still falls back
-    # to lease expiry -- both paths work, they just differ in speed.
-    atexit.register(member._leave_at_exit)
-    return member
+            # A superseded process can keep listening; its heartbeat is what
+            # tells the server it must stop answering as the old occupant.
+            server.still_ours = lambda: c.accepted
+        c.watch([pool])
+        deadline = time.monotonic() + timeout
+        # Include the first exchange in the budget, but leave time to retry
+        # a dropped request rather than spending the whole budget on it.
+        if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):
+            while not c.stats()["beats_ok"]:
+                rev = c.cache_revision()
+                if c.stats()["beats_ok"]:
+                    break
+                ms = _left_ms(deadline)
+                if ms is None:
+                    break
+                c.wait_revision(rev, ms)
+            if not c.stats()["beats_ok"]:
+                raise Unreachable(
+                    f"no answer from the registry at {endpoint} after "
+                    f"{timeout:g}s and {c.stats()['beats_failed']} attempts: "
+                    f"{c.last_error()}. Pass join(timeout=) to wait longer."
+                )
+        if not c.accepted:
+            # A refusal stops the beat loop: never hand back a member whose
+            # apparently live cache will remain frozen forever.
+            if c.refused():
+                raise PolicyError(c.refused())
+            if exclusive:
+                raise SeatTaken(f"seat {slot} of {pool!r} is already held")
+            raise SeatTaken(
+                f"the registry refused tenure {incarnation} for seat {slot} of "
+                f"{pool!r}: a later one holds it. A restarting process normally "
+                f"carries the newer tenure, so the usual cause is a clock that "
+                f"went backwards on this node."
+            )
+        seen = RegistryInfo(*c.registry())
+        missing = [feature for feature in RegistryInfo.FEATURES if not seen.supports(feature)]
+        if missing:
+            required = max(RegistryInfo.FEATURES[feature] for feature in missing)
+            effects = []
+            if "long_poll" in missing:
+                effects.append(
+                    "changes take up to a heartbeat interval and requests are more frequent"
+                )
+            if "publication_ordering" in missing:
+                effects.append("delayed requests can roll back already-confirmed state")
+            warnings.warn(
+                f"the registry at {endpoint} reports protocol {seen.protocol} "
+                f"({seen.version or 'version not reported'}) but tinyray "
+                f"{__version__} expects {required} for {', '.join(missing)}: "
+                f"{'; '.join(effects)}. Upgrade the registry, or silence this with "
+                f"warnings.filterwarnings('ignore', "
+                f"category=tinyray.OldRegistryWarning).",
+                OldRegistryWarning,
+                stacklevel=2,
+            )
+        member = Member(c, pool, slot, incarnation, server, ident)
+        # A normal exit releases the seat; SIGKILL still falls back to expiry.
+        atexit.register(member._leave_at_exit)
+        _rpc.set_identity(member.identity)
+        _client = c
+        _owner_pid = os.getpid()
+        cleanup.pop_all()
+        return member
 
 
 class AsyncPool(Pool):

@@ -366,3 +366,57 @@ def test_the_annotation_covers_every_value_it_names(typed):
     # 放宽的只是形式，不是类型：转不过去的照样是调用方的错，且方法没跑过。
     with pytest.raises(TypeError):
         typed.gather("1", "not a number")
+
+
+class ContextSignatures:
+    def variadic(self, head: int, ctx: tinyray.CallContext, *nums: int, **opts: int):
+        return [head, list(nums), opts, ctx.identity]
+
+    def positional(self, value: int, ctx: tinyray.CallContext, /, tail: int = 3):
+        return [value, tail, ctx.identity]
+
+    def keyword_context(self, *nums: int, ctx: tinyray.CallContext, **opts: int):
+        return [list(nums), opts, ctx.identity]
+
+    def defaults(self, value: int = 7, ctx: tinyray.CallContext = None, /):
+        return [value, ctx.identity]
+
+    def ordinary(self, ctx: tinyray.CallContext, value: int):
+        return value
+
+
+def test_context_injection_preserves_python_binding_and_conversion(registry):
+    with tinyray.join("signatures", serves=ContextSignatures()) as me:
+        me.ready().flush()
+        handle = tinyray.pool(me.pool).pick()
+        assert handle.variadic("1", "2", "3", extra="4") == [
+            1,
+            [2, 3],
+            {"extra": 4},
+            me.identity,
+        ]
+        assert handle.positional("1", tail="2") == [1, 2, me.identity]
+        assert handle.keyword_context("1", "2", extra="3") == [
+            [1, 2],
+            {"extra": 3},
+            me.identity,
+        ]
+        assert handle.defaults() == [7, me.identity]
+        assert handle.ordinary("1", ctx="not the real caller") == 1
+        for call in (
+            lambda: handle.ordinary(1, value=2),
+            lambda: handle.positional(value=1),
+            lambda: handle.variadic(1, 2, "not a number"),
+            lambda: handle.ordinary(),
+            lambda: handle.ordinary(1, 2),
+        ):
+            with pytest.raises(TypeError):
+                call()
+
+
+def test_a_return_annotation_is_not_an_injected_parameter():
+    def identity(value: int) -> tinyray.CallContext:
+        return tinyray.CallContext(f"p/{value}#1")
+
+    args, kwargs = _serve._coerce(identity, {"args": ["7"]})
+    assert identity(*args, **kwargs).identity == "p/7#1"

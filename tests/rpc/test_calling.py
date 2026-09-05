@@ -1,4 +1,4 @@
-"""M2 acceptance: a plain object becomes callable across processes."""
+"""A plain object becomes callable across processes."""
 
 from __future__ import annotations
 

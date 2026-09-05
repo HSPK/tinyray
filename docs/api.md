@@ -38,6 +38,9 @@ tinyray.join(
 阻塞到第一拍落地。联系不上抛 `Unreachable`，座位被更晚的任期占着抛 `SeatTaken`，
 池子形状对不上抛 `PolicyError`。**一个进程只能加入一个 pool。**
 
+加入失败会先关闭已创建的心跳和方法服务器，再抛出错误；同一进程可重试，不会留下
+未注册但仍能接收调用的服务。
+
 ### policy
 
 | policy | 有座位号 | 用在哪 |
@@ -162,16 +165,22 @@ me.flush(timeout=10.0) -> Member     # 阻塞到注册中心确实收下
 
     GIL 保证不了这件事：它只让单条字节码不并行，管不到网络发送和完成的顺序。
 
-    发出去的是**当前值**，不是一条日志。心跳只有一个循环，读的是那个寄存器，
-    所以线上不会乱序；但两次发布挨得比一拍还近时，中间那个值可能根本不上线 ——
-    这是软状态的定义，不是缺陷。要每一步都留痕，那是数据面的事。
+    发出去的是**当前值**，不是一条日志。协议 2 给 state、就绪位和 URL 一起加上
+    发布序号；已取消的旧请求晚到时只续租，不覆盖新状态。两次发布挨得比一拍还近时，
+    中间那个值仍可能根本不上线 —— 这是软状态的定义，不是缺陷。要每一步都留痕，
+    那是数据面的事。
 
-`flush()` 最多多等一拍：调用时若有心跳在途，那一拍是改之前组装的，确认要等到
-再下一拍。联系不上会抛 `TimeoutError`，座位被抢会抛 `SeatTaken`。
+`flush()` 等待的是最新本地发布的确认，而不只是又一拍。联系不上会抛 `TimeoutError`，
+座位被抢会抛 `SeatTaken`。防止确认后的回滚需要
+`me.registry.supports("publication_ordering")`；老注册中心不能执行序号检查，
+客户端会发出 `OldRegistryWarning`。
 
 !!! note "state 是硬上限"
     16 KB，超了直接报错。它和 RPC 的体积限制不一样：state 会复制给**每一个
     订阅者**，实测 6 MB 到 20 个订阅者变成 120 MB。这条限制保护的是别人。
+
+state 必须是有效 JSON：`NaN` 和无穷值抛 `ValueError`。发布被拒时，之前的状态和
+就绪位保持不变。
 
 ### 知道自己被顶替
 
@@ -220,6 +229,7 @@ len(pool)                                      # ready 的人数
 
 `**filt` 按 state 的键值**相等**匹配。数字按值比（`shard=6/2` 找得到发布
 `shard=3` 的人），布尔严格（`free=1` 不匹配 `free=True`）。
+大整数不会先舍入成浮点数再判断相等。
 
 数字这条规则一路走到底：`cfg={"shard": 6/2}` 同样找得到发布
 `cfg={"shard": 3}` 的人，数组里也一样。形状仍然精确 —— 嵌套对象要键完全
@@ -234,6 +244,7 @@ apool.achanges(since=None, timeout=None) -> AsyncWatch # 异步迭代
 ```
 
 `changes()` 阻塞在事件上，**不轮询**。池子不动就不返回。
+超时限制整个流的生命周期，即使变化持续到来也会按时结束。
 
 流有三种结束方式，**其中一种会抛**：
 
@@ -373,6 +384,9 @@ pool.epoch(min=None, timeout=60.0) -> Epoch
 那份名单算出来的时候，这一轮才会被交出去** —— 所以各 rank 指纹相同就意味着名单
 相同。联系不上注册中心会抛 `Stale`，宁可不开也不开一轮不可信的。
 
+确认自己被顶替后，已有 `Epoch.valid` 变为 `False`，再调用 `epoch()` 抛 `Fenced`。
+仅仅失联不会中断已经运行的一轮。
+
 ---
 
 ## `Snapshot`
@@ -469,6 +483,7 @@ me.registry            # -> RegistryInfo
 me.registry.protocol   # 只增不减的整数；老到不报的读作 0
 me.registry.version    # 对面的版本号，用来写进日志
 me.registry.supports("long_poll") -> bool
+me.registry.supports("publication_ordering") -> bool
 ```
 
 `RegistryInfo.FEATURES` 是功能名到所需 protocol 的对照表，放在依赖它的这一侧，
@@ -479,15 +494,19 @@ me.registry.supports("long_poll") -> bool
 
 ```console
 $ curl -s http://registry:7000/health
-{"status":"ok","version":"0.9.0","protocol":1}
+{"status":"ok","version":"0.14.0","protocol":2}
 ```
 
 | protocol | 含义 |
 |---|---|
 | 0 | 长轮询之前（0.7.0 以前） |
 | 1 | 认 `hold_ms`：没话说时挂起应答，被订阅的池子一动就立刻回 |
+| 2 | 认 `publication`：旧请求不能覆盖新的 state、就绪位和 URL |
 
-!!! warning "版本不匹配是性能悬崖，不是报错"
+老客户端仍可连接，但发布顺序保证需要两端都支持序号。新客户端遇到不支持的
+注册中心会告警。
+
+!!! warning "缺失功能会影响性能或一致性"
     老注册中心对长轮询请求的回答**又快又对**，只是不挂起 —— 所以"挂起了但什么
     都没发生"和"根本不会挂起"从客户端看一模一样，靠探测属性是猜不出来的。
 
@@ -514,6 +533,9 @@ def pull_job(self, ctx: tinyray.CallContext) -> dict:
     ctx.incarnation   # 任期号
     ctx.request_id    # 调用方给这一次尝试起的名字
 ```
+
+Context 可以是普通参数、位置专用参数或关键字专用参数。其余参数保留 Python 的
+绑定规则，包括 `*args`、`**kwargs`、默认值和重复参数检查。
 
 **自称的身份，不是认证。** 这个系统里任期号本来也是成员自己生成的。它买到的是
 "调用方不会忘了传、也不会传错"，仅此而已。

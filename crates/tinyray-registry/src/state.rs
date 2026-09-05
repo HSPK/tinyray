@@ -56,6 +56,7 @@ fn disagreement(p: &Pool, b: &Beat) -> Option<String> {
 
 struct Record {
     member: Member,
+    publication: Option<u64>,
     expires_at: Instant,
 }
 
@@ -297,17 +298,23 @@ impl Registry {
             p.gone
                 .insert(b.id, (b.incarnation, Instant::now() + self.ttl));
         } else if stored == Some(b.incarnation) {
-            let changed = {
-                let r = p.members.get(&b.id).unwrap();
-                r.member.url != b.url || r.member.state != b.state || r.member.ready != b.ready
-            };
             let r = p.members.get_mut(&b.id).unwrap();
             r.expires_at = Instant::now() + self.ttl;
-            if changed {
-                r.member.url = b.url.clone();
-                r.member.state = b.state.clone();
-                r.member.ready = b.ready;
-                p.bump(b.id);
+            let newer = match (r.publication, b.publication) {
+                (None, _) => true,
+                (Some(held), Some(incoming)) => incoming > held,
+                (Some(_), None) => false,
+            };
+            if newer {
+                let changed =
+                    r.member.url != b.url || r.member.state != b.state || r.member.ready != b.ready;
+                r.publication = b.publication;
+                if changed {
+                    r.member.url = b.url.clone();
+                    r.member.state = b.state.clone();
+                    r.member.ready = b.ready;
+                    p.bump(b.id);
+                }
             }
         } else {
             // New arrival, or a replacement taking over the seat.
@@ -327,6 +334,7 @@ impl Registry {
                 b.id,
                 Record {
                     member: m,
+                    publication: b.publication,
                     expires_at: Instant::now() + self.ttl,
                 },
             );

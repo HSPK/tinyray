@@ -25,7 +25,7 @@ def test_health_names_the_registry(registry):
         body = json.loads(r.read())
     assert body["status"] == "ok"
     assert body["version"] == tinyray.__version__
-    assert body["protocol"] >= 1
+    assert body["protocol"] >= 2
 
 
 def test_a_member_can_ask_what_the_registry_can_do(registry):
@@ -33,8 +33,9 @@ def test_a_member_can_ask_what_the_registry_can_do(registry):
         m.ready()
         info = m.registry
         assert info.version == tinyray.__version__
-        assert info.protocol >= 1
+        assert info.protocol >= 2
         assert info.supports("long_poll") is True
+        assert info.supports("publication_ordering") is True
 
 
 def test_an_unknown_feature_is_an_error_not_a_false(registry):
@@ -50,10 +51,13 @@ def test_a_registry_too_old_to_say_reads_as_zero():
     """字段缺失必须解码成 0，而不是报错 —— 老注册中心根本不会发这个字段。"""
     assert tinyray.RegistryInfo(0, "").supports("long_poll") is False
     assert tinyray.RegistryInfo(1, "0.8.1").supports("long_poll") is True
+    assert tinyray.RegistryInfo(1, "0.14.0").supports("publication_ordering") is False
+    assert tinyray.RegistryInfo(2, "").supports("publication_ordering") is True
 
 
+@pytest.mark.parametrize("feature", ["long_poll", "publication_ordering"])
 def test_wanting_more_than_the_registry_has_says_so_instead_of_degrading_quietly(
-    registry, monkeypatch
+    registry, monkeypatch, feature
 ):
     """降级是性能悬崖而不是报错，所以除了这条告警不会有任何东西说话。
 
@@ -61,7 +65,7 @@ def test_wanting_more_than_the_registry_has_says_so_instead_of_degrading_quietly
     "本地要的比对面有的新时会不会出声"，那个比较跟具体差多少无关。字段缺失
     解码成 0 由 `crates/tinyray-proto/tests/wire.rs` 那条守着。
     """
-    monkeypatch.setitem(tinyray.RegistryInfo.FEATURES, "long_poll", 9999)
+    monkeypatch.setitem(tinyray.RegistryInfo.FEATURES, feature, 9999)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         m = tinyray.join("p", slot=0, size=1)
@@ -70,7 +74,8 @@ def test_wanting_more_than_the_registry_has_says_so_instead_of_degrading_quietly
         assert tinyray.OldRegistryWarning in kinds, f"没有任何提示: {kinds}"
         said = str(next(w.message for w in caught if isinstance(w.message, Warning)))
         assert "9999" in said and registry.endpoint in said
-        assert m.registry.supports("long_poll") is False
+        assert feature in said
+        assert m.registry.supports(feature) is False
     finally:
         m.leave()
 

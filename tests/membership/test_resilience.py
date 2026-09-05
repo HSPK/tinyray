@@ -1,4 +1,4 @@
-"""The two acceptance criteria M1 exists to prove."""
+"""Membership availability and GIL-independent heartbeats."""
 
 from __future__ import annotations
 

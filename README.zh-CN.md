@@ -89,6 +89,22 @@ python mutation_check.py       # 把每个 bug 放回去，证明有测试会变
 mkdocs serve                   # 文档站，需要 pip install mkdocs-material
 ```
 
+Python 测试按子系统组织：
+
+| 目录 | 覆盖范围 |
+|---|---|
+| `tests/membership/` | 加入、就绪、座位、身份、清理和 fork 所有权 |
+| `tests/discovery/` | 缓存查询、筛选、订阅和等待 |
+| `tests/collectives/` | Epoch 和名单指纹 |
+| `tests/registry/` | 协议、准入、租约、发布顺序和网络恢复 |
+| `tests/rpc/` | 调用、校验、HTTP、载荷、并发和调用统计 |
+| `tests/examples/` | 示例程序及其领域逻辑 |
+| `tests/project/` | 公开 API、文档和 CI 契约 |
+
+共享 fixture 在 `tests/conftest.py`，注册中心进程和网络代理在 `tests/support/`。
+回归用例放在对应功能旁边，不再按里程碑或审查批次分文件。例如
+`pytest tests/rpc/ -q` 只跑 RPC 子系统。Rust 测试仍放在各自的 crate 中。
+
 ## 它是怎么搭的
 
 约 2,900 行：Rust 写的注册中心和客户端（`crates/`），外面是 Python API

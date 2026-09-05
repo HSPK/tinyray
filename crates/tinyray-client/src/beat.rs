@@ -38,10 +38,8 @@ pub struct Shared {
     pub policy: String,
     pub size: Option<u64>,
     pub methods: Vec<String>,
-    pub url: Mutex<Option<String>>,
-    /// State and readiness together, because they are published together. Read
-    /// apart, a beat could carry a new state under the previous readiness --
-    /// the pair is what `ready(**kw)` means, so the pair is what is locked.
+    /// The payload and its sequence are captured under one lock, including
+    /// the URL: a sequence must never describe two different publications.
     pub published: Mutex<Published>,
     pub leaving: AtomicBool,
     pub exclusive: bool,
@@ -125,7 +123,8 @@ pub struct Shared {
 pub struct Published {
     pub state: serde_json::Value,
     pub ready: bool,
-    /// Bumped whenever the pair above changes, under the same lock, so a beat
+    pub url: Option<String>,
+    /// Bumped whenever the publication changes, under the same lock, so a beat
     /// composed from it carries a number that says exactly which version it is
     /// showing the registry. flush() needs that: counting beats cannot tell an
     /// ack for the state it published from an ack for the one before it.
@@ -176,9 +175,10 @@ impl Shared {
             slot: self.slot,
             id: self.id,
             incarnation: self.incarnation,
+            publication: Some(published.version),
             policy: self.policy.clone(),
             size: self.size,
-            url: self.url.lock().unwrap().clone(),
+            url: published.url,
             state: published.state,
             ready: published.ready,
             leaving: self.leaving.load(Ordering::Relaxed),
@@ -255,6 +255,9 @@ impl Shared {
                 continue;
             }
             let c = cache.entry(name.clone()).or_default();
+            if d.version < c.version {
+                continue;
+            }
             if d.full {
                 c.members.clear();
             }
@@ -312,11 +315,10 @@ fn beat_timeout(interval_ms: u64, hold_ms: u64) -> Duration {
     // is the answer arriving on time rather than late. Giving up before then
     // would turn every quiet interval into a failed beat.
     //
-    // Proportional, never a flat margin. A constant put the deadline past the
-    // lease at short leases -- 2.6s of waiting against a 2s lease -- so one
-    // dropped packet cost the seat, which is exactly what a bounded beat is
-    // for. Held at hold * 1.5 it stays at 0.44 of a lease whatever the lease.
-    Duration::from_millis(hold_ms + hold_ms / 2 + 200)
+    // Keep the normal network margin, but bound it by the hold at short
+    // leases. At the 200ms TTL floor this gives 100ms, not 275ms: waiting
+    // longer than the lease before retrying expires a healthy upstream.
+    Duration::from_millis(hold_ms + hold_ms / 2 + (hold_ms / 2).min(200))
 }
 
 async fn post(
@@ -334,7 +336,8 @@ async fn post(
         .header("content-type", "application/json")
         .body(body)
         .map_err(|e| format!("cannot build the request: {e}"))?;
-    let resp = tokio::time::timeout(budget, http.request(req))
+    let deadline = tokio::time::Instant::now() + budget;
+    let resp = tokio::time::timeout_at(deadline, http.request(req))
         .await
         .map_err(|_| format!("no reply within {}ms", budget.as_millis()))?
         .map_err(|e| {
@@ -358,7 +361,7 @@ async fn post(
             resp.status().as_u16()
         ));
     }
-    let bytes = tokio::time::timeout(budget, resp.into_body().collect())
+    let bytes = tokio::time::timeout_at(deadline, resp.into_body().collect())
         .await
         .map_err(|_| format!("reply body stalled past {}ms", budget.as_millis()))?
         .map_err(|e| format!("reply body broke off: {e}"))?
@@ -594,7 +597,9 @@ pub fn beat_once(
 
 #[cfg(test)]
 mod tests {
-    use super::beat_timeout;
+    use super::*;
+    use serde_json::json;
+    use tinyray_proto::PoolDelta;
 
     /// The deadline for a beat that is not being parked has to follow the
     /// interval, not sit at a constant.
@@ -623,23 +628,129 @@ mod tests {
         assert_eq!(beat_timeout(1_000_000, 0).as_millis(), 22_500);
     }
 
-    /// A parked beat is allowed to take as long as it was asked to park for,
-    /// with room for the registry's jitter on top. Proportional, never a flat
-    /// margin: a constant put the deadline past the lease at short leases --
-    /// 2.6s of waiting against a 2s lease -- so one dropped packet cost the
-    /// seat.
+    /// Network slack must not make the deadline outlive a short lease.
     #[test]
-    fn a_parked_beat_is_given_the_hold_plus_half() {
+    fn a_parked_beat_keeps_network_slack_inside_half_the_lease() {
+        assert_eq!(beat_timeout(50, 50).as_millis(), 100);
+        assert_eq!(beat_timeout(125, 125).as_millis(), 249);
         assert_eq!(beat_timeout(500, 500).as_millis(), 950);
         assert_eq!(beat_timeout(500, 2000).as_millis(), 3200);
-        // 0.44 of the lease whatever the lease, so it never outlives one.
-        for ttl_ms in [1_000u64, 2_000, 8_000, 30_000] {
+        for ttl_ms in [200u64, 201, 250, 500, 999, 1_000, 2_000, 8_000, 30_000] {
             let hold = (ttl_ms / 4).clamp(50, 30_000);
             let budget = beat_timeout(ttl_ms / 4, hold).as_millis() as u64;
             assert!(
-                budget < ttl_ms,
-                "budget {budget} outlives the {ttl_ms}ms lease"
+                budget <= ttl_ms / 2,
+                "budget {budget} leaves too little of the {ttl_ms}ms lease to retry"
             );
+            assert!(budget > hold + hold / 8, "allow the registry's jitter");
         }
+    }
+
+    fn shared() -> Shared {
+        Shared {
+            endpoint: "http://127.0.0.1:1".into(),
+            pool: "p".into(),
+            id: 1,
+            slot: None,
+            incarnation: 1,
+            policy: "churn".into(),
+            size: None,
+            methods: Vec::new(),
+            published: Mutex::new(Published {
+                state: json!({}),
+                ready: false,
+                url: None,
+                version: 0,
+            }),
+            leaving: AtomicBool::new(false),
+            exclusive: false,
+            watch: Mutex::new(Vec::new()),
+            cache: RwLock::new(HashMap::new()),
+            accepted: AtomicBool::new(true),
+            beats_ok: AtomicU64::new(0),
+            beats_failed: AtomicU64::new(0),
+            last_error: Mutex::new(String::new()),
+            refused: Mutex::new(String::new()),
+            confirmed: AtomicU64::new(0),
+            interval_ms: AtomicU64::new(1000),
+            hold_ms: AtomicU64::new(0),
+            last_ok_ms: AtomicU64::new(0),
+            seen_epoch: AtomicU64::new(0),
+            registry_protocol: AtomicU64::new(0),
+            registry_version: Mutex::new(String::new()),
+            started: std::time::Instant::now(),
+            wake: Notify::new(),
+            acked: Notify::new(),
+            revision: Mutex::new(0),
+            bell: Condvar::new(),
+            wakeups: AtomicU64::new(0),
+            short_polls: AtomicU64::new(0),
+            wake_fds: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_composed_beat_carries_the_version_of_its_whole_publication() {
+        let s = shared();
+        let (initial, version) = s.compose();
+        assert_eq!(initial.publication, Some(version));
+        assert_eq!(version, 0);
+
+        *s.published.lock().unwrap() = Published {
+            state: json!({"value": "new"}),
+            ready: true,
+            url: Some("http://new".into()),
+            version: 2,
+        };
+        let (beat, version) = s.compose();
+        assert_eq!(version, 2);
+        assert_eq!(beat.publication, Some(2));
+        assert_eq!(beat.url.as_deref(), Some("http://new"));
+        assert_eq!(beat.state, json!({"value": "new"}));
+        assert!(beat.ready);
+    }
+
+    #[test]
+    fn a_late_ack_does_not_roll_back_a_newer_cached_publication() {
+        let s = shared();
+        let ack = |epoch, version, state| BeatAck {
+            epoch,
+            protocol: tinyray_proto::PROTOCOL,
+            version: String::new(),
+            ttl_ms: 2000,
+            accepted: true,
+            refused: None,
+            pools: HashMap::from([(
+                "p".into(),
+                PoolDelta {
+                    version,
+                    roster: 1,
+                    policy: "churn".into(),
+                    methods: Vec::new(),
+                    size: None,
+                    changed: vec![Member {
+                        id: 1,
+                        slot: None,
+                        incarnation: 1,
+                        url: None,
+                        state,
+                        ready: true,
+                    }],
+                    removed: Vec::new(),
+                    full: true,
+                },
+            )]),
+        };
+        assert!(s.apply(&ack(1, 2, json!("new"))));
+        assert!(s.apply(&ack(1, 1, json!("old"))));
+        {
+            let cache = s.cache.read().unwrap();
+            assert_eq!(cache["p"].version, 2);
+            assert_eq!(cache["p"].members[&1].state, json!("new"));
+        }
+        assert!(s.apply(&ack(2, 1, json!("restarted"))));
+        let cache = s.cache.read().unwrap();
+        assert_eq!(cache["p"].version, 1);
+        assert_eq!(cache["p"].members[&1].state, json!("restarted"));
     }
 }

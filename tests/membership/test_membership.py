@@ -1,4 +1,4 @@
-"""M1 acceptance: report in, find each other, survive the registry dying."""
+"""Report in, find each other, and survive the registry dying."""
 
 from __future__ import annotations
 

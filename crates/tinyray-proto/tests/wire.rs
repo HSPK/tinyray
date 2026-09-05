@@ -151,10 +151,98 @@ fn a_beat_deserialises_from_only_its_required_fields() {
     assert_eq!(b.pool, "engine");
     assert_eq!(b.slot, None);
     assert_eq!(b.size, None);
+    assert_eq!(b.publication, None);
     assert_eq!(b.url, None);
     assert_eq!(b.state, Value::Null);
     assert!(!b.ready && !b.leaving && !b.exclusive);
     assert!(b.methods.is_empty() && b.watch.is_empty() && b.seen.is_empty());
+}
+
+#[test]
+fn publication_sequence_distinguishes_zero_from_a_legacy_beat() {
+    let raw = json!({"pool": "p", "id": 1, "incarnation": 1, "policy": "churn"});
+    let mut beat: Beat = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(beat.publication, None);
+    assert!(serde_json::to_value(&beat)
+        .unwrap()
+        .get("publication")
+        .is_none());
+    beat.publication = Some(0);
+    let wire = serde_json::to_value(&beat).unwrap();
+    assert_eq!(wire["publication"], json!(0));
+    let back: Beat = serde_json::from_value(wire).unwrap();
+    assert_eq!(back.publication, Some(0));
+    let mut null = raw;
+    null["publication"] = Value::Null;
+    assert_eq!(
+        serde_json::from_value::<Beat>(null).unwrap().publication,
+        None
+    );
+}
+
+#[test]
+fn mixed_numeric_comparisons_are_exact_and_symmetric_at_integer_boundaries() {
+    let cases = [
+        (
+            json!(9_007_199_254_740_993i64),
+            json!(9_007_199_254_740_992.0),
+            false,
+        ),
+        (
+            json!(-9_007_199_254_740_993i64),
+            json!(-9_007_199_254_740_992.0),
+            false,
+        ),
+        (
+            json!(9_007_199_254_740_992i64),
+            json!(9_007_199_254_740_992.0),
+            true,
+        ),
+        (
+            json!(-9_007_199_254_740_992i64),
+            json!(-9_007_199_254_740_992.0),
+            true,
+        ),
+        (json!(i64::MIN), json!(i64::MIN as f64), true),
+        (json!(i64::MIN), json!((i64::MIN as f64) - 2048.0), false),
+        (json!(i64::MAX), json!(i64::MAX as f64), false),
+        (json!(1u64 << 63), json!((1u64 << 63) as f64), true),
+        (json!(u64::MAX), json!(u64::MAX as f64), false),
+        (
+            json!(u64::MAX - 2047),
+            json!((u64::MAX as f64) - 2048.0),
+            true,
+        ),
+        (json!(u64::MAX), json!(-1.0), false),
+        (json!(-1), json!(u64::MAX as f64), false),
+        (json!(0), json!(-0.0), true),
+        (json!(3), json!(3.0), true),
+        (json!(-3), json!(-3.0), true),
+        (json!(3), json!(3.5), false),
+        (json!(-3), json!(-3.5), false),
+        (json!(0), json!(f64::MIN_POSITIVE), false),
+        (json!(u64::MAX), json!(f64::MAX), false),
+        (json!(true), json!(1.0), false),
+        (json!(false), json!(0.0), false),
+    ];
+    for (a, b, expected) in cases {
+        for (stored, filter) in [(&a, &b), (&b, &a)] {
+            let m = Member {
+                state: json!({"tag": stored, "nested": {"values": [stored]}}),
+                ..member(1, 1)
+            };
+            assert_eq!(
+                m.matches(&json!({"tag": filter})),
+                expected,
+                "{stored} compared with {filter}"
+            );
+            assert_eq!(
+                m.matches(&json!({"nested": {"values": [filter]}})),
+                expected,
+                "nested {stored} compared with {filter}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -227,7 +315,10 @@ fn a_current_ack_carries_the_protocol_and_the_version() {
         pools: Default::default(),
     };
     let raw = serde_json::to_string(&ack).unwrap();
-    assert!(raw.contains("\"protocol\":1"), "{raw}");
+    assert!(
+        raw.contains(&format!("\"protocol\":{}", tinyray_proto::PROTOCOL)),
+        "{raw}"
+    );
     assert!(raw.contains("\"version\":\"9.9.9\""), "{raw}");
     let back: tinyray_proto::BeatAck = serde_json::from_str(&raw).unwrap();
     assert_eq!(back.protocol, tinyray_proto::PROTOCOL);

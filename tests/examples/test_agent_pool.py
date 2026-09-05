@@ -9,12 +9,13 @@ attempt 正常做完并上报。改之前 submit_result 会照单全收，把它
 
 from __future__ import annotations
 
-import pathlib
 import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "examples"))
+from tests.support.registry import ROOT
+
+sys.path.insert(0, str(ROOT / "examples"))
 
 import tinyray  # noqa: E402
 from agent_pool.pool import AgentPool, Catalog  # noqa: E402

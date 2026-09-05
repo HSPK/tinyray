@@ -17,7 +17,8 @@ import sys
 
 import pytest
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+from tests.support.registry import ROOT
+
 EXAMPLES = sorted(
     p
     for p in list(ROOT.glob("examples/*.py")) + list(ROOT.glob("examples/*/*.py"))

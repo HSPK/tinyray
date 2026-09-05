@@ -42,6 +42,9 @@ Blocks until the first beat lands. Raises `Unreachable` if the registry cannot
 be reached, `SeatTaken` if a later tenure holds the seat, and `PolicyError` if
 the pool's shape disagrees. **One process joins one pool.**
 
+If joining fails, its heartbeat and method server are closed before the error
+escapes, so the process can retry without leaving a service behind.
+
 ### policy
 
 | policy | Has a seat | Used for |
@@ -184,21 +187,26 @@ spend a round trip calling them two changes. Readiness counts too, so a
     The GIL cannot promise this: it only stops single bytecodes running in
     parallel, and says nothing about the order sends complete in.
 
-    What goes out is the **current value**, not a log. There is one heartbeat
-    loop and it reads that register, so nothing arrives out of order; but two
-    publishes closer together than a beat may mean the middle value never goes
-    out at all -- that is the definition of soft state, not a defect. If every
-    step has to leave a trace, that belongs on the data plane.
+    What goes out is the **current value**, not a log. Protocol 2 attaches a
+    publication sequence to state, readiness and URL together. The registry
+    ignores older payloads, even when a canceled request arrives late, while
+    still renewing the lease. Two publishes closer together than a beat may
+    mean the middle value never goes out at all -- that is soft state, not a
+    defect. If every step has to leave a trace, that belongs on the data plane.
 
-`flush()` costs at most one extra beat: if a beat was in flight when you
-called, it was composed before the change, so confirmation waits for the one
-after. It raises `TimeoutError` if the registry cannot be reached, and
-`SeatTaken` if the seat was taken.
+`flush()` waits for acknowledgment of the latest local publication, not just
+for another heartbeat. It raises `TimeoutError` if the registry cannot be
+reached, and `SeatTaken` if the seat was taken. Protection against later
+rollback requires `me.registry.supports("publication_ordering")`; older
+registries cannot enforce the sequence and produce an `OldRegistryWarning`.
 
 !!! note "State has a hard cap"
     16 KB, and over it is an error. It is not the same as the RPC size limit:
     state is copied to **every subscriber**, measured at 6 MB reaching 20
     subscribers as 120 MB. This limit protects other people.
+
+State must be valid JSON: `NaN` and infinities raise `ValueError`. A rejected
+publication leaves the previous state and readiness unchanged.
 
 ### Learning that you were superseded
 
@@ -259,6 +267,7 @@ The number rule goes all the way down: `cfg={"shard": 6/2}` also finds a member
 publishing `cfg={"shard": 3}`, and the same holds inside arrays. Shape stays
 exact -- nested objects need the same keys, arrays the same order and length --
 and only the numbers themselves are relaxed.
+Large integers are never rounded to floats to decide equality.
 
 ### Snapshots and changes
 
@@ -270,6 +279,7 @@ apool.achanges(since=None, timeout=None) -> AsyncWatch  # async iteration
 
 `changes()` blocks on an event and **never polls**. While the pool is still it
 does not return.
+Its timeout bounds the stream's lifetime, including while changes keep arriving.
 
 A stream ends in three ways, and **one of them raises**:
 
@@ -437,6 +447,10 @@ that very list** -- so matching fingerprints across ranks mean matching lists.
 It raises `Stale` if the registry cannot be reached: better no round than a
 round nobody can trust.
 
+Once this process is superseded, existing epochs report `valid=False` and
+opening another raises `Fenced`, even if the cached roster never changed.
+Losing contact alone still does not invalidate an established epoch.
+
 ---
 
 ## `Snapshot`
@@ -543,6 +557,7 @@ me.registry  # -> RegistryInfo
 me.registry.protocol  # an integer that only goes up; too old to say reads as 0
 me.registry.version  # the far side's version, to put in a log line
 me.registry.supports("long_poll") -> bool
+me.registry.supports("publication_ordering") -> bool
 ```
 
 `RegistryInfo.FEATURES` maps a feature name to the protocol it needs, and it
@@ -555,15 +570,19 @@ You can look without joining:
 
 ```console
 $ curl -s http://registry:7000/health
-{"status":"ok","version":"0.9.0","protocol":1}
+{"status":"ok","version":"0.14.0","protocol":2}
 ```
 
 | protocol | Meaning |
 |---|---|
 | 0 | Before long polling (earlier than 0.7.0) |
 | 1 | Understands `hold_ms`: park the answer while there is nothing to say, and return the moment a watched pool moves |
+| 2 | Understands `publication`: older payloads cannot undo newer state, readiness or URL |
 
-!!! warning "A version mismatch is a performance cliff, not an error"
+Legacy clients remain accepted, but ordering protection requires both sides
+to support publication sequences. New clients warn when the registry cannot.
+
+!!! warning "Missing features affect performance or consistency"
     An old registry answers a long-poll request **quickly and correctly**, it
     just does not park it -- so "parked and nothing happened" and "does not
     park at all" look identical from the client, and no property can be probed
@@ -595,6 +614,10 @@ def pull_job(self, ctx: tinyray.CallContext) -> dict:
     ctx.incarnation  # the tenure number
     ctx.request_id  # what the caller named this attempt
 ```
+
+Context can be a regular, positional-only or keyword-only parameter. The
+other parameters retain Python's binding rules, including `*args`, `**kwargs`,
+defaults and rejection of duplicate arguments.
 
 **Self-declared identity, not authentication.** In this system a member picks
 its own tenure number anyway. What it buys is that the caller cannot forget to

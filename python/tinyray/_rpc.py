@@ -101,6 +101,7 @@ def per_loop(
     cache: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], _T]],
     make: Callable[[asyncio.AbstractEventLoop], _T],
     drop: Callable[[_T], None] = lambda _: None,
+    reuse: Callable[[_T], bool] = lambda _: True,
 ) -> _T:
     """The one `_T` belonging to the running loop, made on first ask.
 
@@ -121,7 +122,10 @@ def per_loop(
         key = id(loop)
         entry = cache.get(key)
         if entry is not None and entry[0]() is loop:
-            return entry[1]
+            if reuse(entry[1]):
+                return entry[1]
+            cache.pop(key)
+            drop(entry[1])
         made = make(loop)
         cache[key] = (weakref.ref(loop), made)
         return made

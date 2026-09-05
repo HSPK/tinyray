@@ -94,6 +94,23 @@ python mutation_check.py       # put each bug back and prove a test goes red
 mkdocs serve                   # the docs site, needs pip install mkdocs-material
 ```
 
+Python tests are grouped by subsystem:
+
+| Directory | Coverage |
+|---|---|
+| `tests/membership/` | Joining, readiness, seats, identity, cleanup and fork ownership |
+| `tests/discovery/` | Cached lookups, filters, subscriptions and waiting |
+| `tests/collectives/` | Epochs and roster fingerprints |
+| `tests/registry/` | Wire contracts, admission, leases, ordering and network recovery |
+| `tests/rpc/` | Calling, validation, HTTP, payloads, concurrency and call statistics |
+| `tests/examples/` | Example programs and their domain logic |
+| `tests/project/` | Public API, documentation and CI contracts |
+
+Shared fixtures live in `tests/conftest.py`; registry processes and network
+proxies live in `tests/support/`. Regression cases belong beside the feature
+they protect, not in milestone or review-specific files. Select a subsystem
+with, for example, `pytest tests/rpc/ -q`. Rust tests remain in their crates.
+
 ## How it is built
 
 Around 2,900 lines: a Rust registry and client (`crates/`) behind a Python API

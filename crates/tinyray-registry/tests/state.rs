@@ -30,6 +30,7 @@ fn beat(pool: &str, id: u64) -> Beat {
         slot: None,
         id,
         incarnation: 1,
+        publication: None,
         policy: "serving".into(),
         size: None,
         url: None,
@@ -855,4 +856,116 @@ fn a_departure_is_forgotten_once_the_lease_it_had_would_have_run_out() {
         reg.beat(&b).accepted,
         "past the lease the departure is forgotten, so nothing accumulates"
     );
+}
+
+#[test]
+fn older_and_duplicate_publications_cannot_roll_back_state_readiness_or_url() {
+    let reg = registry();
+    let mut startup = beat("p", 1);
+    startup.publication = Some(0);
+    startup.url = Some("http://old".into());
+    assert!(reg.beat(&startup).accepted);
+    let mut current = startup.clone();
+    current.publication = Some(2);
+    current.state = json!({"value": "new"});
+    current.ready = true;
+    current.url = Some("http://new".into());
+    assert!(reg.beat(&current).accepted);
+    let synced = version(&reg, "p");
+    for publication in [Some(0), Some(1), Some(2), None] {
+        let mut delayed = startup.clone();
+        delayed.publication = publication;
+        assert!(reg.beat(&delayed).accepted, "stale beats still renew");
+        assert_eq!(version(&reg, "p"), synced);
+        let ack = reg.beat(&watcher("p", None));
+        let held = &delta_for(&ack, "p").changed[0];
+        assert_eq!(held.state, current.state);
+        assert_eq!(held.ready, current.ready);
+        assert_eq!(held.url, current.url);
+    }
+}
+
+#[test]
+fn a_new_sequence_is_remembered_even_when_the_payload_did_not_change() {
+    let reg = registry();
+    let mut b = beat("p", 1);
+    b.publication = Some(0);
+    assert!(reg.beat(&b).accepted);
+    let before = version(&reg, "p");
+    b.publication = Some(2);
+    assert!(reg.beat(&b).accepted);
+    assert_eq!(version(&reg, "p"), before);
+    b.publication = Some(1);
+    b.state = json!("delayed");
+    assert!(reg.beat(&b).accepted);
+    assert_eq!(version(&reg, "p"), before);
+    let ack = reg.beat(&watcher("p", None));
+    assert_eq!(delta_for(&ack, "p").changed[0].state, Value::Null);
+}
+
+#[test]
+fn stale_publications_renew_the_lease_without_changing_the_roster() {
+    let reg = Registry::new(Duration::from_millis(200));
+    let mut b = beat("p", 1);
+    b.publication = Some(2);
+    b.state = json!("current");
+    assert!(reg.beat(&b).accepted);
+    let before = pool_of(&reg, "p");
+    b.publication = Some(1);
+    b.state = json!("old");
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(reg.beat(&b).accepted);
+        assert_eq!(reg.sweep(), 0);
+        assert_eq!(pool_of(&reg, "p"), before);
+    }
+}
+
+#[test]
+fn publication_ordering_is_per_incarnation_and_does_not_override_departure_or_fencing() {
+    let reg = registry();
+    let mut old = beat("p", 1);
+    old.slot = Some(1);
+    old.publication = Some(100);
+    assert!(reg.beat(&old).accepted);
+    let mut replacement = old.clone();
+    replacement.incarnation += 1;
+    replacement.publication = Some(0);
+    replacement.state = json!("replacement");
+    assert!(reg.beat(&replacement).accepted);
+    old.publication = Some(101);
+    assert!(!reg.beat(&old).accepted);
+    old.leaving = true;
+    assert!(!reg.beat(&old).accepted);
+    assert_eq!(pool_of(&reg, "p").2, 1);
+
+    let mut goodbye = replacement.clone();
+    goodbye.leaving = true;
+    assert!(reg.beat(&goodbye).accepted);
+    assert!(reg.beat(&goodbye).accepted, "goodbye stays idempotent");
+    replacement.publication = Some(1);
+    assert!(
+        !reg.beat(&replacement).accepted,
+        "a departed tenure stays gone"
+    );
+    assert_eq!(pool_of(&reg, "p").2, 0);
+}
+
+#[test]
+fn legacy_clients_can_update_until_the_tenure_adopts_publication_ordering() {
+    let reg = registry();
+    let mut legacy = beat("p", 1);
+    assert!(reg.beat(&legacy).accepted);
+    legacy.state = json!("legacy update");
+    assert!(reg.beat(&legacy).accepted);
+    let ack = reg.beat(&watcher("p", None));
+    assert_eq!(delta_for(&ack, "p").changed[0].state, legacy.state);
+
+    let mut sequenced = legacy.clone();
+    sequenced.publication = Some(0);
+    assert!(reg.beat(&sequenced).accepted);
+    legacy.state = json!("delayed legacy");
+    assert!(reg.beat(&legacy).accepted);
+    let ack = reg.beat(&watcher("p", None));
+    assert_eq!(delta_for(&ack, "p").changed[0].state, sequenced.state);
 }
