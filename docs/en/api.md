@@ -570,7 +570,7 @@ You can look without joining:
 
 ```console
 $ curl -s http://registry:7000/health
-{"status":"ok","version":"0.14.0","protocol":2}
+{"status":"ok","version":"0.15.0","protocol":2}
 ```
 
 | protocol | Meaning |

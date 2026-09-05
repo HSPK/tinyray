@@ -5,7 +5,7 @@
 
 ---
 
-## Unreleased
+## 0.15.0
 
 - 修复 fencing 后仍能使用旧 epoch、同一事件循环重入后 watcher 丢失唤醒，以及
   持续变化绕过超时的问题。

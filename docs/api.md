@@ -494,7 +494,7 @@ me.registry.supports("publication_ordering") -> bool
 
 ```console
 $ curl -s http://registry:7000/health
-{"status":"ok","version":"0.14.0","protocol":2}
+{"status":"ok","version":"0.15.0","protocol":2}
 ```
 
 | protocol | 含义 |
