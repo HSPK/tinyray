@@ -3,10 +3,12 @@
 //! within one interval.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tinyray_proto::{Beat, BeatAck, Member, PoolDelta, MAX_WATCH};
 use tokio::sync::Notify;
+
+use crate::delta::{owned_pools, serialized_len, DeltaCache, SharedBeatAck, SharedPools};
 
 /// How many past versions of change history to keep per pool. A client that
 /// falls further behind than this gets a full roster instead of a delta.
@@ -58,6 +60,34 @@ struct Record {
     member: Member,
     publication: Option<u64>,
     expires_at: Instant,
+    state_bytes: usize,
+}
+
+impl Record {
+    fn delta_bytes(&self) -> usize {
+        // JSON string escaping costs at most six bytes per source byte.
+        256 + self.state_bytes + self.member.url.as_ref().map_or(0, |url| url.len() * 6)
+    }
+}
+
+#[derive(Default)]
+struct Deferred {
+    waiters: Vec<Vec<Weak<Notify>>>,
+    retired: Vec<Arc<PoolDelta>>,
+}
+
+impl Deferred {
+    fn finish(self) {
+        for waiters in self.waiters {
+            for waiter in waiters {
+                if let Some(bell) = waiter.upgrade() {
+                    bell.notify_one();
+                }
+            }
+        }
+        // The last reference to a large cached snapshot is dropped here too,
+        // after the registry lock has been released.
+    }
 }
 
 #[derive(Default)]
@@ -104,26 +134,46 @@ struct Pool {
     /// Weak, so a caller that gave up and went away is not kept alive by the
     /// list it is still sitting in.
     waiters: Vec<Weak<Notify>>,
+    cache: Mutex<DeltaCache>,
 }
 
 impl Pool {
-    fn bump(&mut self, id: u64) {
+    fn invalidate_cache(&mut self, deferred: &mut Deferred) {
+        self.cache.get_mut().unwrap().clear(&mut deferred.retired);
+    }
+
+    fn bump(&mut self, id: u64, deferred: &mut Deferred) {
         self.version += 1;
         self.log.push_back((self.version, id));
         while self.log.len() > LOG_CAP {
             self.log.pop_front();
         }
-        // Drained rather than iterated: everyone woken here will register
-        // again with its next beat, and draining is also what stops the list
-        // growing on a pool that keeps changing.
-        for w in self.waiters.drain(..) {
-            if let Some(bell) = w.upgrade() {
-                bell.notify_one();
-            }
+        self.invalidate_cache(deferred);
+        if !self.waiters.is_empty() {
+            deferred.waiters.push(std::mem::take(&mut self.waiters));
         }
     }
 
-    fn delta(&self, seen: Option<u64>) -> PoolDelta {
+    fn delta(&self, seen: Option<u64>, deferred: &mut Deferred) -> Option<Arc<PoolDelta>> {
+        // Quiet subscribers need neither metadata copies nor a cache lookup.
+        if seen == Some(self.version) {
+            return None;
+        }
+        let oldest = self.log.front().map(|(v, _)| *v).unwrap_or(0);
+        // All full-resync cursors share one snapshot. A future cursor belongs
+        // to a previous registry process, not to this change log.
+        let since = seen.filter(|v| *v < self.version && *v + 1 >= oldest);
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(delta) = cache.get(since) {
+            return Some(delta);
+        }
+        let (delta, bytes) = self.build_delta(since);
+        let delta = Arc::new(delta);
+        cache.insert(since, delta.clone(), bytes, &mut deferred.retired);
+        Some(delta)
+    }
+
+    fn build_delta(&self, since: Option<u64>) -> (PoolDelta, usize) {
         let mut d = PoolDelta {
             version: self.version,
             roster: self.roster,
@@ -134,48 +184,43 @@ impl Pool {
             removed: Vec::new(),
             full: false,
         };
-        let oldest = self.log.front().map(|(v, _)| *v).unwrap_or(0);
-        match seen {
-            // Caught up already.
-            Some(v) if v == self.version => return d,
-            // Known position still covered by the log: send only what moved.
-            //
-            // `v <= self.version` is the part that is not obvious. A position
-            // past anything we ever issued means this client is talking to a
-            // registry that restarted underneath it and started counting again
-            // -- and the empty log of a fresh pool makes the `oldest` test say
-            // yes to any number at all. Answering "nothing changed" to that is
-            // how a client keeps a roster from a previous life for good.
-            // Measured: asked from version+500, the pool was left out of the
-            // answer entirely, which reads as no change.
-            //
-            // The client detects the restart by epoch and clears its cache, so
-            // this is the second lock rather than the first. It is here
-            // because the registry can tell on its own, and an older client
-            // that predates the epoch cannot.
-            Some(v) if v <= self.version && v + 1 >= oldest => {
-                let mut ids: Vec<u64> = self
-                    .log
-                    .iter()
-                    .filter(|(lv, _)| *lv > v)
-                    .map(|(_, id)| *id)
-                    .collect();
+        let mut bytes = 256
+            + self.policy.len() * 6
+            + self.methods.iter().map(|m| m.len() * 6 + 3).sum::<usize>();
+        match since {
+            Some(v) => {
+                let oldest = self.log.front().map(|(v, _)| *v).unwrap_or(0);
+                let start = (v + 1 - oldest) as usize;
+                let mut ids: Vec<u64> = self.log.range(start..).map(|(_, id)| *id).collect();
                 ids.sort_unstable();
                 ids.dedup();
                 for id in ids {
                     match self.members.get(&id) {
-                        Some(r) => d.changed.push(r.member.clone()),
-                        None => d.removed.push(id),
+                        Some(r) => {
+                            bytes = bytes.saturating_add(r.delta_bytes());
+                            d.changed.push(r.member.clone());
+                        }
+                        None => {
+                            bytes = bytes.saturating_add(21);
+                            d.removed.push(id);
+                        }
                     }
                 }
             }
             // Never synced, or fell off the end of the log.
             _ => {
                 d.full = true;
-                d.changed = self.members.values().map(|r| r.member.clone()).collect();
+                d.changed = self
+                    .members
+                    .values()
+                    .map(|r| {
+                        bytes = bytes.saturating_add(r.delta_bytes());
+                        r.member.clone()
+                    })
+                    .collect();
             }
         }
-        d
+        (d, bytes)
     }
 }
 
@@ -202,26 +247,28 @@ impl Registry {
     }
 
     /// Rejects a beat that could damage state rather than merely being wrong.
-    fn admissible(b: &Beat) -> bool {
-        // Cheap enough on the hot path: a real state is a handful of short
-        // keys, and an oversized one is rejected before it is ever stored.
-        fn state_len(v: &serde_json::Value) -> usize {
-            serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX)
-        }
-
-        b.pool.len() <= MAX_NAME
+    fn admissible(b: &Beat) -> Option<usize> {
+        let valid = b.pool.len() <= MAX_NAME
             && b.incarnation <= MAX_INCARNATION
             && b.watch.len() <= MAX_WATCH
             && b.watch.iter().all(|w| w.len() <= MAX_NAME)
             && b.url.as_ref().is_none_or(|u| u.len() <= MAX_NAME)
             && b.methods.len() <= MAX_METHODS
-            && b.methods.iter().all(|m| m.len() <= MAX_NAME)
-            && state_len(&b.state) <= MAX_STATE
+            && b.methods.iter().all(|m| m.len() <= MAX_NAME);
+        if valid {
+            serialized_len(&b.state, MAX_STATE)
+        } else {
+            None
+        }
     }
 
     pub fn beat(&self, b: &Beat) -> BeatAck {
-        if !Self::admissible(b) {
-            return BeatAck {
+        self.beat_shared(b).into_owned()
+    }
+
+    pub(crate) fn beat_shared(&self, b: &Beat) -> SharedBeatAck {
+        let Some(state_bytes) = Self::admissible(b) else {
+            return SharedBeatAck {
                 epoch: self.epoch,
                 protocol: tinyray_proto::PROTOCOL,
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -230,7 +277,8 @@ impl Registry {
                 refused: None,
                 pools: HashMap::new(),
             };
-        }
+        };
+        let mut deferred = Deferred::default();
         let mut pools = self.pools.write().unwrap();
         let p = pools.entry(b.pool.clone()).or_default();
         if p.members.is_empty() {
@@ -238,15 +286,18 @@ impl Registry {
             // here first. An empty pool that pinned its first size forever
             // meant a job relaunched at a different world size silently kept
             // the old one.
-            p.policy = b.policy.clone();
-            p.size = b.size;
-            p.methods = b.methods.clone();
+            if p.policy != b.policy || p.size != b.size || p.methods != b.methods {
+                p.invalidate_cache(&mut deferred);
+                p.policy = b.policy.clone();
+                p.size = b.size;
+                p.methods = b.methods.clone();
+            }
         } else if let Some(why) = disagreement(p, b) {
             // Silently keeping the first arrival's word turns a config typo
             // into a roll call that never completes: measured as every rank
             // waiting out its timeout on "4 of 8 present", with no missing
             // rank to find.
-            return BeatAck {
+            return SharedBeatAck {
                 epoch: self.epoch,
                 protocol: tinyray_proto::PROTOCOL,
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -258,6 +309,7 @@ impl Registry {
         } else if p.methods.is_empty() && !b.methods.is_empty() {
             // Only some members pass serves=; the first one through should not
             // decide that the pool serves nothing.
+            p.invalidate_cache(&mut deferred);
             p.methods = b.methods.clone();
         }
 
@@ -288,7 +340,7 @@ impl Registry {
                 // XOR out what is actually stored. Using the beat's tenure
                 // would leave a permanently wrong fingerprint if they differ.
                 p.roster ^= r.member.roster_hash();
-                p.bump(b.id);
+                p.bump(b.id, &mut deferred);
             }
             // Remembered for one lease: several times longer than any beat
             // still in flight, since a beat gives up at three quarters of an
@@ -313,7 +365,8 @@ impl Registry {
                     r.member.url = b.url.clone();
                     r.member.state = b.state.clone();
                     r.member.ready = b.ready;
-                    p.bump(b.id);
+                    r.state_bytes = state_bytes;
+                    p.bump(b.id, &mut deferred);
                 }
             }
         } else {
@@ -336,9 +389,10 @@ impl Registry {
                     member: m,
                     publication: b.publication,
                     expires_at: Instant::now() + self.ttl,
+                    state_bytes,
                 },
             );
-            p.bump(b.id);
+            p.bump(b.id, &mut deferred);
         }
         if b.slot.is_some() && b.incarnation > watermark && !superseded {
             p.high.insert(b.id, b.incarnation);
@@ -347,18 +401,12 @@ impl Registry {
         let mut out = HashMap::new();
         for name in &b.watch {
             if let Some(wp) = pools.get(name) {
-                let d = wp.delta(b.seen.get(name).copied());
-                // Nothing new: leave it out entirely rather than send an empty body.
-                if d.full
-                    || !d.changed.is_empty()
-                    || !d.removed.is_empty()
-                    || !b.seen.contains_key(name)
-                {
+                if let Some(d) = wp.delta(b.seen.get(name).copied(), &mut deferred) {
                     out.insert(name.clone(), d);
                 }
             }
         }
-        BeatAck {
+        let ack = SharedBeatAck {
             epoch: self.epoch,
             protocol: tinyray_proto::PROTOCOL,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -366,7 +414,10 @@ impl Registry {
             accepted,
             refused: None,
             pools: out,
-        }
+        };
+        drop(pools);
+        deferred.finish();
+        ack
     }
 
     /// Park `bell` on every pool in `watch`, to be rung when one of them moves.
@@ -386,16 +437,22 @@ impl Registry {
 
     /// What a watcher would be told right now, without touching any state.
     pub fn deltas_for(&self, b: &Beat) -> HashMap<String, PoolDelta> {
+        owned_pools(self.deltas_shared_for(b))
+    }
+
+    pub(crate) fn deltas_shared_for(&self, b: &Beat) -> SharedPools {
+        let mut deferred = Deferred::default();
         let pools = self.pools.read().unwrap();
         let mut out = HashMap::new();
         for name in &b.watch {
             if let Some(wp) = pools.get(name) {
-                let d = wp.delta(b.seen.get(name).copied());
-                if d.full || !d.changed.is_empty() || !d.removed.is_empty() {
+                if let Some(d) = wp.delta(b.seen.get(name).copied(), &mut deferred) {
                     out.insert(name.clone(), d);
                 }
             }
         }
+        drop(pools);
+        deferred.finish();
         out
     }
 
@@ -403,6 +460,7 @@ impl Registry {
     /// path -- an earlier version swept inside `lookup` and made it O(N).
     pub fn sweep(&self) -> usize {
         let now = Instant::now();
+        let mut deferred = Deferred::default();
         let mut pools = self.pools.write().unwrap();
         let mut dropped = 0;
         for p in pools.values_mut() {
@@ -422,11 +480,13 @@ impl Registry {
             for id in dead {
                 if let Some(r) = p.members.remove(&id) {
                     p.roster ^= r.member.roster_hash();
-                    p.bump(id);
+                    p.bump(id, &mut deferred);
                     dropped += 1;
                 }
             }
         }
+        drop(pools);
+        deferred.finish();
         dropped
     }
 
@@ -439,3 +499,7 @@ impl Registry {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod tests;

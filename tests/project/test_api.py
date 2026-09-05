@@ -140,6 +140,8 @@ def test_member_accepted_and_silence_and_stats(svc):
         "beats_ok",
         "beats_failed",
         "interval_ms",
+        "coalesce_ms",
+        "effective_coalesce_ms",
         "silence_ms",
         "watch_wakeups",
         "short_polls",
@@ -150,6 +152,7 @@ def test_member_accepted_and_silence_and_stats(svc):
         # 服务端计数器由 tests/rpc/test_stats.py 单独盯。
     }
     assert stats["beats_ok"] >= 1
+    assert stats["coalesce_ms"] == stats["effective_coalesce_ms"] == 50
 
 
 # ---- Pool ----------------------------------------------------------------

@@ -14,6 +14,9 @@ one in `python/tinyray/`.
 | `tinyray.join(...)` | Report in; returns a `Member` |
 | `tinyray.pool(name)` | Get a `Pool` |
 | `tinyray.apool(name)` | Get an `AsyncPool` (its methods return awaitables) |
+| `tinyray.Call(method, args=(), kwargs=None)` | Describe one item in an RPC batch |
+| `tinyray.batch(handle, calls, timeout=30.0)` | Execute an ordered batch on one member |
+| `tinyray.abatch(handle, calls, timeout=30.0)` | Await the same batch operation |
 | `tinyray.__version__` | The installed version |
 | `tinyray.MAX_STATE` | The hard cap on state, 16 KB |
 | `tinyray.FIRST_BEAT_S` | The default for `join(timeout=)`, 30 seconds |
@@ -35,6 +38,7 @@ tinyray.join(
     max_concurrency: int | None = None,
     timeout: float = FIRST_BEAT_S,
     registry_url: str | None = None,
+    coalesce_ms: int = 50,
 ) -> Member
 ```
 
@@ -69,6 +73,12 @@ Seated policies need `slot=`, or read it from `TINYRAY_SLOT` / `RANK` /
   runs.
 - **`max_concurrency=`** -- a ceiling on calls running at once. Past it the
   caller gets `NotDelivered` rather than a queue. Unlimited by default.
+- **`coalesce_ms=`** -- coalescing delay for rapidly changing membership
+  traffic, in milliseconds. The default remains 50; smaller values reduce
+  burst notification latency at the cost of more requests. Zero opts out of
+  this spacing. Values must be nonnegative integers; the effective spacing
+  is capped by the registry's lease/4 so a large setting cannot prevent renewal.
+  Local publications may wake a resting client early.
 - **`url=`** -- set the advertised address by hand. By default it is probed
   from the routing table; on a multi-homed machine use `TINYRAY_ADVERTISE`.
 - **`registry_url=`** -- which registry to report in to, overriding
@@ -116,6 +126,7 @@ This process's own registration.
 |---|---|
 | `beats_ok` / `beats_failed` | Beats answered, and beats not |
 | `interval_ms` / `silence_ms` | The current interval; time since the last success |
+| `coalesce_ms` / `effective_coalesce_ms` | Requested coalescing delay; the delay capped by the current lease/4 |
 | `watch_wakeups` | Times the local cache moved and woke a waiter |
 | `short_polls` | Times a beat waited on a **timer** rather than on the registry. Only the path before the first ack should do this; a number that keeps climbing means this client is polling and not getting what long polling buys |
 | `state_bytes` | How large this member's published state is |
@@ -268,6 +279,11 @@ publishing `cfg={"shard": 3}`, and the same holds inside arrays. Shape stays
 exact -- nested objects need the same keys, arrays the same order and length --
 and only the numbers themselves are relaxed.
 Large integers are never rounded to floats to decide equality.
+
+`slot()` uses a native slot index and `pick()` selects one eligible member
+before serialization; neither constructs a full Python roster just to return
+one handle. Repeated bulk reads reuse bounded native snapshots, but each
+returned handle still has its own independently decoded state.
 
 ### Snapshots and changes
 
@@ -654,6 +670,42 @@ inside the block and does not leak into the one next door.
 
 ---
 
+## RPC batches
+
+```python
+calls = [
+    tinyray.Call("assign", args=("task-1",)),
+    tinyray.Call("assign", kwargs={"task": "task-2"}),
+]
+results = tinyray.batch(handle, calls)
+results = await tinyray.abatch(handle, calls)
+```
+
+A batch contains at most 128 calls to one member. Calls run sequentially and
+stop at the first failure. An empty batch is a local no-op. This amortizes one
+HTTP exchange across several operations; it is **not a transaction**.
+
+`BatchError` contains `failed_index` (zero-based), `completed_results`, and
+`cause` (`RemoteError`, `TypeError`, `AttributeError`, or `Fenced`). Earlier
+items completed; the failing method may already have had side effects before
+raising; later items were not invoked. Each return value is serialized before
+the next item runs. Fencing is rechecked between items.
+
+The transport timeout applies to the batch exchange, not separately to every
+item. `OutcomeUnknown` means an unknown prefix, or the whole batch, may have
+run. Async cancellation stops waiting, not remote execution. Nothing is
+automatically retried; older peers without `/_batch` return `NotDelivered`
+without replaying the batch as individual requests.
+
+Each item receives a distinct, stable `CallContext.request_id` derived from
+the batch ID and its index. Short IDs use `<batch-id>:<index>`; long IDs retain
+a deterministic hash and stay within 200 characters. Pin the batch ID with
+`request_id()` when the application needs to reconcile retries. Deduplication
+remains the application's responsibility.
+
+A batch occupies one concurrency slot and counts as one request in `calls`;
+it is counted as failed if any item fails.
+
 ## Exceptions
 
 ```text
@@ -663,6 +715,7 @@ TinyrayError
 │   └── OutcomeUnknown   it may have run -- retry with a request id, or be idempotent
 ├── Fenced               delivered, but that seat changed hands
 ├── RemoteError          delivered, and the method raised (.type/.message/.traceback)
+├── BatchError           an item failed; exposes its index, earlier results, and cause
 ├── Stale                out of contact with the registry; the roster is not trustworthy
 └── SeatTaken            the seat is held (exclusive) or was taken by a later tenure
 

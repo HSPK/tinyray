@@ -17,4 +17,8 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+fastrand = "2"
 pyo3 = { version = "0.22", features = ["extension-module"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

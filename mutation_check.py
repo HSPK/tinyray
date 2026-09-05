@@ -42,7 +42,7 @@ MUTANTS = [
     (
         "removals in a delta are ignored",
         RS_BEAT,
-        "            for id in &d.removed {\n                c.members.remove(id);\n            }",
+        "        for id in &d.removed {\n            membership_changed |= self.remove(*id);\n        }",
         "",
         # test_deltas.py does not see this one -- it checks that a delta
         # arrives, not that a departure is applied.
@@ -51,7 +51,7 @@ MUTANTS = [
     (
         "the cached version is never advanced",
         RS_BEAT,
-        "            c.version = d.version;",
+        "        self.version = d.version;",
         "",
         "tests/discovery/test_deltas.py",
     ),
@@ -105,24 +105,24 @@ MUTANTS = [
     (
         "a position past the end of the log is answered incrementally",
         RS_STATE,
-        "            Some(v) if v <= self.version && v + 1 >= oldest => {",
-        "            Some(v) if v <= self.version => {",
+        "let since = seen.filter(|v| *v < self.version && *v + 1 >= oldest);",
+        "let since = seen.filter(|v| *v < self.version);",
         "tests/registry/test_wire_fields.py"
         "::test_full_says_to_drop_what_you_had",
     ),
     (
         "a position the registry never issued is answered incrementally",
         RS_STATE,
-        "            Some(v) if v <= self.version && v + 1 >= oldest => {",
-        "            Some(v) if v + 1 >= oldest => {",
+        "let since = seen.filter(|v| *v < self.version && *v + 1 >= oldest);",
+        "let since = seen.filter(|v| *v + 1 >= oldest);",
         "tests/registry/test_restart.py"
         "::test_asking_from_a_version_the_registry_never_issued_gets_the_whole_roster",
     ),
     (
         "a beat is taken whatever is in it",
         RS_STATE,
-        "        if !Self::admissible(b) {",
-        "        if false {",
+        "        let Some(state_bytes) = Self::admissible(b) else {",
+        "        let Some(state_bytes) = Some(0) else {",
         "tests/registry/test_admission.py"
         "::test_absurd_names_are_refused_rather_than_stored",
     ),
@@ -137,8 +137,11 @@ MUTANTS = [
     (
         "a parked watcher is never handed what changed",
         RS_STATE,
-        "                if d.full || !d.changed.is_empty() || !d.removed.is_empty() {",
-        "                if false {",
+        "    pub(crate) fn deltas_shared_for(&self, b: &Beat) -> SharedPools {\n"
+        "        let mut deferred = Deferred::default();",
+        "    pub(crate) fn deltas_shared_for(&self, b: &Beat) -> SharedPools {\n"
+        "        let b = &Beat { watch: Vec::new(), ..b.clone() };\n"
+        "        let mut deferred = Deferred::default();",
         "tests/registry/test_long_poll.py"
         "::test_a_change_arrives_long_before_the_next_beat_would_have",
     ),
@@ -169,8 +172,9 @@ MUTANTS = [
     (
         "leaving does not take the member out of the fingerprint",
         RS_STATE,
-        "                p.roster ^= r.member.roster_hash();\n                p.bump(b.id);",
-        "                p.bump(b.id);",
+        "                p.roster ^= r.member.roster_hash();\n"
+        "                p.bump(b.id, &mut deferred);",
+        "                p.bump(b.id, &mut deferred);",
         "tests/collectives/test_roster_fingerprint.py",
     ),
     (
@@ -585,8 +589,8 @@ MUTANTS = [
         "a call is counted only after its answer is on the wire",
         "python/tinyray/_serve.py",
         "            counters.answered(failed)\n            counted = True\n"
-        "            self._send(code, body)",
-        "            self._send(code, body)\n            counters.answered(failed)\n"
+        "            self._send_raw(code, encoded)",
+        "            self._send_raw(code, encoded)\n            counters.answered(failed)\n"
         "            counted = True",
         "tests/rpc/test_stats.py"
         "::test_a_call_you_have_the_answer_to_is_already_counted",
@@ -658,7 +662,7 @@ MUTANTS = [
     (
         "any path at all reaches a method",
         "python/tinyray/_serve.py",
-        '        if not self.path.startswith("/call/"):',
+        '        if not batching and not self.path.startswith("/call/"):',
         "        if False:",
         "tests/rpc/test_http.py"
         "::test_only_the_call_path_reaches_a_method",
@@ -700,8 +704,8 @@ MUTANTS = [
     (
         "a status nobody agreed on is read as a good answer",
         PY_RPC,
-        "    if status != 200:",
-        "    if False:",
+        "    if status != 200:\n        raise OutcomeUnknown(f\"{target} returned HTTP {status}\")",
+        "    if False:\n        raise OutcomeUnknown(f\"{target} returned HTTP {status}\")",
         "tests/rpc/test_outcomes.py"
         "::test_every_status_lands_in_the_right_class",
     ),
@@ -844,7 +848,7 @@ MUTANTS = [
     ),
     (
         "the digest leaves out who the members are",
-        RS_LIB,
+        RS_BEAT,
         "            m.id.hash(&mut h);\n            m.incarnation.hash(&mut h);",
         "",
         "tests/discovery/test_watch_lifecycle.py"
@@ -1089,9 +1093,9 @@ MUTANTS = [
     ),
     (
         "the client's own fingerprint is not the registry's hash",
-        RS_LIB,
-        "let mine = members.iter().fold(0u64, |acc, m| acc ^ m.roster_hash());",
-        "let mine = members.iter().fold(0u64, |acc, m| acc.wrapping_add(m.roster_hash()));",
+        RS_BEAT,
+        "let roster = members.iter().fold(0, |h, m| h ^ m.roster_hash());",
+        "let roster = members.iter().fold(0u64, |h, m| h.wrapping_add(m.roster_hash()));",
         "tests/collectives/test_roster_fingerprint.py"
         "::test_the_clients_own_fingerprint_agrees_with_the_registrys",
     ),
@@ -1106,12 +1110,8 @@ MUTANTS = [
     (
         "taking a seat does not release the parked beat of the member losing it",
         RS_STATE,
-        "        for w in self.waiters.drain(..) {\n"
-        "            if let Some(bell) = w.upgrade() {\n"
-        "                bell.notify_one();\n"
-        "            }\n"
-        "        }",
-        "        self.waiters.clear();",
+        "                    bell.notify_one();",
+        "                    let _ = bell;",
         "tests/membership/test_seats.py"
         "::test_a_superseded_process_stops_answering",
     ),
@@ -1427,6 +1427,63 @@ MUTANTS = [
         "",
         "tests/project/test_ci.py"
         "::test_code_quality_runs_for_pull_requests_and_main",
+    ),
+    (
+        "slot lookup ignores readiness",
+        RS_BEAT,
+        "            (!require_ready || m.ready).then_some(m)",
+        "            Some(m)",
+        "tests/discovery/test_fast_lookups.py"
+        "::test_duplicate_slots_choose_the_lowest_eligible_wire_id",
+    ),
+    (
+        "native snapshots survive a changed publication",
+        RS_BEAT,
+        "            *self.snapshots.get_mut().unwrap() = Default::default();",
+        "",
+        "cargo:tinyray-client",
+    ),
+    (
+        "field digest memoization survives a changed publication",
+        RS_BEAT,
+        "            *self.digest.get_mut().unwrap() = None;",
+        "",
+        "cargo:tinyray-client",
+    ),
+    (
+        "shared registry deltas survive a pool change",
+        RS_STATE,
+        "        self.cache.get_mut().unwrap().clear(&mut deferred.retired);",
+        "",
+        "cargo:tinyray-registry",
+    ),
+    (
+        "a batch does not recheck fencing between items",
+        "python/tinyray/_serve.py",
+        "            fenced = self._fenced()\n            name = item[\"method\"]",
+        "            fenced = None\n            name = item[\"method\"]",
+        "tests/rpc/test_batch.py::test_takeover_between_items_fences_the_remaining_prefix",
+    ),
+    (
+        "a batch continues after an item failed",
+        "python/tinyray/_serve.py",
+        "            if failed or encoding_failed:",
+        "            if False:",
+        "tests/rpc/test_batch.py::test_first_failure_stops_execution_with_completed_results",
+    ),
+    (
+        "a missing performance metric is silently skipped",
+        "bench.py",
+        "        if key not in is_:\n            worse.append(f\"{key}: missing from current results\")",
+        "        if key not in is_:\n            pass",
+        "tests/project/test_bench.py::test_missing_current_metrics_fail_instead_of_disappearing",
+    ),
+    (
+        "benchmark cleanup bypasses the member-owned server",
+        "bench.py",
+        "    _registries[-1].members.callback(member.leave)",
+        "    _registries[-1].members.callback(member._c.leave)",
+        "tests/project/test_bench.py::test_benchmark_teardown_closes_members_and_restores_environment",
     ),
 ]
 

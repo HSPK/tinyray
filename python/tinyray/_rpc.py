@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import inspect
 import itertools
 import json
@@ -15,13 +16,15 @@ import sys
 import threading
 import warnings
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import httpx
 import msgspec
 
 from ._errors import (
+    BatchError,
     Fenced,
     NotDelivered,
     OutcomeUnknown,
@@ -29,6 +32,7 @@ from ._errors import (
     RemoteError,
     Unreachable,
 )
+from ._json import dumps, loads
 
 # Past this a call is warned about, not refused. The control plane carries
 # facts about where things are, not the things -- but a call is point to point,
@@ -51,6 +55,8 @@ _NEVER_LEFT = (
 
 SOFT_BODY = 1 << 20
 DEFAULT_TIMEOUT = 30.0  # the measured control-plane band is 2-30s
+MAX_BATCH = 128
+_MAX_REQUEST_ID = 200
 
 # Set at join() time. Travels on every call so the far side can bind a lease to
 # the tenure that asked for it, instead of trusting an argument the caller had
@@ -162,7 +168,7 @@ def _async_client() -> httpx.AsyncClient:
 
 
 def _app_stacklevel() -> int:
-    """How far up the first frame that is not ours is.
+    """How far up the first application frame is.
 
     A fixed number cannot be right for both directions. Synchronously the
     frames are `_nudge`, `invoke`, `BoundMethod.__call__`, then the
@@ -172,12 +178,18 @@ def _app_stacklevel() -> int:
     that made the call, which also collapses every async nudge into one
     suppressed duplicate.
 
+    asyncio.run(abatch(...)) has no application coroutine frame: the first one
+    outside tinyray is the loop's task runner. Skip that machinery too, so the
+    warning points at the application driving the loop, not asyncio internals.
+
     Counting is cheap here because nothing reaches this unless something was
     already over a megabyte.
     """
     level = 1
     frame: Any = sys._getframe(1)
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("tinyray"):
+    while frame is not None and frame.f_globals.get("__name__", "").startswith(
+        ("tinyray", "asyncio")
+    ):
         level += 1
         frame = frame.f_back
     return level
@@ -198,10 +210,12 @@ def _nudge(what: str, size: int, where: str | None) -> None:
     )
 
 
-def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str, str]]:
+def _prepare(
+    handle: Any, name: str, payload: Any, *, batching: bool = False
+) -> tuple[str, bytes, dict[str, str]]:
     if handle.url is None:
         raise NotDelivered(f"{handle} advertises no address; it joined without serves=")
-    body = json.dumps(payload).encode()
+    body = dumps(payload)
     headers = {
         "content-type": "application/json",
         # Plain str: a header value has to be ASCII, which is why the names
@@ -214,7 +228,8 @@ def _prepare(handle: Any, name: str, payload: Any) -> tuple[str, bytes, dict[str
         # that. OutcomeUnknown is where that decision belongs.
         "x-tinyray-request": _request_id(),
     }
-    return f"{handle.url}/call/{name}", body, headers
+    path = "/_batch" if batching else f"/call/{name}"
+    return f"{handle.url}{path}", body, headers
 
 
 _seq = itertools.count(1)
@@ -264,7 +279,7 @@ def request_id(value: str) -> Iterator[str]:
             f"as a header, where anything else cannot be encoded and a newline "
             f"would end the header."
         )
-    if len(value.encode()) > 200:
+    if len(value.encode()) > _MAX_REQUEST_ID:
         raise ValueError(
             f"a request id of {len(value.encode())} bytes is too long; keep it "
             f"under 200. It is sent on every attempt, and servers cap headers."
@@ -276,6 +291,15 @@ def request_id(value: str) -> Iterator[str]:
         _pinned.reset(token)
 
 
+def _batch_request_id(root: str, index: int) -> str:
+    suffix = f":{index}"
+    if len(root) + len(suffix) <= _MAX_REQUEST_ID:
+        return root + suffix
+    digest = hashlib.sha256(root.encode()).hexdigest()
+    prefix = root[: _MAX_REQUEST_ID - len(digest) - len(suffix) - 1]
+    return f"{prefix}~{digest}{suffix}"
+
+
 def _transport_error(handle: Any, name: str, exc: Exception) -> Unreachable:
     at = f"{handle.identity} at {handle.url}: {exc}"
     if isinstance(exc, _NEVER_LEFT):
@@ -283,7 +307,7 @@ def _transport_error(handle: Any, name: str, exc: Exception) -> Unreachable:
     return OutcomeUnknown(f"{name}() may or may not have run on {at}")
 
 
-def _decode(status: int, raw: bytes, target: str) -> Any:
+def _check_status(status: int, raw: bytes, target: str) -> None:
     if status == 409:
         raise Fenced(f"{target} is held by a later tenure now; look it up again")
     if status == 503:
@@ -305,10 +329,11 @@ def _decode(status: int, raw: bytes, target: str) -> Any:
     if status >= 500:
         # The handler was already running when it came apart.
         raise OutcomeUnknown(f"{target} answered HTTP {status} partway through")
-    try:
-        body = json.loads(raw or b"{}")
-    except json.JSONDecodeError as e:
-        raise OutcomeUnknown(f"{target} answered with a body that will not parse: {e}") from e
+
+
+def _decode_result(status: int, body: Any, target: str) -> Any:
+    if status == 409:
+        raise Fenced(f"{target} is held by a later tenure now; look it up again")
     if status == 404:
         raise AttributeError(body.get("error", "no such method"))
     if status == 422:
@@ -323,8 +348,75 @@ def _decode(status: int, raw: bytes, target: str) -> Any:
     return body.get("result")
 
 
-def invoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
-    url, body, headers = _prepare(handle, name, payload)
+def _decode(status: int, raw: bytes, target: str) -> Any:
+    _check_status(status, raw, target)
+    try:
+        body = loads(raw or b"{}")
+    except json.JSONDecodeError as e:
+        raise OutcomeUnknown(f"{target} answered with a body that will not parse: {e}") from e
+    return _decode_result(status, body, target)
+
+
+def _decode_batch(status: int, raw: bytes, target: str, expected: int) -> list[Any]:
+    if status in (404, 405, 501):
+        raise NotDelivered(
+            f"{target} does not support RPC batching (HTTP {status}); no calls were replayed"
+        )
+    _check_status(status, raw, target)
+    if status != 200:
+        return _decode(status, raw, target)
+    try:
+        body = loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise OutcomeUnknown(f"{target} answered with an invalid batch response") from exc
+    invalid = f"{target} answered with an invalid batch response; item outcomes are unknown"
+    if not isinstance(body, dict) or set(body) != {"items"}:
+        raise OutcomeUnknown(invalid)
+    items = body["items"]
+    if not isinstance(items, list) or not 0 < len(items) <= expected:
+        raise OutcomeUnknown(invalid)
+    results: list[Any] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != {"status", "body"}:
+            raise OutcomeUnknown(invalid)
+        code, reply = item["status"], item["body"]
+        if type(code) is not int or code not in (200, 404, 409, 422):
+            raise OutcomeUnknown(invalid)
+        if not isinstance(reply, dict):
+            raise OutcomeUnknown(invalid)
+        if code == 200 and set(reply) == {"result"}:
+            results.append(reply["result"])
+            continue
+        error = reply.get("error")
+        if code == 200:
+            if (
+                set(reply) != {"error"}
+                or not isinstance(error, dict)
+                or not isinstance(error.get("type"), str)
+                or not isinstance(error.get("message"), str)
+                or not isinstance(error.get("traceback", ""), str)
+            ):
+                raise OutcomeUnknown(invalid)
+        elif not isinstance(error, str):
+            raise OutcomeUnknown(invalid)
+        # A failure terminates the response; accepting trailing items would
+        # falsely promise they did not run.
+        if index != len(items) - 1:
+            raise OutcomeUnknown(invalid)
+        try:
+            _decode_result(code, reply, target)
+        except (AttributeError, TypeError, Fenced, RemoteError) as exc:
+            raise BatchError(index, results, exc) from exc
+        raise OutcomeUnknown(invalid)
+    if len(results) != expected:
+        raise OutcomeUnknown(invalid)
+    return results
+
+
+def invoke(
+    handle: Any, name: str, payload: Any, timeout: float, *, _batch_size: int | None = None
+) -> Any:
+    url, body, headers = _prepare(handle, name, payload, batching=_batch_size is not None)
     _nudge(f"{name}() is sending", len(body), handle.url)
     try:
         r = _sync_client().post(url, content=body, headers=headers, timeout=timeout)
@@ -333,18 +425,92 @@ def invoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
     # Nudged here rather than on the far side: a served process routinely has
     # its output sent to /dev/null, so a warning there is one nobody reads.
     _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
+    if _batch_size is not None:
+        return _decode_batch(r.status_code, r.content, handle.identity, _batch_size)
     return _decode(r.status_code, r.content, handle.identity)
 
 
-async def ainvoke(handle: Any, name: str, payload: Any, timeout: float) -> Any:
-    url, body, headers = _prepare(handle, name, payload)
+async def ainvoke(
+    handle: Any, name: str, payload: Any, timeout: float, *, _batch_size: int | None = None
+) -> Any:
+    url, body, headers = _prepare(handle, name, payload, batching=_batch_size is not None)
     _nudge(f"{name}() is sending", len(body), handle.url)
     try:
         r = await _async_client().post(url, content=body, headers=headers, timeout=timeout)
     except httpx.HTTPError as e:
         raise _transport_error(handle, name, e) from e
     _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
+    if _batch_size is not None:
+        return _decode_batch(r.status_code, r.content, handle.identity, _batch_size)
     return _decode(r.status_code, r.content, handle.identity)
+
+
+@dataclass(frozen=True)
+class Call:
+    """One batch item. Only public ASCII method names can be served."""
+
+    method: str
+    args: tuple[Any, ...] | list[Any] = ()
+    kwargs: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        _call_payload(self)
+
+
+def _call_payload(call: Call) -> dict[str, Any]:
+    name = call.method
+    if not isinstance(name, str):
+        raise TypeError("a batch method has to be a string")
+    if not name.isascii() or not name.isidentifier() or name.startswith("_"):
+        raise ValueError("a batch method has to be a public ASCII identifier")
+    if not isinstance(call.args, (tuple, list)):
+        raise TypeError("batch args has to be a tuple or list")
+    if call.kwargs is not None and (
+        not isinstance(call.kwargs, dict) or any(not isinstance(k, str) for k in call.kwargs)
+    ):
+        raise TypeError("batch kwargs has to be a dict with string keys, or None")
+    return {"method": name, "args": list(call.args), "kwargs": dict(call.kwargs or {})}
+
+
+def _batch_payload(calls: Iterable[Call]) -> list[dict[str, Any]]:
+    items = []
+    for index, call in enumerate(calls):
+        if index >= MAX_BATCH:
+            raise ValueError(f"a batch can contain at most {MAX_BATCH} calls")
+        if not isinstance(call, Call):
+            raise TypeError(f"batch item {index} has to be a Call")
+        items.append(_call_payload(call))
+    return items
+
+
+def batch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TIMEOUT) -> list[Any]:
+    """Run up to 128 calls in order, stopping at the first failure. Not atomic.
+
+    BatchError identifies a failed item and carries earlier results. Transport
+    failures apply to the entire batch and are never retried. Each item gets
+    CallContext.request_id ``<batch request id>:<zero-based index>``; pin the
+    batch id with request_id() when reconciling application side effects.
+    Long roots are truncated and SHA-256 suffixed to keep item ids within the
+    same 200-character limit, so they can themselves be pinned or forwarded.
+    An empty batch is a local no-op. Older peers are refused without replay.
+    """
+    items = _batch_payload(calls)
+    if not items:
+        return []
+    return invoke(handle, "batch", {"calls": items}, timeout, _batch_size=len(items))
+
+
+async def abatch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TIMEOUT) -> list[Any]:
+    """Await batch(); cancellation stops waiting, not remote execution.
+
+    As with ordinary async calls, CancelledError propagates. Reconcile using
+    item request ids before resubmitting; cancellation may leave any prefix
+    (or the whole batch) executed.
+    """
+    items = _batch_payload(calls)
+    if not items:
+        return []
+    return await ainvoke(handle, "batch", {"calls": items}, timeout, _batch_size=len(items))
 
 
 def _restore_return(value: Any, want: Any, target: str) -> Any:

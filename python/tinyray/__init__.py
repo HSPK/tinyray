@@ -22,8 +22,11 @@ from contextlib import ExitStack as _ExitStack
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
+from msgspec.json import decode as _json_decode
+
 from . import _rpc
 from ._errors import (
+    BatchError,
     Fenced,
     NotDelivered,
     NotFound,
@@ -38,7 +41,7 @@ from ._errors import (
     Unreachable,
 )
 from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
-from ._rpc import request_id
+from ._rpc import Call, abatch, batch, request_id
 from ._serve import CallContext
 from ._serve import MethodServer as _MethodServer
 from ._tinyray import Client as _Client
@@ -67,6 +70,10 @@ __all__ = [
     "AsyncPool",
     "Epoch",
     "CallContext",
+    "Call",
+    "batch",
+    "abatch",
+    "BatchError",
     "request_id",
     "Snapshot",
     "RegistryInfo",
@@ -782,7 +789,7 @@ class Pool:
         # of a pool run the same code.
         info = self._c.pool_info(self._name)
         methods = tuple(info[3]) if info else ()
-        return [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
+        return [self._handle_cls(self._name, m, methods) for m in _json_decode(raw)]
 
     def snapshot(self, include_unready: bool = True) -> Snapshot:
         """The pool as it stands, with the revision it stood at.
@@ -798,7 +805,7 @@ class Pool:
             return Snapshot(self._name, 0, [])
         raw, _, _, version = got
         methods = tuple(info[3]) if info else ()
-        members = [self._handle_cls(self._name, m, methods) for m in json.loads(raw)]
+        members = [self._handle_cls(self._name, m, methods) for m in _json_decode(raw)]
         return Snapshot(self._name, version, members)
 
     def changes(
@@ -859,15 +866,27 @@ class Pool:
         return self._members(filt, require_ready=True)
 
     def pick(self, **filt: Any) -> Handle:
-        found = self._members(filt, require_ready=True)
-        if not found:
+        self._settle()
+        raw = self._c.choose(self._name, json.dumps(filt), True)
+        if raw is None:
             raise NotFound(f"no ready member of {self._name!r} matching {filt}")
-        return random.choice(found)
+        info = self._c.pool_info(self._name)
+        return self._handle_cls(self._name, _json_decode(raw), tuple(info[3]) if info else ())
 
     def slot(self, k: int, require_ready: bool = False) -> Handle:
-        for h in self._members({}, require_ready=require_ready):
-            if h.slot == k:
-                return h
+        self._settle()
+        try:
+            seat = int(k)
+        except (TypeError, ValueError, OverflowError):
+            seat = -1
+        raw = (
+            self._c.lookup_slot(self._name, seat, require_ready)
+            if seat == k and 0 <= seat < 1 << 64
+            else None
+        )
+        if raw is not None:
+            info = self._c.pool_info(self._name)
+            return self._handle_cls(self._name, _json_decode(raw), tuple(info[3]) if info else ())
         # Never silently substitute another member: routing a keyed request to
         # the wrong seat corrupts data instead of raising.
         raise NotFound(f"seat {k} of {self._name!r} is empty")
@@ -1023,7 +1042,9 @@ class Pool:
             got = self._c.frozen(self._name, True)
             if got is not None:
                 raw, ours, whole, _ = got
-                members = [self._handle_cls(self._name, m, tuple(info[3])) for m in json.loads(raw)]
+                members = [
+                    self._handle_cls(self._name, m, tuple(info[3])) for m in _json_decode(raw)
+                ]
                 found, mismatched = len(members), ours != whole
                 if found >= target and not mismatched:
                     self._check_fenced()
@@ -1316,6 +1337,7 @@ class Member:
         |---|---|
         | `beats_ok` / `beats_failed` | heartbeats answered, and not |
         | `interval_ms` / `silence_ms` | current beat spacing, time since the last one |
+        | `coalesce_ms` / `effective_coalesce_ms` | requested gap, bounded by the lease |
         | `watch_wakeups` | times the local cache moved and woke a waiter |
         | `state_bytes` | size of what this member is publishing |
         | `pool_revision` | version of its own pool, as last heard |
@@ -1468,6 +1490,7 @@ def join(
     max_concurrency: int | None = None,
     timeout: float = FIRST_BEAT_S,
     registry_url: str | None = None,
+    coalesce_ms: int = 50,
 ) -> Member:
     """Report in. One line per process.
 
@@ -1492,6 +1515,10 @@ def join(
 
     It picks the registry, it does not add one. A process is one member with
     one registry, so pool() and apool() follow whatever this joined.
+
+    `coalesce_ms` bounds how long bursts of publications and roster updates
+    are batched between beats. Defaults to 50ms; zero opts out. The effective
+    gap never exceeds a quarter of the lease, even for a larger requested gap.
     """
     global _client, _left, _owner_pid
     _left = False
@@ -1500,6 +1527,8 @@ def join(
             "this process has already joined; one process is one member. "
             "Call leave() first if you meant to re-join."
         )
+    if isinstance(coalesce_ms, bool) or not isinstance(coalesce_ms, int) or coalesce_ms < 0:
+        raise ValueError("coalesce_ms must be a nonnegative integer")
     pool = _checked_pool_name(pool)
     if policy not in POLICIES:
         raise PolicyError(f"policy must be one of {POLICIES}, got {policy!r}")
@@ -1561,6 +1590,7 @@ def join(
             url=url,
             methods=methods,
             exclusive=exclusive,
+            coalesce_ms=min(coalesce_ms, (1 << 64) - 1),
         )
         cleanup.callback(c.leave)
         if server is not None:

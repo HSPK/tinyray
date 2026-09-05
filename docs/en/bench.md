@@ -14,13 +14,82 @@ python bench.py --json out.json       # machine readable
 python bench.py --only rpc_latency    # one scenario
 python bench.py --check               # compare against bench-baseline.json,
                                       # non-zero exit on a regression
+python bench.py --only point_lookup rpc_batch
+python bench.py --only discovery watch_wakeup --coalesce-ms 1
 ```
 
 Every scenario feature-detects: this one script has to run against old wheels,
 reporting `n/a` for what it cannot do rather than crashing, or cross-version
 comparison is impossible.
 
+Known unsupported features are labeled `unsupported`; execution failures are
+errors and exit non-zero. `--check` also refuses missing metrics, empty
+comparisons, obsolete baseline formats and different workload settings. It
+never treats a failed measurement as an improvement. Workloads and cleanup
+still execute under `python -O`.
+
+Format 2 records the Python/native versions, a library fingerprint, benchmark
+revision, workload settings and host details. Capture a new baseline with
+`--json` after changing scenarios or calibration hardware. Do not compare an
+explicit low-latency policy against a default-policy baseline.
+
+`rpc_latency` and `rpc_throughput` retain the historical same-process topology.
+Use `rpc_latency_separate` and `rpc_concurrency` for a callee with its own GIL.
+`rpc_batch` compares the same 32 logical calls individually and in one request,
+not 32 requests against one logical operation. `point_lookup` uses stable
+seated rosters up to 5,000 members. `all_filtered_ms` and `pick_filtered_ms`
+now measure the operations their names describe.
+
+The 50 ms default coalescing budget is a traffic/latency choice, not a network
+floor. `discovery` measures a burst; `discovery_spaced` spaces changes by
+150 ms. Lower `coalesce_ms` explicitly to measure the latency/load tradeoff.
+
+For registry-only work, build and run the portable
+`crates/tinyray-registry/examples/perf_registry.rs` example. Its output
+distinguishes owned acknowledgment assembly from HTTP/shared-response costs;
+do not report the former as end-to-end throughput.
+
 ## The baseline
+
+The current format-2 baseline is the per-metric median of three independent
+optimized-build runs, followed by two independent verification runs. All 23
+watched metrics passed both verification runs. Relative tolerance is 20%,
+combined with calibrated absolute floors; the sub-millisecond `flush()` floor
+is now 0.1 ms, not the historical 50 ms allowance.
+
+### Measured optimization results
+
+Same benchmark script, same Python 3.11.15 environment, same 24-vCPU AMD EPYC
+host, sequential runs with no tests/builds running alongside. The before build
+is the saved v0.15.0 wheel; the after build is the current working tree.
+Lookup figures below are warm-cache medians across three runs.
+
+| Operation | Before | After |
+|---|---:|---:|
+| `slot()` at 5,000 members | 9.211 ms | 0.002034 ms |
+| Unfiltered `pick()` at 5,000 | 9.133 ms | 0.003671 ms |
+| `all()` at 5,000 | 9.271 ms | 4.445 ms |
+| Repeated field digest at 1,000 | 0.0990 ms | 0.000360 ms |
+| 64 KiB RPC echo p50 | 1.269 ms | 0.961 ms |
+| Burst discovery, default policy | 50.85 ms | 50.73 ms |
+
+One opt-in `coalesce_ms=1` run reduced burst discovery to 1.22 ms and watched
+notification to 2.24 ms. The default remains unchanged. A separate-process
+batch of 32 no-op calls cost 1.12 ms versus about 20.7 ms individually
+(18.5x per logical operation). Single-call RPC latency stayed near 0.69 ms.
+
+The portable registry benchmark reduced quiet owned-ack assembly from
+39.4 us to 0.58 us and fresh one-change history replay from 2.29 us to
+0.73 us. A separate HTTP probe with a shared roughly 1 MiB roster improved
+from 3.27 ms to 2.84 ms: assembly gains are not network-throughput multipliers.
+
+Native caches trade bounded memory for repeated-read speed: clients retain
+at most two 1 MiB serialized snapshots and one bounded field digest per pool;
+registry delta caches retain at most eight entries with a 2 MiB conservative
+serialized-payload budget per pool. These are not process-wide RSS limits,
+and cold reads or changing pools must still build their new snapshots.
+
+### Historical noise rationale
 
 `--check` compares a small set of metrics, and **the threshold was measured,
 not chosen**. Five consecutive runs on an idle machine, taking each metric's
@@ -56,7 +125,11 @@ down 30% reported 1 -- while 10% slower passed through.
 **Only something that fires gets read.** A baseline that goes red on its own
 is ignored, and then it is worse than none.
 
-## Across versions
+## Historical cross-version measurements
+
+The tables below retain earlier measurements; `HEAD` means the checkout used
+at that time, not today's build. In particular, their old `flush()` values are
+not the current sub-millisecond path.
 
 ### Group one: the core paths
 
@@ -81,8 +154,8 @@ clean venv. A 2000 ms lease (500 ms heartbeat interval), all over loopback.
 0.7.x and finished in 0.9.x. The 541.8 ms of 0.6.1 is exactly what the design
 notes call "structurally one heartbeat interval", and the measurement bears it
 out: a 500 ms interval, a 541.8 ms median. The four versions after 0.9.1 read
-51.1 / 51.6 / 51.2 / 51.0, inside the noise, which says this path has bottomed
-out -- what is left is one round trip plus assembling a beat.
+51.1 / 51.6 / 51.2 / 51.0, inside the noise. Those bursts exercised the
+50 ms coalescing budget; they did not establish a network latency floor.
 
 ### Everything else is flat, and that is the finding
 
@@ -104,8 +177,8 @@ keys should not pay for a full snapshot when a third key changes.
 one is the registry's heartbeat throughput under `loadgen`; this one is the
 Python RPC path (8 threads, one httpx client, the GIL). The two numbers
 measure two different things, and the notes did not say so, which makes it
-easy to read as a regression along one line. The 907 here is the **calling
-process's ceiling**, unmoved across six versions and never attacked.
+easy to read as a regression along one line. The 907 here also includes the
+callee sharing the caller's GIL; it is not an isolated caller ceiling.
 
 **Idle heartbeats are 2 a second, the same in all six versions.** That is not
 what long polling saves. The "14.5 a second against 0.12" in the notes is
@@ -148,13 +221,13 @@ to know: **on loopback the async API buys threads, not time.**
 
 **The scale curve (HEAD):**
 
-| Members | `all()` | `snapshot()` | `pick(shard=)` | `field_digest` | `epoch()` |
+| Members | `all()` | `snapshot()` | `all(shard=)` | `field_digest` | `epoch()` |
 |---|---|---|---|---|---|
 | 10 | 0.018 | 0.017 | 0.006 | 0.001 | 0.020 |
 | 100 | 0.140 | 0.142 | 0.026 | 0.009 | 0.148 |
 | 1000 | 1.496 | 1.513 | 0.207 | 0.102 | 1.548 |
 
-Clean O(N). Two ratios are worth remembering: at 1000 members `field_digest`
+These historical bulk paths grew with N. Two ratios are worth remembering: at 1000 members `field_digest`
 is **15x** cheaper than a full snapshot (0.102 against 1.513), and a filter
 matching one in eight is **7x** cheaper than `all()` (0.207 against 1.496) --
 the latter because the match happens before serialisation, on the Rust side.

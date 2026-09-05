@@ -9,10 +9,11 @@
 
 mod beat;
 
-use beat::{beat_once, spawn, CachedPool, Published, Shared};
+use beat::{beat_once, spawn, Published, Shared};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -21,6 +22,7 @@ use tinyray_proto::{Member, MAX_WATCH};
 #[pyclass]
 pub struct Client {
     shared: Arc<Shared>,
+    rng: Mutex<fastrand::Rng>,
     // Interior mutability, so every method can take &self. A &mut self method
     // holds pyo3's borrow for its whole duration, and leave() blocks on a
     // network round trip -- long enough for a watchdog thread reading
@@ -28,21 +30,25 @@ pub struct Client {
     rt: Mutex<Option<tokio::runtime::Runtime>>,
 }
 
-fn pick_from(c: &CachedPool, filter: &serde_json::Value, require_ready: bool) -> Vec<Member> {
-    let mut out: Vec<Member> = c
-        .members
-        .values()
-        .filter(|m| (!require_ready || m.ready) && m.matches(filter))
-        .cloned()
-        .collect();
-    out.sort_by_key(|m| m.id);
-    out
+fn selection_rng(id: u64, incarnation: u64) -> fastrand::Rng {
+    // fastrand's thread-local generator survives fork unchanged.
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let mut seed = std::collections::hash_map::DefaultHasher::new();
+    (
+        std::process::id(),
+        id,
+        incarnation,
+        std::time::Instant::now(),
+        NONCE.fetch_add(1, Ordering::Relaxed),
+    )
+        .hash(&mut seed);
+    fastrand::Rng::with_seed(seed.finish())
 }
 
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (endpoint, pool, id, incarnation, policy, slot=None, size=None, url=None, methods=None, exclusive=false))]
+    #[pyo3(signature = (endpoint, pool, id, incarnation, policy, slot=None, size=None, url=None, methods=None, exclusive=false, coalesce_ms=50))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: String,
@@ -55,6 +61,7 @@ impl Client {
         url: Option<String>,
         methods: Option<Vec<String>>,
         exclusive: bool,
+        coalesce_ms: u64,
     ) -> PyResult<Self> {
         let shared = Arc::new(Shared {
             endpoint,
@@ -82,6 +89,7 @@ impl Client {
             refused: Mutex::new(String::new()),
             confirmed: AtomicU64::new(0),
             interval_ms: AtomicU64::new(1000),
+            coalesce_ms,
             hold_ms: AtomicU64::new(0),
             last_ok_ms: AtomicU64::new(0),
             seen_epoch: AtomicU64::new(0),
@@ -98,6 +106,7 @@ impl Client {
         });
         Ok(Self {
             shared,
+            rng: Mutex::new(selection_rng(id, incarnation)),
             rt: Mutex::new(None),
         })
     }
@@ -252,11 +261,45 @@ impl Client {
         let filter: serde_json::Value = serde_json::from_str(filter_json)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let cache = self.shared.cache.read().unwrap();
-        let members = match cache.get(pool) {
-            Some(c) => pick_from(c, &filter, require_ready),
-            None => Vec::new(),
+        let Some(c) = cache.get(pool) else {
+            return Ok("[]".into());
         };
+        if filter.as_object().is_none_or(|f| f.is_empty()) {
+            return Ok(c.serialized(require_ready).0);
+        }
+        let members: Vec<&Member> = c
+            .ids(require_ready)
+            .iter()
+            .map(|id| &c.members[id])
+            .filter(|m| m.matches(&filter))
+            .collect();
         Ok(serde_json::to_string(&members).unwrap())
+    }
+
+    /// Only the selected member crosses the Python boundary.
+    #[pyo3(signature = (pool, filter_json="{}", require_ready=true))]
+    fn choose(
+        &self,
+        pool: &str,
+        filter_json: &str,
+        require_ready: bool,
+    ) -> PyResult<Option<String>> {
+        let filter: serde_json::Value = serde_json::from_str(filter_json)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let cache = self.shared.cache.read().unwrap();
+        Ok(cache
+            .get(pool)
+            .and_then(|c| c.choose(&filter, require_ready, &mut self.rng.lock().unwrap()))
+            .map(|m| serde_json::to_string(m).unwrap()))
+    }
+
+    #[pyo3(signature = (pool, slot, require_ready=false))]
+    fn lookup_slot(&self, pool: &str, slot: u64, require_ready: bool) -> Option<String> {
+        let cache = self.shared.cache.read().unwrap();
+        cache
+            .get(pool)?
+            .slot(slot, require_ready)
+            .map(|m| serde_json::to_string(m).unwrap())
     }
 
     /// The members of `pool` matching `require_ready`, the fingerprint they
@@ -272,14 +315,8 @@ impl Client {
     fn frozen(&self, pool: &str, require_ready: bool) -> Option<(String, u64, u64, u64)> {
         let cache = self.shared.cache.read().unwrap();
         let c = cache.get(pool)?;
-        let members = pick_from(c, &serde_json::Value::Null, require_ready);
-        let mine = members.iter().fold(0u64, |acc, m| acc ^ m.roster_hash());
-        Some((
-            serde_json::to_string(&members).unwrap(),
-            mine,
-            c.roster,
-            c.version,
-        ))
+        let (raw, mine) = c.serialized(require_ready);
+        Some((raw, mine, c.roster, c.version))
     }
 
     /// A hash over only the named fields of every member, plus who is present.
@@ -301,30 +338,9 @@ impl Client {
     /// asked for by name, as `fields=["ready"]`, which is the same question
     /// without a second way to spell it.
     fn field_digest(&self, pool: &str, fields: Vec<String>) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
         let cache = self.shared.cache.read().unwrap();
         let c = cache.get(pool)?;
-        let mut ids: Vec<&u64> = c.members.keys().collect();
-        ids.sort_unstable();
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for id in ids {
-            let m = &c.members[id];
-            m.id.hash(&mut h);
-            m.incarnation.hash(&mut h);
-            for f in &fields {
-                match f.as_str() {
-                    "ready" => m.ready.hash(&mut h),
-                    "url" => m.url.hash(&mut h),
-                    other => m
-                        .state
-                        .get(other)
-                        .map(|v| v.to_string())
-                        .unwrap_or_default()
-                        .hash(&mut h),
-                }
-            }
-        }
-        Some(h.finish())
+        Some(c.field_digest(&fields))
     }
 
     /// Version and roster fingerprint of a cached pool, or None if unseen.
@@ -435,6 +451,15 @@ impl Client {
             (
                 "interval_ms".into(),
                 self.shared.interval_ms.load(Ordering::Relaxed),
+            ),
+            ("coalesce_ms".into(), self.shared.coalesce_ms),
+            (
+                "effective_coalesce_ms".into(),
+                beat::coalesce_gap(
+                    self.shared.coalesce_ms,
+                    self.shared.interval_ms.load(Ordering::Relaxed),
+                )
+                .as_millis() as u64,
             ),
             ("silence_ms".into(), self.shared.silence_ms()),
             (

@@ -14,6 +14,7 @@ class Client:
         url: str | None = ...,
         methods: list[str] = ...,
         exclusive: bool = ...,
+        coalesce_ms: int = 50,
     ) -> None: ...
     @property
     def accepted(self) -> bool: ...
@@ -54,6 +55,12 @@ class Client:
     def set_url(self, url: str | None = ...) -> None: ...
     def lookup(self, pool: str, filter_json: str = ..., require_ready: bool = ...) -> str:
         """Matching members of `pool`, as a JSON list."""
+
+    def choose(self, pool: str, filter_json: str = ..., require_ready: bool = ...) -> str | None:
+        """One uniformly selected matching member, or None."""
+
+    def lookup_slot(self, pool: str, slot: int, require_ready: bool = ...) -> str | None:
+        """The occupant of a slot, or None."""
 
     def pool_info(self, pool: str) -> tuple[int, int, int | None, list[str]] | None:
         """(version, roster, size, methods), or None if the pool is unseen."""

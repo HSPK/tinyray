@@ -11,12 +11,13 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
-use tinyray_proto::{Beat, BeatAck, Member};
+use tinyray_proto::{Beat, BeatAck, Member, PoolDelta};
 use tokio::sync::Notify;
 
 #[derive(Default)]
@@ -26,6 +27,183 @@ pub struct CachedPool {
     pub methods: Vec<String>,
     pub size: Option<u64>,
     pub members: HashMap<u64, Member>,
+    slots: HashMap<u64, BTreeSet<u64>>,
+    ids: OnceLock<Vec<u64>>,
+    ready_ids: OnceLock<Vec<u64>>,
+    snapshots: Mutex<[Option<SerializedMembers>; 2]>,
+    digest: Mutex<Option<(Vec<String>, u64)>>,
+}
+
+struct SerializedMembers {
+    json: String,
+    roster: u64,
+}
+
+// At most two strings per pool, never an entry per filter or revision.
+const SNAPSHOT_BYTES: usize = 1024 * 1024;
+
+impl CachedPool {
+    fn unindex(&mut self, slot: u64, id: u64) {
+        if let Some(ids) = self.slots.get_mut(&slot) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                self.slots.remove(&slot);
+            }
+        }
+    }
+
+    fn remove(&mut self, id: u64) -> bool {
+        let Some(m) = self.members.remove(&id) else {
+            return false;
+        };
+        if let Some(slot) = m.slot {
+            self.unindex(slot, id);
+        }
+        true
+    }
+
+    fn apply(&mut self, d: &PoolDelta) {
+        if d.full || !d.changed.is_empty() || !d.removed.is_empty() {
+            *self.snapshots.get_mut().unwrap() = Default::default();
+            *self.digest.get_mut().unwrap() = None;
+        }
+        let mut membership_changed = d.full;
+        let mut readiness_changed = false;
+        if d.full {
+            self.members.clear();
+            self.slots.clear();
+        }
+        for m in &d.changed {
+            let old = self.members.insert(m.id, m.clone());
+            membership_changed |= old.is_none();
+            readiness_changed |= old.as_ref().map(|m| m.ready) != Some(m.ready);
+            let old_slot = old.and_then(|m| m.slot);
+            if old_slot != m.slot {
+                if let Some(slot) = old_slot {
+                    self.unindex(slot, m.id);
+                }
+                if let Some(slot) = m.slot {
+                    self.slots.entry(slot).or_default().insert(m.id);
+                }
+            }
+        }
+        for id in &d.removed {
+            membership_changed |= self.remove(*id);
+        }
+        if membership_changed {
+            self.ids.take();
+        }
+        if membership_changed || readiness_changed {
+            self.ready_ids.take();
+        }
+        self.version = d.version;
+        self.roster = d.roster;
+        self.methods.clone_from(&d.methods);
+        self.size = d.size;
+    }
+
+    pub fn ids(&self, require_ready: bool) -> &[u64] {
+        let ids = self.ids.get_or_init(|| {
+            let mut ids: Vec<u64> = self.members.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        });
+        if require_ready {
+            self.ready_ids.get_or_init(|| {
+                ids.iter()
+                    .copied()
+                    .filter(|id| self.members[id].ready)
+                    .collect()
+            })
+        } else {
+            ids
+        }
+    }
+
+    pub fn slot(&self, slot: u64, require_ready: bool) -> Option<&Member> {
+        self.slots.get(&slot)?.iter().find_map(|id| {
+            let m = &self.members[id];
+            (!require_ready || m.ready).then_some(m)
+        })
+    }
+
+    pub fn choose(
+        &self,
+        filter: &serde_json::Value,
+        require_ready: bool,
+        rng: &mut fastrand::Rng,
+    ) -> Option<&Member> {
+        if filter.as_object().is_none_or(|f| f.is_empty()) {
+            let ids = self.ids(require_ready);
+            return (!ids.is_empty()).then(|| &self.members[&ids[rng.usize(..ids.len())]]);
+        }
+        let mut chosen = None;
+        let mut count = 0;
+        for m in self.members.values() {
+            if (!require_ready || m.ready) && m.matches(filter) {
+                count += 1;
+                if rng.usize(..count) == 0 {
+                    chosen = Some(m);
+                }
+            }
+        }
+        chosen
+    }
+
+    pub fn serialized(&self, require_ready: bool) -> (String, u64) {
+        let mut snapshots = self.snapshots.lock().unwrap();
+        let cached = &mut snapshots[usize::from(require_ready)];
+        if let Some(cached) = cached {
+            return (cached.json.clone(), cached.roster);
+        }
+        let members: Vec<&Member> = self
+            .ids(require_ready)
+            .iter()
+            .map(|id| &self.members[id])
+            .collect();
+        let roster = members.iter().fold(0, |h, m| h ^ m.roster_hash());
+        let json = serde_json::to_string(&members).unwrap();
+        if json.len() <= SNAPSHOT_BYTES {
+            *cached = Some(SerializedMembers {
+                json: json.clone(),
+                roster,
+            });
+        }
+        (json, roster)
+    }
+
+    pub fn field_digest(&self, fields: &[String]) -> u64 {
+        let mut cached = self.digest.lock().unwrap();
+        if let Some((keys, digest)) = cached.as_ref() {
+            if keys == fields {
+                return *digest;
+            }
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for id in self.ids(false) {
+            let m = &self.members[id];
+            m.id.hash(&mut h);
+            m.incarnation.hash(&mut h);
+            for f in fields {
+                match f.as_str() {
+                    "ready" => m.ready.hash(&mut h),
+                    "url" => m.url.hash(&mut h),
+                    other => m
+                        .state
+                        .get(other)
+                        .map(|v| v.to_string())
+                        .unwrap_or_default()
+                        .hash(&mut h),
+                }
+            }
+        }
+        let digest = h.finish();
+        // A caller-controlled list of fields must not become an unbounded cache.
+        if fields.len() <= 64 && fields.iter().map(String::len).sum::<usize>() <= 4096 {
+            *cached = Some((fields.to_vec(), digest));
+        }
+        digest
+    }
 }
 
 /// Everything the beat loop needs, without touching Python.
@@ -60,6 +238,7 @@ pub struct Shared {
     /// says nothing about the newer state.
     pub confirmed: AtomicU64,
     pub interval_ms: AtomicU64,
+    pub coalesce_ms: u64,
     /// How long we let the registry sit on an answer that says nothing. Set to
     /// the interval we would otherwise have slept, so the request rate is the
     /// one the polling had and the delay before hearing about a change becomes
@@ -258,19 +437,7 @@ impl Shared {
             if d.version < c.version {
                 continue;
             }
-            if d.full {
-                c.members.clear();
-            }
-            for m in &d.changed {
-                c.members.insert(m.id, m.clone());
-            }
-            for id in &d.removed {
-                c.members.remove(id);
-            }
-            c.version = d.version;
-            c.roster = d.roster;
-            c.methods = d.methods.clone();
-            c.size = d.size;
+            c.apply(d);
         }
         // There used to be a loop here recording every watched pool as empty,
         // for fear that a pool we asked about and heard nothing back for would
@@ -294,19 +461,27 @@ fn nodelay_connector() -> hyper_util::client::legacy::connect::HttpConnector {
     c
 }
 
-/// A beat is small and local; anything slower than this is a lost packet, not
-/// a slow server. Without a deadline a single dropped packet hangs the caller
-/// forever, which is exactly what "failure must be explicitly bounded" is for.
-///
-/// The loop is serial, so this deadline is also how long a lost packet stops
-/// us beating. It has to stay well inside the interval, or one drop costs the
-/// lease: at a 500 ms interval a five-second timeout meant a single lost packet
-/// took the member out of the roster.
-/// The closest two beats from one member may be. Only reachable when a watched
-/// pool is changing constantly, and it caps that at twenty beats a second
-/// rather than as fast as the network will go.
-const MIN_GAP: Duration = Duration::from_millis(50);
+/// Leave the rest of the lease available for a timed-out request and a retry.
+pub fn coalesce_gap(requested_ms: u64, interval_ms: u64) -> Duration {
+    Duration::from_millis(requested_ms.min(interval_ms).min(30_000))
+}
 
+async fn coalesce(shared: &Shared, started: tokio::time::Instant, interruptible: bool) {
+    let gap = coalesce_gap(
+        shared.coalesce_ms,
+        shared.interval_ms.load(Ordering::Relaxed),
+    );
+    let delay = gap.saturating_sub(started.elapsed());
+    if !delay.is_zero() {
+        if interruptible {
+            let _ = tokio::time::timeout(delay, shared.wake.notified()).await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+/// The serial loop must retry a lost request well before its lease expires.
 fn beat_timeout(interval_ms: u64, hold_ms: u64) -> Duration {
     if hold_ms == 0 {
         return Duration::from_millis(interval_ms.clamp(50, 30_000) * 3 / 4);
@@ -397,7 +572,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 // One final beat carrying `leaving` was already sent by leave().
                 return;
             }
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let (mut beat, showing) = shared.compose();
             let interval = shared.interval_ms.load(Ordering::Relaxed);
             // The request that replaces a cancelled one is never parked. It
@@ -433,16 +608,13 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
             cancelled_last = outcome.is_none();
             let Some(outcome) = outcome else {
                 // Something to publish. Go straight back round with it, but
-                // no faster than MIN_GAP: a process publishing flat out would
+                // no faster than the configured gap: a process publishing flat out would
                 // otherwise turn the loop into a request generator bounded
                 // only by the round trip. Measured under an unthrottled
                 // publisher, this halves it -- 24 to 11 requests a second.
                 // What keeps such a publisher *alive* is the unparked
                 // replacement above, not this.
-                let spent = started.elapsed();
-                if spent < MIN_GAP {
-                    tokio::time::sleep(MIN_GAP - spent).await;
-                }
+                coalesce(&shared, started, false).await;
                 continue;
             };
             match outcome {
@@ -508,10 +680,7 @@ pub fn spawn(shared: Arc<Shared>) -> tokio::runtime::Runtime {
                 // to pause is to keep a pool that changes constantly from
                 // turning this into a spin: the answer would come back at once
                 // every time, and we would ask again just as fast.
-                let spent = started.elapsed();
-                if spent < MIN_GAP {
-                    let _ = tokio::time::timeout(MIN_GAP - spent, shared.wake.notified()).await;
-                }
+                coalesce(&shared, started, true).await;
             }
         }
     });
@@ -601,6 +770,303 @@ mod tests {
     use serde_json::json;
     use tinyray_proto::PoolDelta;
 
+    fn member(id: u64, slot: Option<u64>, ready: bool) -> Member {
+        Member {
+            id,
+            slot,
+            incarnation: 1,
+            url: None,
+            state: json!({"n": 3, "flag": true, "nested": {"values": [3]}}),
+            ready,
+        }
+    }
+
+    fn delta(version: u64, full: bool, changed: Vec<Member>, removed: Vec<u64>) -> PoolDelta {
+        PoolDelta {
+            version,
+            roster: changed.iter().fold(0, |h, m| h ^ m.roster_hash()),
+            policy: "stateful".into(),
+            methods: vec!["ping".into()],
+            size: Some(4),
+            changed,
+            removed,
+            full,
+        }
+    }
+
+    fn decoded(c: &CachedPool, require_ready: bool) -> Vec<Member> {
+        let (raw, fingerprint) = c.serialized(require_ready);
+        let members: Vec<Member> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            fingerprint,
+            members.iter().fold(0, |h, m| h ^ m.roster_hash())
+        );
+        members
+    }
+
+    #[test]
+    fn slot_index_tracks_wire_ids_readiness_and_duplicate_slots() {
+        let mut c = CachedPool::default();
+        c.apply(&delta(
+            1,
+            true,
+            vec![
+                member(50, Some(2), true),
+                member(30, Some(2), false),
+                member(2, None, true),
+            ],
+            vec![],
+        ));
+        assert_eq!(c.slot(2, false).unwrap().id, 30);
+        assert_eq!(c.slot(2, true).unwrap().id, 50);
+        assert!(c.slot(30, false).is_none());
+        assert_eq!(c.ids(false), &[2, 30, 50]);
+        assert_eq!(c.ids(true), &[2, 50]);
+
+        c.apply(&delta(2, false, vec![member(30, Some(3), true)], vec![50]));
+        assert!(c.slot(2, false).is_none());
+        assert_eq!(c.slot(3, true).unwrap().id, 30);
+        assert_eq!(c.ids(true), &[2, 30]);
+        c.apply(&delta(3, false, vec![member(30, None, true)], vec![]));
+        assert!(c.slots.is_empty());
+        c.apply(&delta(4, false, vec![], vec![30, 12345]));
+        assert_eq!(c.ids(false), &[2]);
+    }
+
+    #[test]
+    fn snapshots_digests_and_indices_are_invalidated_together() {
+        let mut c = CachedPool::default();
+        c.apply(&delta(
+            1,
+            true,
+            vec![member(90, Some(0), true), member(40, Some(1), false)],
+            vec![],
+        ));
+        assert_eq!(
+            decoded(&c, false).iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![40, 90]
+        );
+        assert_eq!(decoded(&c, true).len(), 1);
+        let fields = vec!["n".into(), "ready".into(), "url".into()];
+        let before = c.field_digest(&fields);
+        assert_eq!(before, c.field_digest(&fields));
+        let mut changed = member(40, Some(3), true);
+        changed.state = json!({"n": 4});
+        changed.url = Some("http://new".into());
+        changed.incarnation = 2;
+        c.apply(&delta(2, false, vec![changed.clone()], vec![]));
+        assert!(c.ids.get().is_some());
+        assert!(c.ready_ids.get().is_none());
+        assert_ne!(before, c.field_digest(&fields));
+        assert!(c.slot(1, false).is_none());
+        assert_eq!(c.slot(3, true), Some(&changed));
+        for ready in [false, true] {
+            let members = decoded(&c, ready);
+            assert_eq!(members.len(), 2);
+            assert_eq!(members[0], changed);
+        }
+        c.apply(&delta(3, false, vec![], vec![90]));
+        assert_eq!(decoded(&c, true), vec![changed]);
+        c.apply(&delta(4, true, vec![member(7, Some(2), false)], vec![]));
+        assert!(c.slot(3, false).is_none());
+        assert_eq!(c.ids(false), &[7]);
+        assert!(decoded(&c, true).is_empty());
+        assert_eq!(decoded(&c, false).len(), 1);
+    }
+
+    #[test]
+    fn no_change_beats_reuse_derived_data_but_full_resyncs_do_not() {
+        let mut c = CachedPool::default();
+        c.apply(&delta(1, true, vec![member(90, Some(0), true)], vec![]));
+        let original = decoded(&c, true);
+        let fields = vec!["ready".into()];
+        c.field_digest(&fields);
+        c.apply(&delta(2, false, vec![], vec![]));
+        assert!(c.ids.get().is_some());
+        assert!(c.ready_ids.get().is_some());
+        assert!(c.snapshots.lock().unwrap()[1].is_some());
+        assert!(c.digest.lock().unwrap().is_some());
+        assert_eq!(c.version, 2);
+        assert_eq!(decoded(&c, true), original);
+
+        let mut updated = original[0].clone();
+        updated.state = json!({"n": 42});
+        c.apply(&delta(3, false, vec![updated], vec![]));
+        assert!(c.ids.get().is_some());
+        assert!(c.ready_ids.get().is_some());
+        assert!(c.snapshots.lock().unwrap().iter().all(Option::is_none));
+        assert!(c.digest.lock().unwrap().is_none());
+        assert_eq!(decoded(&c, true)[0].state, json!({"n": 42}));
+
+        c.apply(&delta(3, true, vec![], vec![]));
+        assert!(c.ids.get().is_none());
+        assert!(c.ready_ids.get().is_none());
+        assert!(c.snapshots.lock().unwrap().iter().all(Option::is_none));
+        assert!(c.digest.lock().unwrap().is_none());
+        assert!(c.slot(0, false).is_none());
+        assert!(decoded(&c, false).is_empty());
+    }
+
+    #[test]
+    fn derived_cache_sizes_are_bounded() {
+        let mut c = CachedPool::default();
+        let mut large = member(1, Some(0), true);
+        large.state = json!({"large": "x".repeat(SNAPSHOT_BYTES)});
+        c.apply(&delta(1, true, vec![large.clone()], vec![]));
+        for ready in [false, true] {
+            assert_eq!(decoded(&c, ready), vec![large.clone()]);
+        }
+        assert!(c.snapshots.lock().unwrap().iter().all(Option::is_none));
+        c.field_digest(&vec!["x".into(); 65]);
+        assert!(c.digest.lock().unwrap().is_none());
+        c.field_digest(&["x".repeat(4097)]);
+        assert!(c.digest.lock().unwrap().is_none());
+        c.field_digest(&["large".into()]);
+        for i in 0..100 {
+            let field = format!("key{i}");
+            c.field_digest(std::slice::from_ref(&field));
+            assert_eq!(c.digest.lock().unwrap().as_ref().unwrap().0, vec![field]);
+        }
+    }
+
+    #[test]
+    fn native_selection_is_uniform_and_filters_only_eligible_members() {
+        let mut rng = fastrand::Rng::with_seed(0x715E1EC7);
+        let mut c = CachedPool::default();
+        c.apply(&delta(
+            1,
+            true,
+            (0..8).map(|id| member(id, Some(id + 10), id < 7)).collect(),
+            vec![],
+        ));
+        for filter in [json!({}), json!({"nested": {"values": [3.0]}})] {
+            let mut counts = [0; 7];
+            for _ in 0..35_000 {
+                let m = c.choose(&filter, true, &mut rng).unwrap();
+                assert!(m.ready);
+                counts[m.id as usize] += 1;
+            }
+            for count in counts {
+                assert!((4500..5500).contains(&count), "{counts:?}");
+            }
+        }
+        assert!(c.choose(&json!({"flag": 1}), false, &mut rng).is_none());
+        assert!(c
+            .choose(&json!({"missing": null}), false, &mut rng)
+            .is_none());
+        assert!(c
+            .choose(&json!({"nested": {"values": [true]}}), false, &mut rng)
+            .is_none());
+        c.apply(&delta(2, true, vec![member(99, Some(0), false)], vec![]));
+        assert!(c.choose(&json!({}), true, &mut rng).is_none());
+        assert_eq!(
+            c.choose(&json!({"n": 3.0}), false, &mut rng).unwrap().id,
+            99
+        );
+        c.apply(&delta(3, true, vec![], vec![]));
+        assert!(c.choose(&json!({}), false, &mut rng).is_none());
+    }
+
+    #[test]
+    fn restart_and_refusal_do_not_leak_stale_indices_or_snapshots() {
+        let s = shared();
+        let ack = |epoch, accepted, d| BeatAck {
+            epoch,
+            protocol: tinyray_proto::PROTOCOL,
+            version: String::new(),
+            ttl_ms: 2000,
+            accepted,
+            refused: None,
+            pools: HashMap::from([("p".into(), d)]),
+        };
+        assert!(s.apply(&ack(
+            1,
+            true,
+            delta(5, true, vec![member(42, Some(1), true)], vec![])
+        )));
+        {
+            let cache = s.cache.read().unwrap();
+            assert_eq!(cache["p"].slot(1, true).unwrap().id, 42);
+            decoded(&cache["p"], true);
+        }
+        assert!(s.apply(&ack(
+            1,
+            true,
+            delta(4, true, vec![member(41, Some(2), true)], vec![])
+        )));
+        {
+            let cache = s.cache.read().unwrap();
+            assert!(cache["p"].slot(2, false).is_none());
+            assert_eq!(decoded(&cache["p"], true)[0].id, 42);
+        }
+        assert!(s.apply(&ack(2, true, delta(1, false, vec![], vec![]))));
+        assert!(!s.cache.read().unwrap().contains_key("p"));
+        assert!(s.apply(&ack(
+            2,
+            true,
+            delta(1, true, vec![member(17, Some(3), true)], vec![])
+        )));
+        assert!(!s.apply(&ack(2, false, delta(2, true, vec![], vec![]))));
+        assert!(!s.accepted.load(Ordering::Relaxed));
+        {
+            let cache = s.cache.read().unwrap();
+            assert!(cache["p"].slot(1, false).is_none());
+            assert_eq!(decoded(&cache["p"], true)[0].id, 17);
+        }
+    }
+
+    #[test]
+    fn coalescing_is_bounded_by_the_renewal_budget() {
+        for ttl in [200, 201, 500, 2000, 20_000, 120_000] {
+            let interval = ttl / 4;
+            let hold = interval.clamp(50, 30_000);
+            assert_eq!(coalesce_gap(50, interval), Duration::from_millis(50));
+            assert_eq!(coalesce_gap(0, interval), Duration::ZERO);
+            let gap = coalesce_gap(u64::MAX, interval);
+            assert!(gap <= Duration::from_millis(interval));
+            assert!(gap + beat_timeout(interval, hold) < Duration::from_millis(ttl));
+        }
+        assert_eq!(coalesce_gap(7, 500), Duration::from_millis(7));
+        assert_eq!(coalesce_gap(u64::MAX, 0), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_latency_and_wakeup_order_are_deterministic() {
+        let mut s = shared();
+        for requested in [0, 7, 50, 10_000] {
+            s.coalesce_ms = requested;
+            s.interval_ms.store(50, Ordering::Relaxed);
+            for interruptible in [false, true] {
+                let started = tokio::time::Instant::now();
+                coalesce(&s, started, interruptible).await;
+                assert_eq!(started.elapsed(), coalesce_gap(requested, 50));
+            }
+        }
+        s.coalesce_ms = 50;
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        coalesce(&s, started, false).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
+
+        s.wake.notify_one();
+        let started = tokio::time::Instant::now();
+        coalesce(&s, started, false).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
+        let started = tokio::time::Instant::now();
+        coalesce(&s, started, true).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        s.coalesce_ms = 0;
+        s.wake.notify_one();
+        coalesce(&s, tokio::time::Instant::now(), true).await;
+        s.coalesce_ms = 50;
+        let started = tokio::time::Instant::now();
+        coalesce(&s, started, true).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        coalesce(&s, started, true).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
+    }
+
     /// The deadline for a beat that is not being parked has to follow the
     /// interval, not sit at a constant.
     ///
@@ -673,6 +1139,7 @@ mod tests {
             refused: Mutex::new(String::new()),
             confirmed: AtomicU64::new(0),
             interval_ms: AtomicU64::new(1000),
+            coalesce_ms: 50,
             hold_ms: AtomicU64::new(0),
             last_ok_ms: AtomicU64::new(0),
             seen_epoch: AtomicU64::new(0),

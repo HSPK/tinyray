@@ -21,6 +21,9 @@ from typing import Any
 
 import msgspec
 
+from ._json import dumps, loads
+from ._rpc import MAX_BATCH, _batch_request_id
+
 # A caller that announces a body and never sends it pins a thread for as long
 # as it cares to: measured 200 such connections holding 203 threads, released
 # only when the attacker closed them. Real bodies are under a megabyte.
@@ -268,7 +271,9 @@ class Counters:
 
     Plain ints under a lock rather than a metrics library: this is a membership
     layer, and whoever wants histograms can build them from `calls` and
-    `busy_ns`.
+    `busy_ns`. Batches count as one request, including one failure if any item
+    fails, and hold one concurrency slot until their complete reply is written.
+    Invalid admitted batch bodies count as failed requests, like single calls.
     """
 
     __slots__ = ("calls", "refused", "failed", "in_flight", "peak_in_flight", "busy_ns", "_lock")
@@ -397,14 +402,18 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code: int, body: dict) -> None:
+        code, raw, _ = self._encode_reply(code, body)
+        self._send_raw(code, raw)
+
+    @staticmethod
+    def _encode_reply(code: int, body: dict) -> tuple[int, bytes, bool]:
         try:
-            raw = json.dumps(body).encode()
-        except (TypeError, ValueError) as e:
+            return code, dumps(body), False
+        except (TypeError, ValueError, RecursionError) as e:
             # A method returning something JSON cannot carry used to kill the
             # handler thread, and the caller saw a reset connection -- which
             # reads as "the peer died" rather than "your return value".
-            code = 200
-            raw = json.dumps(
+            raw = dumps(
                 {
                     "error": {
                         "type": "TypeError",
@@ -412,10 +421,21 @@ class _Handler(BaseHTTPRequestHandler):
                         "traceback": "",
                     }
                 }
-            ).encode()
-        self.send_response(code)
+            )
+            return 200, raw, True
+
+    def _send_raw(self, code: int, raw: bytes) -> None:
+        if self.close_connection:
+            # Keep refusal replies small despite the required close header.
+            # The optional server banner adds no useful information here.
+            self.send_response_only(code)
+            self.send_header("date", self.date_time_string())
+        else:
+            self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
+        if self.close_connection:
+            self.send_header("connection", "close")
         # Buffer the head and send it together with the body: one write, one
         # segment, no interaction with delayed ACK.
         self._headers_buffer.append(b"\r\n")
@@ -492,7 +512,12 @@ class _Handler(BaseHTTPRequestHandler):
             finally:
                 self.connection.settimeout(IDLE_TIMEOUT)
 
-        if not self.path.startswith("/call/"):
+        if length and len(raw) != length:
+            self.close_connection = True
+            return self._send(400, {"error": "body is shorter than content-length"})
+
+        batching = self.path == "/_batch"
+        if not batching and not self.path.startswith("/call/"):
             return self._send(404, {})
         name = self.path[len("/call/") :]
 
@@ -503,14 +528,12 @@ class _Handler(BaseHTTPRequestHandler):
         # now answers on -- that is the identity check. Or the seat may have
         # moved on while this process kept running and listening, in which case
         # nothing about the request looks wrong and only we know we are a ghost.
-        if not self.server.still_ours():
-            return self._send(409, {"error": "superseded", "identity": self.server.identity})
-        target = self.headers.get("x-tinyray-target")
-        if target and target != self.server.identity:
-            return self._send(409, {"error": "fenced", "identity": self.server.identity})
+        fenced = self._fenced()
+        if fenced is not None:
+            return self._send(409, fenced)
 
-        fn = self.server.dispatch.get(name)
-        if fn is None:
+        fn = None if batching else self.server.dispatch.get(name)
+        if not batching and fn is None:
             return self._send(404, {"error": f"no method {name!r}"})
 
         # A thread per connection with nothing bounding it: a hundred workers
@@ -527,10 +550,16 @@ class _Handler(BaseHTTPRequestHandler):
         started = time.perf_counter_ns()
         counted = False
         try:
-            code, body, failed = self._dispatch(fn, name, raw)
+            if batching:
+                code, encoded, failed = self._dispatch_batch(raw)
+            else:
+                assert fn is not None
+                code, body, failed = self._dispatch(fn, name, raw)
+                code, encoded, encoding_failed = self._encode_reply(code, body)
+                failed = failed or encoding_failed
             counters.answered(failed)
             counted = True
-            self._send(code, body)
+            self._send_raw(code, encoded)
         finally:
             # _dispatch answers for anything the method itself can do. Getting
             # here without having counted means something above the method came
@@ -541,6 +570,70 @@ class _Handler(BaseHTTPRequestHandler):
             if slots is not None:
                 slots.release()
 
+    def _fenced(self) -> dict | None:
+        if not self.server.still_ours():
+            return {"error": "superseded", "identity": self.server.identity}
+        target = self.headers.get("x-tinyray-target")
+        if target and target != self.server.identity:
+            return {"error": "fenced", "identity": self.server.identity}
+        return None
+
+    def _dispatch_batch(self, raw: bytes) -> tuple[int, bytes, bool]:
+        try:
+            payload = loads(raw)
+        except (ValueError, RecursionError) as exc:
+            return 400, dumps({"error": str(exc)}), True
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"calls"}
+            or not isinstance(payload["calls"], list)
+        ):
+            return 400, dumps({"error": "a batch needs a 'calls' array"}), True
+        calls = payload["calls"]
+        if len(calls) > MAX_BATCH:
+            return 413, dumps({"error": f"a batch can contain at most {MAX_BATCH} calls"}), True
+        # Validate every envelope before any method runs. Signature and method
+        # lookup failures, unlike malformed envelopes, belong to individual items.
+        for item in calls:
+            if not isinstance(item, dict) or set(item) != {"method", "args", "kwargs"}:
+                return 400, dumps({"error": "each batch item needs method, args and kwargs"}), True
+            name = item["method"]
+            if (
+                not isinstance(name, str)
+                or not name.isascii()
+                or not name.isidentifier()
+                or name.startswith("_")
+                or not isinstance(item["args"], list)
+                or not isinstance(item["kwargs"], dict)
+            ):
+                return 400, dumps({"error": "invalid batch method or argument envelope"}), True
+        replies: list[bytes] = []
+        batch_id = self.headers.get("x-tinyray-request") or ""
+        failed = False
+        for index, item in enumerate(calls):
+            fenced = self._fenced()
+            name = item["method"]
+            fn = self.server.dispatch.get(name)
+            if fenced is not None:
+                code, body, failed = 409, fenced, True
+            elif fn is None:
+                code, body, failed = 404, {"error": f"no method {name!r}"}, True
+            else:
+                code, body, failed = self._dispatch_payload(
+                    fn,
+                    name,
+                    {"args": item["args"], "kwargs": item["kwargs"]},
+                    _batch_request_id(batch_id, index),
+                )
+            # Freeze each result before the next method can mutate it, and
+            # stop on serialization failure before any later item is executed.
+            code, encoded, encoding_failed = self._encode_reply(code, body)
+            replies.append(b'{"status":' + str(code).encode() + b',"body":' + encoded + b"}")
+            if failed or encoding_failed:
+                failed = True
+                break
+        return 200, b'{"items":[' + b",".join(replies) + b"]}", failed
+
     def _dispatch(self, fn: Callable[..., Any], name: str, raw: bytes) -> tuple[int, dict, bool]:
         """The answer to give, and whether the call failed however it failed.
 
@@ -549,14 +642,23 @@ class _Handler(BaseHTTPRequestHandler):
         it counted. One place writes instead of four.
         """
         try:
-            args, kwargs = _coerce(
-                fn,
-                json.loads(raw or b"{}"),
-                self.headers.get("x-tinyray-caller") or "",
-                self.headers.get("x-tinyray-request") or "",
-            )
+            payload = loads(raw or b"{}")
         except json.JSONDecodeError as e:
             return 400, {"error": str(e)}, True
+        return self._dispatch_payload(
+            fn, name, payload, self.headers.get("x-tinyray-request") or ""
+        )
+
+    def _dispatch_payload(
+        self, fn: Callable[..., Any], name: str, payload: Any, request_id: str
+    ) -> tuple[int, dict, bool]:
+        try:
+            args, kwargs = _coerce(
+                fn,
+                payload,
+                self.headers.get("x-tinyray-caller") or "",
+                request_id,
+            )
         except msgspec.ValidationError as e:
             # A type mismatch is the caller's fault, so it is reported as one
             # rather than dressed up as a business failure.

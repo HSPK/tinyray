@@ -1,105 +1,182 @@
 {
-  "label": "HEAD",
+  "calibration": {
+    "aggregation": "per-metric median",
+    "lookup_cache": "warm",
+    "runs": 3,
+    "timing_tests_run_concurrently": false
+  },
+  "format_version": 2,
+  "label": "optimized working tree; median of 3 independent runs",
+  "provenance": {
+    "benchmark_revision": "7729ce2fcdb1eaa9e45dc1f292fbb1e808ddc663",
+    "environment": {
+      "cpu": "AMD EPYC 7V13 64-Core Processor",
+      "httpx": "0.28.1",
+      "load_average": [
+        4.92822265625,
+        2.9619140625,
+        2.275390625
+      ],
+      "logical_cpus": 24,
+      "msgspec": "0.21.1",
+      "platform": "Linux-6.17.0-1021-azure-x86_64-with-glibc2.39",
+      "python_optimization": 0
+    },
+    "library_fingerprint": "a6fb0df29cb3bb75b9e336065a01e3f13005e053ed5b2a8b9d52fb3ef07139db",
+    "native_version": "0.15.0",
+    "package_path": "python/tinyray",
+    "package_version": "0.15.0",
+    "recorded_at": "2026-09-05T12:38:07.623155+00:00",
+    "worktree_dirty": true
+  },
   "python": "3.11.15",
   "scenarios": {
     "async_call": {
       "calls": 1000,
-      "max_ms": 10.832,
-      "p50_ms": 1.344,
-      "p90_ms": 1.446,
-      "p99_ms": 1.84,
-      "took_s": 1.7
+      "concurrency": 1,
+      "max_ms": 2.711318,
+      "p50_ms": 1.351621,
+      "p90_ms": 1.442648,
+      "p99_ms": 1.746178,
+      "took_s": 1.7,
+      "topology": "same_process"
     },
     "discovery": {
       "changes": 10,
-      "max_ms": 52.162,
-      "p50_ms": 51.054,
-      "p90_ms": 52.162,
-      "p99_ms": 52.162,
-      "took_s": 0.9
+      "max_ms": 52.141513,
+      "p50_ms": 50.727214,
+      "p90_ms": 52.141513,
+      "p99_ms": 52.141513,
+      "publish_gap_ms": 0.0,
+      "took_s": 0.9,
+      "topology": "separate_processes"
     },
-    "idle_beat_rate": {
-      "beats_per_s": 2.0,
-      "interval_ms": 500,
-      "took_s": 7.2
-    },
-    "join_cold_start": {
-      "max_ms": 43.55,
-      "over_15ms": 19,
-      "p50_ms": 1.72,
-      "p90_ms": 42.52,
-      "p99_ms": 43.55,
-      "starts": 40,
-      "took_s": 7.2,
-      "under_5ms": 21
+    "discovery_spaced": {
+      "changes": 10,
+      "max_ms": 1.520263,
+      "p50_ms": 1.387537,
+      "p90_ms": 1.520263,
+      "p99_ms": 1.520263,
+      "publish_gap_ms": 150.0,
+      "took_s": 1.9,
+      "topology": "separate_processes"
     },
     "lookup_scaling": {
       "10": {
-        "all_ms": 0.019,
-        "epoch_ms": 0.02,
-        "field_digest_ms": 0.001,
-        "pick_filtered_ms": 0.006,
-        "snapshot_ms": 0.017
+        "all_filtered_ms": 0.004658,
+        "all_ms": 0.009703,
+        "epoch_ms": 0.012058,
+        "field_digest_ms": 0.000351,
+        "pick_filtered_ms": 0.004032,
+        "pick_ms": 0.003186,
+        "snapshot_ms": 0.008286
       },
       "100": {
-        "all_ms": 0.14,
-        "epoch_ms": 0.146,
-        "field_digest_ms": 0.009,
-        "pick_filtered_ms": 0.025,
-        "snapshot_ms": 0.141
+        "all_filtered_ms": 0.018249,
+        "all_ms": 0.069876,
+        "epoch_ms": 0.076198,
+        "field_digest_ms": 0.000351,
+        "pick_filtered_ms": 0.005681,
+        "pick_ms": 0.003221,
+        "snapshot_ms": 0.068669
       },
       "1000": {
-        "all_ms": 1.538,
-        "epoch_ms": 1.569,
-        "field_digest_ms": 0.093,
-        "pick_filtered_ms": 0.207,
-        "snapshot_ms": 1.55
+        "all_filtered_ms": 0.158602,
+        "all_ms": 0.818075,
+        "epoch_ms": 0.851042,
+        "field_digest_ms": 0.00036,
+        "pick_filtered_ms": 0.029375,
+        "pick_ms": 0.003256,
+        "snapshot_ms": 0.821903
       },
-      "took_s": 1.6
+      "took_s": 1.2
+    },
+    "point_lookup": {
+      "100": {
+        "all_ms": 0.071144,
+        "pick_filtered_ms": 0.006241,
+        "pick_ms": 0.003296,
+        "slot_ms": 0.001983,
+        "snapshot_ms": 0.070187
+      },
+      "1000": {
+        "all_ms": 0.863105,
+        "pick_filtered_ms": 0.036529,
+        "pick_ms": 0.003477,
+        "slot_ms": 0.002044,
+        "snapshot_ms": 0.862394
+      },
+      "5000": {
+        "all_ms": 4.444923,
+        "pick_filtered_ms": 0.166682,
+        "pick_ms": 0.003671,
+        "slot_ms": 0.002034,
+        "snapshot_ms": 4.500001
+      },
+      "took_s": 4.7
     },
     "publish": {
-      "flush_p50_ms": 692.92,
-      "took_s": 14.7,
-      "update_changed_us": 3.0,
-      "update_same_us": 3.0
+      "flush_p50_ms": 0.21,
+      "took_s": 0.3,
+      "update_changed_us": 3.9,
+      "update_same_us": 3.8
+    },
+    "rpc_batch": {
+      "batch_per_call_ms": 0.03511753125,
+      "batch_total_ms": 1.123761,
+      "individual_total_ms": 20.731034,
+      "logical_calls": 32,
+      "speedup": 18.45665445229158,
+      "took_s": 1.9,
+      "topology": "separate_processes"
     },
     "rpc_error": {
-      "ok_p50_ms": 0.789,
-      "raising_p50_ms": 0.946,
-      "took_s": 1.8
+      "ok_p50_ms": 0.704772,
+      "raising_p50_ms": 0.838519,
+      "took_s": 1.2
     },
     "rpc_latency": {
       "calls": 2000,
-      "max_ms": 10.377,
-      "p50_ms": 0.675,
-      "p90_ms": 0.746,
-      "p99_ms": 1.039,
-      "took_s": 1.8
+      "max_ms": 8.871501,
+      "p50_ms": 0.689163,
+      "p90_ms": 0.762781,
+      "p99_ms": 0.945284,
+      "took_s": 2.2,
+      "topology": "same_process"
+    },
+    "rpc_latency_separate": {
+      "calls": 2000,
+      "max_ms": 9.641435,
+      "p50_ms": 0.643277,
+      "p90_ms": 0.721725,
+      "p99_ms": 0.908826,
+      "took_s": 1.9,
+      "topology": "separate_processes"
     },
     "rpc_payload_64k": {
       "bytes": 65536,
-      "max_ms": 2.051,
-      "p50_ms": 1.374,
-      "p90_ms": 1.464,
-      "p99_ms": 1.93,
-      "took_s": 1.2
-    },
-    "rpc_throughput": {
-      "calls_per_s": 860,
-      "threads": 8,
-      "took_s": 5.8
+      "max_ms": 1.810869,
+      "p50_ms": 0.960812,
+      "p90_ms": 1.069788,
+      "p99_ms": 1.364781,
+      "took_s": 0.7,
+      "topology": "same_process"
     },
     "watch_wakeup": {
       "fields_supported": true,
-      "took_s": 4.8,
+      "took_s": 5.0,
       "wakeup": {
-        "max_ms": 52.001,
-        "p50_ms": 50.928,
-        "p90_ms": 52.001,
-        "p99_ms": 52.001
+        "max_ms": 51.962092,
+        "p50_ms": 51.188661,
+        "p90_ms": 51.962092,
+        "p99_ms": 51.962092
       },
       "wakeups_for_10_unwatched_changes": 0,
       "woken_by_the_watched_key": true
     }
+  },
+  "settings": {
+    "coalesce_ms": null,
+    "ttl_ms": 2000
   }
 }

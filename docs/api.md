@@ -11,6 +11,9 @@
 | `tinyray.join(...)` | 报到，返回 `Member` |
 | `tinyray.pool(name)` | 拿一个 `Pool` |
 | `tinyray.apool(name)` | 拿一个 `AsyncPool`（方法返回 awaitable） |
+| `tinyray.Call(method, args=(), kwargs=None)` | 描述一个批量 RPC 项 |
+| `tinyray.batch(handle, calls, timeout=30.0)` | 在一个成员上按顺序执行一批调用 |
+| `tinyray.abatch(handle, calls, timeout=30.0)` | 批量调用的异步形式 |
 | `tinyray.__version__` | 装上的版本号 |
 | `tinyray.MAX_STATE` | state 的硬上限，16 KB |
 | `tinyray.FIRST_BEAT_S` | `join(timeout=)` 的默认值，30 秒 |
@@ -32,6 +35,7 @@ tinyray.join(
     max_concurrency: int | None = None,
     timeout: float = FIRST_BEAT_S,
     registry_url: str | None = None,
+    coalesce_ms: int = 50,
 ) -> Member
 ```
 
@@ -61,6 +65,10 @@ tinyray.join(
   默认相反，因为重启的 rank 必须能在旧租约还没过期时拿回座位。
 - **`max_concurrency=`** —— 同时执行的调用数上限。超了返回 `NotDelivered`
   给调用方，不排队。默认无限制。
+- **`coalesce_ms=`** —— 持续变化时成员通信的合并等待预算，单位毫秒，默认仍为 50。
+  较小值降低突发变化的通知延迟，但会增加请求数；0 关闭这项间隔限制。只接受
+  非负整数，实际间隔不超过租约的四分之一，避免大值阻碍续租。
+  本地发布可提前唤醒正在休息的客户端。
 - **`url=`** —— 手工指定对外地址。默认由路由表探出来；多网卡机器上可以用
   `TINYRAY_ADVERTISE` 指定。
 - **`registry_url=`** —— 去哪个注册中心报到，压过 `TINYRAY_REGISTRY`。
@@ -103,6 +111,7 @@ tinyray.join(
 |---|---|
 | `beats_ok` / `beats_failed` | 心跳被应答的次数，和没有的次数 |
 | `interval_ms` / `silence_ms` | 当前心跳间隔；距上次成功多久 |
+| `coalesce_ms` / `effective_coalesce_ms` | 请求的合并等待预算；受当前租约四分之一限制后的预算 |
 | `watch_wakeups` | 本地缓存动过、并因此唤醒等待者的次数 |
 | `short_polls` | 心跳等在**定时器**而不是注册中心上的次数。只有第一次 ack 之前才该发生；一直涨说明这个客户端在轮询，没吃到长轮询的好处 |
 | `state_bytes` | 这个成员正在发布的 state 有多大 |
@@ -230,6 +239,10 @@ len(pool)                                      # ready 的人数
 `**filt` 按 state 的键值**相等**匹配。数字按值比（`shard=6/2` 找得到发布
 `shard=3` 的人），布尔严格（`free=1` 不匹配 `free=True`）。
 大整数不会先舍入成浮点数再判断相等。
+
+`slot()` 使用原生座位索引，`pick()` 在序列化之前选出一个匹配者，不再为了返回
+一个句柄构造整份 Python 名单。重复的批量查询复用有界的原生快照缓存，但返回
+句柄的 state 仍是各自独立解码的，不会因修改一个句柄而污染下一次查询。
 
 数字这条规则一路走到底：`cfg={"shard": 6/2}` 同样找得到发布
 `cfg={"shard": 3}` 的人，数组里也一样。形状仍然精确 —— 嵌套对象要键完全
@@ -565,6 +578,35 @@ with tinyray.request_id(f"commit-{batch}"):
 
 ---
 
+## 批量 RPC
+
+```python
+calls = [
+    tinyray.Call("assign", args=("task-1",)),
+    tinyray.Call("assign", kwargs={"task": "task-2"}),
+]
+results = tinyray.batch(handle, calls)
+results = await tinyray.abatch(handle, calls)
+```
+
+每批最多 128 项，全部发给同一个成员，顺序执行，第一项失败就停止。空批次是本地
+空操作。它把多项操作合在一次 HTTP 往返里，**不是事务，也不回滚**。
+
+`BatchError` 包含从 0 开始的 `failed_index`、之前成功项的 `completed_results`
+以及 `cause`（`RemoteError`、`TypeError`、`AttributeError` 或 `Fenced`）。
+此前的项已完成；失败方法抛错前可能已有副作用；之后的项不会执行。每项结果在
+执行下一项之前就被序列化，且每项之前重新检查 fencing。
+
+传输超时针对整个批次交换，不是每项各享一份。`OutcomeUnknown` 表示不知道执行了
+哪一段，也可能整批都执行了；异步取消只停止等待，不撤销远端执行。库不会自动重试，
+也不会把不支持 `/_batch` 的老服务悄悄降级成逐项调用，而是返回 `NotDelivered`。
+
+每项的 `CallContext.request_id` 从批次 ID 和下标稳定派生。短 ID 形如
+`<batch-id>:<index>`；长 ID 带确定性哈希，保持在 200 字符内。应用需要核对重试
+结果时，用 `request_id()` 固定批次 ID；去重仍由应用负责。
+
+一批占一个并发槽，`calls` 按一次请求计数；任一项失败则整次请求计入 `failed`。
+
 ## 异常
 
 ```text
@@ -574,6 +616,7 @@ TinyrayError
 │   └── OutcomeUnknown   可能跑了 —— 带 request id 重试，或保证幂等
 ├── Fenced               送到了，但那个座位换人了
 ├── RemoteError          送到了，对方的方法抛了（.type/.message/.traceback）
+├── BatchError           某项失败，携带下标、此前结果及原因
 ├── Stale                和注册中心失联，名单不可信
 └── SeatTaken            座位被人占着（exclusive）或被更晚的任期拿走
 

@@ -1,6 +1,7 @@
 //! The registry, usable both as a standalone binary and from the Python
 //! package, so `pip install tinyray` gives you the server too.
 
+mod delta;
 pub mod server;
 pub mod state;
 

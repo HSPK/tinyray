@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class TinyrayError(Exception):
     """Base for everything tinyray raises, so one except clause catches it."""
@@ -48,6 +50,24 @@ class RemoteError(TinyrayError):
         # The original class is not reconstructed: that needs both sides to
         # define it, which is a hidden coupling.
         self.type, self.message, self.traceback = type_name, message, traceback
+
+
+class BatchError(TinyrayError):
+    """An item failed; earlier results are available and later items did not run.
+
+    Not an Unreachable: repeating the batch can repeat completed side effects.
+    A transport failure instead raises NotDelivered or OutcomeUnknown for the
+    entire batch, without pretending to know which items completed.
+    """
+
+    def __init__(self, failed_index: int, completed_results: list[Any], cause: Exception):
+        self.failed_index = failed_index
+        self.completed_results = list(completed_results)
+        self.cause = cause
+        super().__init__(
+            f"batch item {failed_index} failed after {len(completed_results)} completed "
+            f"calls: {cause}"
+        )
 
 
 class Stale(TinyrayError):

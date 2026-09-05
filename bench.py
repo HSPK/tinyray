@@ -20,8 +20,12 @@ crashing, so one script can compare versions that do not share an API.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import json
+import math
 import os
+import platform
 import socket
 import statistics
 import subprocess
@@ -31,12 +35,24 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
+import msgspec
 import tinyray
 
 TTL_MS = 2000
+FORMAT_VERSION = 2
+COALESCE_MS: int | None = None
+_registries: list[Registry] = []
+
+
+class UnsupportedScenario(Exception):
+    """A feature known to be absent, not an execution failure."""
 
 
 # --------------------------------------------------------------------------
@@ -54,14 +70,17 @@ def registry_binary() -> str:
 
 
 class Registry:
-    def __init__(self) -> None:
+    def __init__(self, ttl_ms: int = TTL_MS) -> None:
         self.port = free_port()
         self.endpoint = f"127.0.0.1:{self.port}"
+        self.ttl_ms = ttl_ms
         self.proc: subprocess.Popen | None = None
+        self.members = ExitStack()
+        self.previous_endpoint: str | None = None
 
     def __enter__(self) -> Registry:
         self.proc = subprocess.Popen(
-            [registry_binary(), "--listen", self.endpoint, "--ttl-ms", str(TTL_MS)],
+            [registry_binary(), "--listen", self.endpoint, "--ttl-ms", str(self.ttl_ms)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -70,40 +89,71 @@ class Registry:
             try:
                 with urllib.request.urlopen(f"http://{self.endpoint}/health", timeout=0.5) as r:
                     if r.status == 200:
+                        self.previous_endpoint = os.environ.get("TINYRAY_REGISTRY")
                         os.environ["TINYRAY_REGISTRY"] = self.endpoint
+                        _registries.append(self)
                         return self
             except (urllib.error.URLError, OSError):
                 time.sleep(0.02)
+        self.stop()
         raise RuntimeError("registry did not come up")
 
-    def __exit__(self, *exc: object) -> None:
+    def stop(self) -> None:
         if self.proc is not None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait(timeout=5)
 
-
-def leave_quietly() -> None:
-    client = getattr(tinyray, "_client", None)
-    if client is not None:
+    def __exit__(self, *exc: object) -> None:
         try:
-            client.leave()
-        except Exception:
-            pass
-        tinyray._client = None
+            self.members.close()
+        finally:
+            try:
+                self.stop()
+            finally:
+                if _registries.pop() is not self:
+                    raise RuntimeError("benchmark registry contexts exited out of order")
+                if self.previous_endpoint is None:
+                    os.environ.pop("TINYRAY_REGISTRY", None)
+                else:
+                    os.environ["TINYRAY_REGISTRY"] = self.previous_endpoint
+
+
+def joined(*args: Any, **kwargs: Any) -> Any:
+    if not _registries:
+        raise RuntimeError("benchmark members need a Registry context")
+    parameters = inspect.signature(tinyray.join).parameters
+    if "size" not in parameters:
+        kwargs.pop("size", None)
+    if "serves" in kwargs and "serves" not in parameters:
+        raise UnsupportedScenario("this build cannot serve RPC methods")
+    if COALESCE_MS is not None:
+        if "coalesce_ms" not in parameters:
+            raise UnsupportedScenario("this build has no coalesce_ms option")
+        kwargs["coalesce_ms"] = COALESCE_MS
+    member = tinyray.join(*args, **kwargs)
+    _registries[-1].members.callback(member.leave)
+    return member
+
+
+def leave_members() -> None:
+    if _registries:
+        _registries[-1].members.close()
+
+
+def coalesce_source() -> str:
+    return "" if COALESCE_MS is None else f", coalesce_ms={COALESCE_MS}"
 
 
 def settle(member: Any) -> None:
     """Get published state to the registry, whatever this build calls it."""
     flush = getattr(member, "flush", None)
     if callable(flush):
-        try:
-            flush()
-            return
-        except Exception:
-            pass
+        flush()
+        return
     time.sleep(TTL_MS / 1000 / 2)
 
 
@@ -114,21 +164,25 @@ def percentiles(samples: list[float]) -> dict[str, float]:
         return s[min(len(s) - 1, int(len(s) * p))]
 
     return {
-        "p50_ms": round(statistics.median(s) * 1000, 3),
-        "p90_ms": round(at(0.90) * 1000, 3),
-        "p99_ms": round(at(0.99) * 1000, 3),
-        "max_ms": round(s[-1] * 1000, 3),
+        "p50_ms": round(statistics.median(s) * 1000, 6),
+        "p90_ms": round(at(0.90) * 1000, 6),
+        "p99_ms": round(at(0.99) * 1000, 6),
+        "max_ms": round(s[-1] * 1000, 6),
     }
 
 
 def watching(pool: Any, **kw: Any) -> Any:
     """`changes()` as a context manager, across builds that return a bare
-    generator instead. Old ones cannot be closed or given fields; say so by
-    raising TypeError, which every caller here already handles."""
+    generator instead. Known missing features are reported as unsupported,
+    rather than treating execution failures as version differences."""
+    if not hasattr(pool, "changes"):
+        raise UnsupportedScenario("this build has no changes()")
+    if "fields" in kw and "fields" not in inspect.signature(pool.changes).parameters:
+        raise UnsupportedScenario("this build cannot watch selected fields")
     watch = pool.changes(**kw)
     if hasattr(watch, "__enter__"):
         return watch
-    raise TypeError("this build's changes() is a plain generator")
+    raise UnsupportedScenario("this build's changes() is a plain generator")
 
 
 def publish(member: Any, **state: Any) -> None:
@@ -155,10 +209,7 @@ class Service:
 
 def serving_member(pool: str = "b"):
     """join() with a served object, across builds that spell it differently."""
-    try:
-        return tinyray.join(pool, "stateful", slot=0, size=1, serves=Service())
-    except TypeError:
-        return tinyray.join(pool, "stateful", slot=0, serves=Service())
+    return joined(pool, "stateful", slot=0, size=1, serves=Service())
 
 
 def bench_rpc_latency() -> dict[str, Any]:
@@ -176,13 +227,13 @@ def bench_rpc_latency() -> dict[str, Any]:
                 t0 = time.perf_counter()
                 handle.ping()
                 samples.append(time.perf_counter() - t0)
-            return percentiles(samples) | {"calls": len(samples)}
+            return percentiles(samples) | {"calls": len(samples), "topology": "same_process"}
         finally:
-            leave_quietly()
+            leave_members()
 
 
 def bench_rpc_throughput() -> dict[str, Any]:
-    """Eight threads on one client. Measures the shared path, not the network."""
+    """Eight threads with caller and callee sharing the same interpreter."""
     with Registry():
         me = serving_member()
         try:
@@ -190,28 +241,35 @@ def bench_rpc_throughput() -> dict[str, Any]:
             settle(me)
             handle = tinyray.pool("b").wait(count=1, timeout=20)[0]
             handle.ping()
-            stop = threading.Event()
-            counts = [0] * 8
-
-            def worker(i: int) -> None:
-                n = 0
-                while not stop.is_set():
-                    handle.ping()
-                    n += 1
-                counts[i] = n
-
-            threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-            t0 = time.perf_counter()
-            for t in threads:
-                t.start()
-            time.sleep(5.0)
-            stop.set()
-            for t in threads:
-                t.join()
-            elapsed = time.perf_counter() - t0
-            return {"threads": 8, "calls_per_s": round(sum(counts) / elapsed)}
+            return {
+                "threads": 8,
+                "calls_per_s": rpc_rate(handle),
+                "topology": "same_process",
+            }
         finally:
-            leave_quietly()
+            leave_members()
+
+
+def rpc_rate(handle: Any, threads: int = 8, duration: float = 5.0) -> int:
+    stop = threading.Event()
+
+    def worker() -> int:
+        count = 0
+        while not stop.is_set():
+            if handle.ping() != "pong":
+                raise RuntimeError("RPC benchmark returned an unexpected result")
+            count += 1
+        return count
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=threads) as workers:
+        futures = [workers.submit(worker) for _ in range(threads)]
+        try:
+            time.sleep(duration)
+        finally:
+            stop.set()
+        count = sum(future.result(timeout=35) for future in futures)
+    return round(count / (time.perf_counter() - t0))
 
 
 def bench_rpc_payload() -> dict[str, Any]:
@@ -230,12 +288,12 @@ def bench_rpc_payload() -> dict[str, Any]:
                 t0 = time.perf_counter()
                 handle.echo(blob)
                 samples.append(time.perf_counter() - t0)
-            return percentiles(samples) | {"bytes": len(blob)}
+            return percentiles(samples) | {"bytes": len(blob), "topology": "same_process"}
         finally:
-            leave_quietly()
+            leave_members()
 
 
-def bench_discovery() -> dict[str, Any]:
+def bench_discovery(pause: float = 0.0) -> dict[str, Any]:
     """Publish here, notice there. This is what long polling bought."""
     with Registry() as reg:
         peer = None
@@ -243,7 +301,7 @@ def bench_discovery() -> dict[str, Any]:
             peer_src = (
                 "import os, sys, tinyray\n"
                 f"os.environ['TINYRAY_REGISTRY'] = '{reg.endpoint}'\n"
-                "m = tinyray.join('news', 'churn')\n"
+                f"m = tinyray.join('news', 'churn'{coalesce_source()})\n"
                 "m.ready(n=0)\n"
                 "print('UP', flush=True)\n"
                 "n = 0\n"
@@ -258,16 +316,19 @@ def bench_discovery() -> dict[str, Any]:
                 stdout=subprocess.PIPE,
                 text=True,
             )
-            assert peer.stdout is not None and peer.stdin is not None
-            assert peer.stdout.readline().strip() == "UP"
+            if peer.stdout is None or peer.stdin is None:
+                raise RuntimeError("benchmark peer pipes are missing")
+            if peer.stdout.readline().strip() != "UP":
+                raise RuntimeError("benchmark peer did not start")
 
-            me = tinyray.join("watch", "churn")
+            me = joined("watch", "churn")
             me.ready()
             pool = tinyray.pool("news")
             pool.wait(count=1, timeout=20)
 
             samples = []
             for i in range(1, 11):
+                time.sleep(pause)
                 t0 = time.perf_counter()
                 peer.stdin.write("go\n")
                 peer.stdin.flush()
@@ -281,22 +342,27 @@ def bench_discovery() -> dict[str, Any]:
                 else:
                     raise RuntimeError("the change never arrived")
                 samples.append(time.perf_counter() - t0)
-            return percentiles(samples) | {"changes": len(samples)}
+            return percentiles(samples) | {
+                "changes": len(samples),
+                "publish_gap_ms": pause * 1000,
+                "topology": "separate_processes",
+            }
         finally:
             if peer is not None:
                 try:
                     peer.stdin.close()
                     peer.wait(timeout=5)
-                except Exception:
+                except subprocess.TimeoutExpired:
                     peer.kill()
-            leave_quietly()
+                    peer.wait(timeout=5)
+            leave_members()
 
 
 def bench_idle_beat_rate() -> dict[str, Any]:
     """Requests a quiet member costs the registry per second."""
     with Registry():
         try:
-            me = tinyray.join("quiet", "churn")
+            me = joined("quiet", "churn")
             me.ready()
             tinyray.pool("quiet")
             time.sleep(1.0)
@@ -313,7 +379,7 @@ def bench_idle_beat_rate() -> dict[str, Any]:
                 "interval_ms": before.get("interval_ms"),
             }
         finally:
-            leave_quietly()
+            leave_members()
 
 
 def bench_join() -> dict[str, Any]:
@@ -332,7 +398,7 @@ def bench_join() -> dict[str, Any]:
             "import os, time, tinyray\n"
             f"os.environ['TINYRAY_REGISTRY'] = '{reg.endpoint}'\n"
             "t0 = time.perf_counter()\n"
-            "m = tinyray.join('cold', 'churn')\n"
+            f"m = tinyray.join('cold', 'churn'{coalesce_source()})\n"
             "m.ready()\n"
             "tinyray.pool('cold').all()\n"
             "print(f'{(time.perf_counter() - t0) * 1000:.2f}')\n"
@@ -409,6 +475,7 @@ class Crowd:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait(timeout=5)
 
 
 def timed(fn: Callable[[], Any], rounds: int = 200) -> float:
@@ -419,7 +486,16 @@ def timed(fn: Callable[[], Any], rounds: int = 200) -> float:
         t0 = time.perf_counter()
         fn()
         samples.append(time.perf_counter() - t0)
-    return round(statistics.median(samples) * 1000, 3)
+    return round(statistics.median(samples) * 1000, 6)
+
+
+def digest_reader(digest: Any) -> Callable[[], Any]:
+    legacy = "require_ready" in inspect.signature(digest).parameters
+
+    def read() -> Any:
+        return digest("load", ["shard"], False) if legacy else digest("load", ["shard"])
+
+    return read
 
 
 def bench_lookup_scaling() -> dict[str, Any]:
@@ -431,41 +507,36 @@ def bench_lookup_scaling() -> dict[str, Any]:
     before the sizes worth knowing about -- 200 of them took 35s to start.
     """
     if loadgen_binary() is None:
-        return {"error": "no loadgen built; run cargo build --release --bin loadgen"}
+        raise RuntimeError("no loadgen built; run cargo build --release --bin loadgen")
     out: dict[str, Any] = {}
     for size in (10, 100, 1000):
         with Registry() as reg, Crowd(reg.endpoint, size):
             try:
-                me = tinyray.join("watch", "churn")
+                me = joined("watch", "churn")
                 me.ready()
                 pool = tinyray.pool("load")
                 pool.wait(count=size, timeout=90)
                 row: dict[str, Any] = {
                     "all_ms": timed(lambda p=pool: p.all()),
-                    "pick_filtered_ms": timed(lambda p=pool: p.all(shard=3)),
+                    "all_filtered_ms": timed(lambda p=pool: p.all(shard=3)),
+                    "pick_ms": timed(lambda p=pool: p.pick()),
+                    "pick_filtered_ms": timed(lambda p=pool: p.pick(shard=3)),
                     "snapshot_ms": timed(lambda p=pool: p.snapshot()),
                 }
                 digest = getattr(tinyray._client, "field_digest", None)
                 if callable(digest):
-
-                    def one_digest(d: Any = digest) -> Any:
-                        try:
-                            return d("load", ["shard"])
-                        except TypeError:
-                            return d("load", ["shard"], False)
-
-                    row["field_digest_ms"] = timed(one_digest)
+                    row["field_digest_ms"] = timed(digest_reader(digest))
                 else:
                     row["field_digest_ms"] = None
-                try:
+                if hasattr(pool, "epoch"):
                     row["epoch_ms"] = timed(
                         lambda p=pool, n=size: p.epoch(min=n, timeout=30), rounds=50
                     )
-                except Exception as e:
-                    row["epoch_ms"] = f"n/a ({type(e).__name__})"
+                else:
+                    row["epoch_ms"] = None
                 out[str(size)] = row
             finally:
-                leave_quietly()
+                leave_members()
     return out
 
 
@@ -483,7 +554,7 @@ def bench_watch_wakeup() -> dict[str, Any]:
             peer_src = (
                 "import os, sys, tinyray\n"
                 f"os.environ['TINYRAY_REGISTRY'] = '{reg.endpoint}'\n"
-                "m = tinyray.join('news', 'churn')\n"
+                f"m = tinyray.join('news', 'churn'{coalesce_source()})\n"
                 "m.ready(role='a', n=0)\n"
                 "print('UP', flush=True)\n"
                 "n = 0\n"
@@ -500,10 +571,12 @@ def bench_watch_wakeup() -> dict[str, Any]:
                 stdout=subprocess.PIPE,
                 text=True,
             )
-            assert peer.stdout is not None and peer.stdin is not None
-            assert peer.stdout.readline().strip() == "UP"
+            if peer.stdout is None or peer.stdin is None:
+                raise RuntimeError("benchmark peer pipes are missing")
+            if peer.stdout.readline().strip() != "UP":
+                raise RuntimeError("benchmark peer did not start")
 
-            me = tinyray.join("watch", "churn")
+            me = joined("watch", "churn")
             me.ready()
             pool = tinyray.pool("news")
             pool.wait(count=1, timeout=20)
@@ -522,7 +595,7 @@ def bench_watch_wakeup() -> dict[str, Any]:
 
             try:
                 watch = watching(pool, timeout=3.0, fields=["role"])
-            except TypeError:
+            except UnsupportedScenario:
                 out["fields_supported"] = False
                 return out
             out["fields_supported"] = True
@@ -546,12 +619,14 @@ def bench_watch_wakeup() -> dict[str, Any]:
         finally:
             if peer is not None:
                 try:
-                    assert peer.stdin is not None
+                    if peer.stdin is None:
+                        raise RuntimeError("benchmark peer input pipe is missing")
                     peer.stdin.close()
                     peer.wait(timeout=5)
-                except Exception:
+                except subprocess.TimeoutExpired:
                     peer.kill()
-            leave_quietly()
+                    peer.wait(timeout=5)
+            leave_members()
 
 
 def bench_async_call() -> dict[str, Any]:
@@ -563,7 +638,7 @@ def bench_async_call() -> dict[str, Any]:
     import asyncio
 
     if not hasattr(tinyray, "apool"):
-        return {"error": "no apool in this build"}
+        raise UnsupportedScenario("no apool in this build")
     with Registry():
         me = serving_member()
         try:
@@ -582,9 +657,13 @@ def bench_async_call() -> dict[str, Any]:
                     out.append(time.perf_counter() - t0)
                 return out
 
-            return percentiles(asyncio.run(body())) | {"calls": 1000}
+            return percentiles(asyncio.run(body())) | {
+                "calls": 1000,
+                "topology": "same_process",
+                "concurrency": 1,
+            }
         finally:
-            leave_quietly()
+            leave_members()
 
 
 def bench_rpc_error() -> dict[str, Any]:
@@ -600,10 +679,7 @@ def bench_rpc_error() -> dict[str, Any]:
 
     with Registry():
         try:
-            try:
-                me = tinyray.join("e", "stateful", slot=0, size=1, serves=Raiser())
-            except TypeError:
-                me = tinyray.join("e", "stateful", slot=0, serves=Raiser())
+            me = joined("e", "stateful", slot=0, size=1, serves=Raiser())
             me.ready()
             settle(me)
             handle = tinyray.pool("e").wait(count=1, timeout=20)[0]
@@ -614,7 +690,7 @@ def bench_rpc_error() -> dict[str, Any]:
             def call_boom() -> Any:
                 try:
                     handle.boom()
-                except Exception:
+                except tinyray.RemoteError:
                     pass
 
             return {
@@ -622,7 +698,7 @@ def bench_rpc_error() -> dict[str, Any]:
                 "raising_p50_ms": timed(call_boom, rounds=500),
             }
         finally:
-            leave_quietly()
+            leave_members()
 
 
 def bench_publish() -> dict[str, Any]:
@@ -630,7 +706,7 @@ def bench_publish() -> dict[str, Any]:
     what flush() pays to know the registry has it."""
     with Registry():
         try:
-            me = tinyray.join("p", "churn")
+            me = joined("p", "churn")
             me.ready(step=0)
             settle(me)
             n = [0]
@@ -659,7 +735,146 @@ def bench_publish() -> dict[str, Any]:
                 out["flush_p50_ms"] = None
             return out
         finally:
-            leave_quietly()
+            leave_members()
+
+
+class RemoteService:
+    """A callee with its own GIL, rather than another thread in the caller."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+
+    def __enter__(self) -> Any:
+        source = (
+            "import inspect, sys, tinyray\n"
+            + inspect.getsource(Service)
+            + "\nkwargs = {'slot': 0, 'serves': Service()}\n"
+            + "if 'size' in inspect.signature(tinyray.join).parameters: kwargs['size'] = 1\n"
+            + f"with tinyray.join('remote', 'stateful'{coalesce_source()}, **kwargs) as me:\n"
+            + " me.ready()\n print('READY', flush=True)\n sys.stdin.readline()\n"
+        )
+        with ExitStack() as cleanup:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-c", source],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            cleanup.callback(self.stop)
+            if self.proc.stdout is None:
+                raise RuntimeError("RPC benchmark peer output pipe is missing")
+            if self.proc.stdout.readline().strip() != "READY":
+                raise RuntimeError("RPC benchmark callee did not start")
+            me = joined("caller")
+            me.ready()
+            settle(me)
+            handle = tinyray.pool("remote").wait(count=1, timeout=20)[0]
+            cleanup.pop_all()
+            return handle
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            try:
+                self.proc.communicate("\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.communicate(timeout=5)
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+
+def bench_rpc_separate() -> dict[str, Any]:
+    with Registry(), RemoteService() as handle:
+        for _ in range(200):
+            handle.ping()
+        samples = []
+        for _ in range(2000):
+            start = time.perf_counter()
+            if handle.ping() != "pong":
+                raise RuntimeError("RPC benchmark returned an unexpected result")
+            samples.append(time.perf_counter() - start)
+        return percentiles(samples) | {
+            "calls": len(samples),
+            "topology": "separate_processes",
+        }
+
+
+def bench_rpc_concurrency() -> dict[str, Any]:
+    with Registry(), RemoteService() as handle:
+        handle.ping()
+        return {
+            "topology": "separate_processes",
+            "calls_per_s": {str(n): rpc_rate(handle, n, duration=3) for n in (1, 4, 8)},
+        }
+
+
+def bench_rpc_batch() -> dict[str, Any]:
+    if not hasattr(tinyray, "batch"):
+        raise UnsupportedScenario("this build has no batch RPC")
+    count = 32
+    calls = [tinyray.Call("ping") for _ in range(count)]
+    expected = ["pong"] * count
+    with Registry(), RemoteService() as handle:
+
+        def individual() -> None:
+            if [handle.ping() for _ in range(count)] != expected:
+                raise RuntimeError("individual RPC benchmark returned unexpected results")
+
+        def batched() -> None:
+            if tinyray.batch(handle, calls) != expected:
+                raise RuntimeError("batch RPC benchmark returned unexpected results")
+
+        one = timed(individual, rounds=40)
+        batch = timed(batched, rounds=40)
+        return {
+            "topology": "separate_processes",
+            "logical_calls": count,
+            "individual_total_ms": one,
+            "batch_total_ms": batch,
+            "batch_per_call_ms": batch / count,
+            "speedup": one / batch,
+        }
+
+
+def bench_point_lookup() -> dict[str, Any]:
+    """Stable seated rosters: selecting one member must not cost a full list."""
+    out = {}
+    for size in (100, 1000, 5000):
+        with Registry(ttl_ms=120_000) as reg:
+            # Synthetic members do not renew: keep their lease outside the
+            # measurement window without concurrent load-generator traffic.
+            with httpx.Client(base_url=f"http://{reg.endpoint}", trust_env=False) as client:
+                for index in range(size):
+                    response = client.post(
+                        "/v1/beat",
+                        json={
+                            "pool": "points",
+                            "id": index,
+                            "slot": index,
+                            "size": size,
+                            "incarnation": 1,
+                            "policy": "stateful",
+                            "ready": True,
+                            "state": {"idx": index, "shard": index % 8},
+                        },
+                    )
+                    response.raise_for_status()
+                    if not response.json()["accepted"]:
+                        raise RuntimeError("registry refused the benchmark roster")
+            me = joined("point_observer")
+            me.ready()
+            settle(me)
+            pool = tinyray.pool("points")
+            pool.wait(count=size, timeout=20)
+            out[str(size)] = {
+                "slot_ms": timed(lambda p=pool, k=size // 2: p.slot(k)),
+                "pick_ms": timed(pool.pick),
+                "pick_filtered_ms": timed(lambda p=pool: p.pick(shard=3)),
+                "all_ms": timed(pool.all, rounds=50),
+                "snapshot_ms": timed(pool.snapshot, rounds=50),
+            }
+    return out
 
 
 SCENARIOS: dict[str, Callable[[], dict[str, Any]]] = {
@@ -674,6 +889,11 @@ SCENARIOS: dict[str, Callable[[], dict[str, Any]]] = {
     "discovery": bench_discovery,
     "idle_beat_rate": bench_idle_beat_rate,
     "join_cold_start": bench_join,
+    "rpc_latency_separate": bench_rpc_separate,
+    "rpc_concurrency": bench_rpc_concurrency,
+    "rpc_batch": bench_rpc_batch,
+    "point_lookup": bench_point_lookup,
+    "discovery_spaced": lambda: bench_discovery(pause=0.15),
 }
 
 # What --check compares. Deliberately a short list: a baseline that cries wolf
@@ -704,14 +924,22 @@ WATCHED: dict[str, float] = {
     "rpc_payload_64k.p50_ms": 0.1,
     "rpc_error.raising_p50_ms": 0.05,
     "async_call.p50_ms": 0.1,
-    "publish.flush_p50_ms": 50.0,
-    "lookup_scaling.100.all_ms": 0.02,
-    "lookup_scaling.100.snapshot_ms": 0.02,
+    "publish.flush_p50_ms": 0.1,
+    "lookup_scaling.100.all_ms": 0.002,
+    "lookup_scaling.100.snapshot_ms": 0.002,
     "lookup_scaling.1000.all_ms": 0.1,
     "lookup_scaling.1000.snapshot_ms": 0.1,
     "lookup_scaling.1000.epoch_ms": 0.1,
-    "lookup_scaling.1000.field_digest_ms": 0.02,
-    "lookup_scaling.1000.pick_filtered_ms": 0.02,
+    "lookup_scaling.1000.field_digest_ms": 0.00005,
+    "lookup_scaling.1000.pick_filtered_ms": 0.002,
+    "lookup_scaling.1000.all_filtered_ms": 0.02,
+    "lookup_scaling.1000.pick_ms": 0.0002,
+    "point_lookup.5000.slot_ms": 0.0001,
+    "point_lookup.5000.pick_ms": 0.0001,
+    "point_lookup.5000.all_ms": 0.1,
+    "rpc_latency_separate.p50_ms": 0.05,
+    "rpc_batch.batch_total_ms": 0.1,
+    "discovery_spaced.p50_ms": 0.1,
     "discovery.p50_ms": 5.0,
     "watch_wakeup.wakeup.p50_ms": 5.0,
     # rpc_throughput is measured and printed but not watched. Five runs of one
@@ -738,78 +966,191 @@ def flatten(scenarios: dict[str, Any], prefix: str = "") -> dict[str, float]:
 
 
 def compare(baseline: dict[str, Any], now: dict[str, Any]) -> tuple[list[str], list[str], int]:
-    """Regressions, improvements, and how many watched metrics were checked."""
+    """Check every required metric in the selected scenarios, including omissions."""
     was = flatten(baseline["scenarios"])
     is_ = flatten(now["scenarios"])
     worse: list[str] = []
     better: list[str] = []
     checked = 0
     for key, floor in WATCHED.items():
-        if key not in was or key not in is_:
+        if key.split(".", 1)[0] not in now["scenarios"]:
             continue
         checked += 1
+        if key not in was:
+            worse.append(f"{key}: missing from baseline; record a complete baseline")
+            continue
+        if key not in is_:
+            worse.append(f"{key}: missing from current results")
+            continue
         a, b = was[key], is_[key]
+        if not math.isfinite(a) or not math.isfinite(b) or a < 0 or b < 0:
+            worse.append(f"{key}: non-finite or negative metric")
+            continue
         if key in BIGGER_IS_BETTER:
             a, b = -a, -b
-        change = (b - a) / abs(a) if a else 0.0
+        change = (b - a) / abs(a) if a else (0.0 if b == a else math.copysign(math.inf, b - a))
         if abs(b - a) < floor:
             continue
         if change > TOLERANCE:
             worse.append(f"{key}: {was[key]} -> {is_[key]}  ({change * 100:+.0f}%)")
         elif change < -TOLERANCE:
             better.append(f"{key}: {was[key]} -> {is_[key]}  ({change * 100:+.0f}%)")
+    if checked == 0:
+        worse.append("no watched metrics selected; this comparison cannot establish performance")
     return worse, better, checked
 
 
-def main() -> int:
+def provenance() -> dict[str, Any]:
+    root = Path(__file__).resolve().parent
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    package = Path(tinyray.__file__).resolve().parent
+    core = getattr(tinyray, "_tinyray", None)
+    fingerprint = hashlib.sha256()
+    paths = sorted(package.glob("*.py"))
+    if core is not None and getattr(core, "__file__", None):
+        paths.append(Path(core.__file__))
+    for path in paths:
+        fingerprint.update(path.name.encode())
+        fingerprint.update(path.read_bytes())
+    cpu = platform.processor() or platform.machine()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        cpu = next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in cpuinfo.read_text().splitlines()
+                if line.startswith("model name")
+            ),
+            cpu,
+        )
+    return {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "benchmark_revision": revision.stdout.strip() if revision.returncode == 0 else None,
+        "worktree_dirty": bool(dirty.stdout) if dirty.returncode == 0 else None,
+        "package_version": getattr(tinyray, "__version__", "unknown"),
+        "native_version": getattr(core, "version", None),
+        "library_fingerprint": fingerprint.hexdigest(),
+        "package_path": (
+            package.relative_to(root).as_posix()
+            if package.is_relative_to(root)
+            else "<external>/tinyray"
+        ),
+        "environment": {
+            "platform": platform.platform(),
+            "cpu": cpu,
+            "logical_cpus": os.cpu_count(),
+            "load_average": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
+            "httpx": httpx.__version__,
+            "msgspec": msgspec.__version__,
+            "python_optimization": sys.flags.optimize,
+        },
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Measure tinyray.")
     ap.add_argument("--json", help="write results here as well")
-    ap.add_argument("--only", nargs="*", help="run just these scenarios")
+    ap.add_argument("--only", nargs="+", choices=list(SCENARIOS), help="run just these scenarios")
     ap.add_argument("--label", default="", help="what build this is, for the report")
+    ap.add_argument("--coalesce-ms", type=int, help="explicit client coalescing policy")
     ap.add_argument(
         "--check",
         nargs="?",
         const="bench-baseline.json",
         help="compare against a baseline and fail on a regression",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    global COALESCE_MS
+    COALESCE_MS = args.coalesce_ms
+    if COALESCE_MS is not None:
+        if COALESCE_MS < 0:
+            ap.error("--coalesce-ms must be nonnegative")
+        if "coalesce_ms" not in inspect.signature(tinyray.join).parameters:
+            ap.error("this build does not support --coalesce-ms")
+    baseline = None
+    if args.check:
+        path = Path(args.check)
+        if not path.is_file():
+            ap.error(f"no baseline at {path}; write one with --json {path}")
+        try:
+            baseline = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            ap.error(f"invalid baseline JSON: {exc}")
+        if not isinstance(baseline, dict) or baseline.get("format_version") != FORMAT_VERSION:
+            ap.error("baseline format is obsolete; record a new baseline with --json")
+        if not isinstance(baseline.get("scenarios"), dict):
+            ap.error("baseline scenarios must be an object")
+        if not isinstance(baseline.get("settings"), dict):
+            ap.error("baseline settings must be an object")
+        if baseline["settings"] != {"ttl_ms": TTL_MS, "coalesce_ms": COALESCE_MS}:
+            ap.error("baseline uses different workload settings")
 
     wanted = args.only or list(SCENARIOS)
     results: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
         "label": args.label or getattr(tinyray, "__version__", "unknown"),
         "python": sys.version.split()[0],
+        "settings": {"ttl_ms": TTL_MS, "coalesce_ms": COALESCE_MS},
+        "provenance": provenance(),
         "scenarios": {},
     }
+    failed = False
+    unsupported = False
     for name in wanted:
-        fn = SCENARIOS.get(name)
-        if fn is None:
-            print(f"{name}: no such scenario", file=sys.stderr)
-            continue
+        fn = SCENARIOS[name]
         t0 = time.monotonic()
         try:
             got: Any = fn()
-        except Exception as e:  # a build that cannot do this at all
-            got = {"error": f"{type(e).__name__}: {e}"[:200]}
+            if not isinstance(got, dict):
+                raise TypeError("a scenario must return a result object")
+            if any(not math.isfinite(value) or value < 0 for value in flatten(got).values()):
+                raise ValueError("scenario returned a non-finite or negative measurement")
+            if got.get("error"):
+                failed = True
+                got["status"] = "error"
+        except UnsupportedScenario as e:
+            unsupported = True
+            got = {"status": "unsupported", "reason": str(e)}
+        except Exception as e:
+            # Keep the remaining observations, but never turn an execution
+            # failure into a successful benchmark or a skipped metric.
+            failed = True
+            got = {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}
         got["took_s"] = round(time.monotonic() - t0, 1)
         results["scenarios"][name] = got
         print(f"{name:20s} {json.dumps(got, sort_keys=True)}", flush=True)
 
     if args.json:
-        Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True))
+        Path(args.json).write_text(json.dumps(results, indent=2, sort_keys=True, allow_nan=False))
 
     if not args.check:
-        return 0
-    path = Path(args.check)
-    if not path.exists():
-        print(f"\nno baseline at {path}; write one with --json {path}", file=sys.stderr)
-        return 1
-    worse, better, checked = compare(json.loads(path.read_text()), results)
+        return int(failed)
+    if baseline is None:
+        raise RuntimeError("benchmark comparison has no baseline")
+    worse, better, checked = compare(baseline, results)
     for line in better:
         print(f"  faster  {line}")
     for line in worse:
         print(f"  SLOWER  {line}")
-    print(f"\n{checked - len(worse)} of {checked} within {int(TOLERANCE * 100)}% of the baseline")
-    return 1 if worse else 0
+    if checked:
+        print(
+            f"\n{checked - len(worse)} of {checked} within tolerance "
+            f"({int(TOLERANCE * 100)}% plus absolute noise floors)"
+        )
+    return int(bool(worse) or failed or unsupported)
 
 
 if __name__ == "__main__":
