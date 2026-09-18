@@ -504,11 +504,49 @@ h.assign.timeout(5.0)("task")  # this call's timeout; 30 seconds by default
 h.pull_job.returns(AgentJob)()  # restore the JSON result as an AgentJob
 ```
 
-JSON does not retain Python types: a `NamedTuple` crosses the wire as an array,
-and a dataclass-shaped value as an object. `.returns(T)` declares the type to
-restore on the calling side. It recursively handles `NamedTuple`, dataclass,
-`TypedDict`, Enum, `T | None`, and containers such as `list[T]`,
-`dict[K, V]`, tuple, and set:
+Standard dataclasses can be passed and returned directly. Pydantic 2 support is
+optional:
+
+```bash
+pip install "tinyray[pydantic]"
+```
+
+```python
+from dataclasses import dataclass
+from pydantic import BaseModel
+
+class Request(BaseModel):
+    prompt: str
+    max_tokens: int
+
+@dataclass(frozen=True)
+class Reply:
+    text: str
+    tokens: int
+
+class Worker:
+    def infer(self, request: Request) -> Reply:
+        return Reply("done", request.max_tokens)
+
+reply = h.infer.returns(Reply)(Request(prompt="hello", max_tokens=32))
+```
+
+The caller turns a model into JSON and the callee restores it from the method
+parameter annotation. A method may return a dataclass or Pydantic model
+directly. Without `.returns(T)` the caller receives ordinary dictionaries and
+lists; with it, the result is restored as the locally declared type.
+Dataclasses and Pydantic models may nest inside each other and inside
+`list[T]`, `dict[K, V]`, Optional/Union, tuples, and sets.
+
+Pydantic encoding uses `model_dump(mode="json", by_alias=True)`; decoding uses
+`model_validate()` or a cached `TypeAdapter`, so aliases, validators, and JSON
+serializers apply. TinyRay does not import Pydantic at startup and only enables
+the adapter after the application itself imports it.
+
+JSON still does not retain Python types: a `NamedTuple` crosses the wire as an
+array, and dataclass/Pydantic values as objects. `.returns(T)` declares the
+type to restore on the calling side. It also recursively handles `NamedTuple`,
+`TypedDict`, Enum, datetime, UUID, and the containers above:
 
 ```python
 class AgentJob(NamedTuple):
@@ -522,9 +560,9 @@ jobs = await ah.pull_jobs.returns(list[AgentJob])()
 A conversion failure raises a local `TypeError` naming the remote member,
 method, and failing JSON path. The remote method has already completed
 successfully at that point; only result restoration failed. The protocol
-remains plain JSON and never sends Python class names. The value returned by
-the server must itself be JSON-compatible -- `.returns()` restores types, it
-does not teach the server to serialize arbitrary objects.
+remains plain JSON and never sends Python class names. Standard dataclasses
+and Pydantic models are the explicit model boundary; other arbitrary Python
+objects are still rejected as they are by `json.dumps`.
 
 `.returns()` and `.timeout()` are per-call modifiers and compose in either
 order:
@@ -586,7 +624,7 @@ You can look without joining:
 
 ```console
 $ curl -s http://registry:7000/health
-{"status":"ok","version":"0.16.0","protocol":2}
+{"status":"ok","version":"0.17.0","protocol":2}
 ```
 
 | protocol | Meaning |

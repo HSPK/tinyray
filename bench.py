@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import inspect
 import json
 import math
@@ -37,6 +38,7 @@ import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -837,6 +839,117 @@ def bench_rpc_batch() -> dict[str, Any]:
         }
 
 
+def bench_rpc_models() -> dict[str, Any]:
+    """Typed models, including both codec cost and a full RPC round trip."""
+    try:
+        from pydantic import BaseModel, ConfigDict, Field
+        from tinyray import _json
+    except ImportError as exc:
+        raise UnsupportedScenario("Pydantic is not installed") from exc
+    if not hasattr(_json, "convert"):
+        raise UnsupportedScenario("this build cannot encode typed RPC models")
+
+    @dataclass(frozen=True)
+    class Data:
+        task_id: str
+        step: int
+        scores: tuple[float, float]
+        created_at: datetime
+
+    class Model(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        task_id: str = Field(alias="taskId")
+        step: int
+        scores: tuple[float, float]
+        created_at: datetime
+
+    class Models:
+        def raw(self, value):
+            return value
+
+        def data(self, value):
+            return value
+
+        def model(self, value):
+            return value
+
+        def data_manual(self, value):
+            restored = msgspec.convert(value, Data, strict=False)
+            return msgspec.to_builtins(restored)
+
+        def model_manual(self, value):
+            restored = Model.model_validate(value)
+            return restored.model_dump(mode="json", by_alias=True)
+
+    Models.data.__annotations__ = {"value": Data, "return": Data}
+    Models.model.__annotations__ = {"value": Model, "return": Model}
+
+    created_at = datetime(2026, 9, 17, 16, 0, tzinfo=timezone.utc)
+    data = Data("task-7", 3, (0.25, 0.75), created_at)
+    model = Model(task_id="task-7", step=3, scores=(0.25, 0.75), created_at=created_at)
+    raw_data = {
+        "task_id": "task-7",
+        "step": 3,
+        "scores": [0.25, 0.75],
+        "created_at": "2026-09-17T16:00:00Z",
+    }
+    raw_model = raw_data | {"taskId": raw_data["task_id"]}
+    del raw_model["task_id"]
+
+    def codec_us(fn: Callable[[], Any]) -> float:
+        return round(timed(fn, rounds=2000) * 1000, 3)
+
+    codec = {
+        "encode_plain_us": codec_us(lambda: _json.dumps({"args": [raw_data], "kwargs": {}})),
+        "encode_dataclass_us": codec_us(lambda: _json.dumps({"args": [data], "kwargs": {}})),
+        "encode_pydantic_us": codec_us(lambda: _json.dumps({"args": [model], "kwargs": {}})),
+        "restore_dataclass_us": codec_us(lambda: _json.convert(raw_data, Data)),
+        "restore_pydantic_us": codec_us(lambda: _json.convert(raw_model, Model)),
+    }
+
+    with Registry():
+        me = joined("model-bench", "stateful", slot=0, size=1, serves=Models())
+        me.ready()
+        settle(me)
+        handle = tinyray.pool("model-bench").wait(count=1, timeout=20)[0]
+
+        def manual_data(value: Data) -> Data:
+            raw = handle.data_manual(msgspec.to_builtins(value))
+            return msgspec.convert(raw, Data, strict=False)
+
+        def manual_model(value: Model) -> Model:
+            raw = handle.model_manual(value.model_dump(mode="json", by_alias=True))
+            return Model.model_validate(raw)
+
+        calls = [
+            ("plain", handle.raw, raw_data, raw_data),
+            ("dataclass", handle.data.returns(Data), data, data),
+            ("dataclass_manual", manual_data, data, data),
+            ("pydantic", handle.model.returns(Model), model, model),
+            ("pydantic_manual", manual_model, model, model),
+        ]
+        samples: dict[str, list[float]] = {name: [] for name, *_ in calls}
+        for _ in range(100):
+            for _, call, value, expected in calls:
+                if call(value) != expected:
+                    raise RuntimeError("typed RPC benchmark returned an unexpected result")
+        for round_index in range(1000):
+            for offset in range(len(calls)):
+                name, call, value, expected = calls[(round_index + offset) % len(calls)]
+                start = time.perf_counter()
+                result = call(value)
+                samples[name].append(time.perf_counter() - start)
+                if result != expected:
+                    raise RuntimeError("typed RPC benchmark returned an unexpected result")
+        return {
+            "codec": codec,
+            "round_trip": {name: percentiles(values) for name, values in samples.items()},
+            "calls_per_kind": 1000,
+            "topology": "same_process",
+        }
+
+
 def bench_point_lookup() -> dict[str, Any]:
     """Stable seated rosters: selecting one member must not cost a full list."""
     out = {}
@@ -892,6 +1005,7 @@ SCENARIOS: dict[str, Callable[[], dict[str, Any]]] = {
     "rpc_latency_separate": bench_rpc_separate,
     "rpc_concurrency": bench_rpc_concurrency,
     "rpc_batch": bench_rpc_batch,
+    "rpc_models": bench_rpc_models,
     "point_lookup": bench_point_lookup,
     "discovery_spaced": lambda: bench_discovery(pause=0.15),
 }
@@ -1002,6 +1116,10 @@ def compare(baseline: dict[str, Any], now: dict[str, Any]) -> tuple[list[str], l
 
 def provenance() -> dict[str, Any]:
     root = Path(__file__).resolve().parent
+    try:
+        pydantic_version = importlib.metadata.version("pydantic")
+    except importlib.metadata.PackageNotFoundError:
+        pydantic_version = None
     revision = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=root,
@@ -1055,6 +1173,7 @@ def provenance() -> dict[str, Any]:
             "load_average": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
             "httpx": httpx.__version__,
             "msgspec": msgspec.__version__,
+            "pydantic": pydantic_version,
             "python_optimization": sys.flags.optimize,
         },
     }

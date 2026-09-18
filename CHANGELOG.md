@@ -5,6 +5,25 @@
 
 ---
 
+## 0.17.0
+
+- RPC 参数和返回值可直接使用标准 dataclass 与 Pydantic 2 model。服务端参数注解负责
+  恢复类型，方法可直接返回模型，调用端用 `.returns(T)` 恢复；同步、异步、批量和
+  dataclass/Pydantic/容器相互嵌套走同一条路径。
+- 协议仍是普通 JSON，不传 Python 类名，不接受任意对象。Pydantic 是可选依赖，
+  `tinyray[pydantic]` 才安装；没用它的进程不会导入它。Pydantic 的 alias、validator
+  和 JSON serializer 由 `model_dump(mode="json", by_alias=True)`、`model_validate`
+  与缓存的 `TypeAdapter` 保留。
+- 新增 `rpc_models` 基准，交错比较普通 dict、自动模型转换和应用手写的最佳转换。
+  Python 3.12 三次中位数中，编码普通值/dataclass/Pydantic 分别为
+  5.13/5.58/6.37 us；完整 RPC p50 为 0.7305 ms（dataclass，手写 0.7239）和
+  0.7540 ms（Pydantic，手写 0.7571）。普通 RPC 对旧 `json.dumps` 做六轮平衡
+  A/B 为 0.6717/0.6725 ms，没有可测回退。
+- 完整验证为 Python 默认集 848 passed、examples 25 passed、slow 1 passed，Rust
+  87 passed（1 个显式 microbenchmark ignored），mutation 175/175 caught。
+
+---
+
 ## 0.16.0
 
 - `slot()` / `pick()` 改为原生单成员查询，增加有界快照和字段摘要缓存，批量结果

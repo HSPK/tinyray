@@ -436,9 +436,44 @@ h.assign.timeout(5.0)("task")       # 单次调用的超时，默认 30 秒
 h.pull_job.returns(AgentJob)()      # 把 JSON 结果恢复成 AgentJob
 ```
 
-JSON 不保存 Python 类型：`NamedTuple` 过线后是 list，dataclass 通常是 object。
-`.returns(T)` 在调用端声明要恢复成什么，递归处理 `NamedTuple`、dataclass、
-`TypedDict`、Enum、`T | None` 和 `list[T]` / `dict[K, V]` / tuple / set 等容器：
+标准 dataclass 可以直接作为参数和返回值；Pydantic 2 是可选集成：
+
+```bash
+pip install "tinyray[pydantic]"
+```
+
+```python
+from dataclasses import dataclass
+from pydantic import BaseModel
+
+class Request(BaseModel):
+    prompt: str
+    max_tokens: int
+
+@dataclass(frozen=True)
+class Reply:
+    text: str
+    tokens: int
+
+class Worker:
+    def infer(self, request: Request) -> Reply:
+        return Reply("done", request.max_tokens)
+
+reply = h.infer.returns(Reply)(Request(prompt="hello", max_tokens=32))
+```
+
+调用端模型先变成 JSON；服务端再按方法参数注解恢复。方法返回 dataclass 或
+Pydantic model 时会自动编码；调用端不写 `.returns(T)` 得到普通 dict/list，
+写了就恢复成本地声明的类型。两种模型可以互相嵌套，也可以放进
+`list[T]`、`dict[K, V]`、Optional/Union、tuple 和 set。
+
+Pydantic 编码使用 `model_dump(mode="json", by_alias=True)`，解码使用
+`model_validate()` 或缓存的 `TypeAdapter`，所以 alias、validator、JSON serializer
+都生效。TinyRay 不在启动时导入 Pydantic；应用已经安装并使用它时才启用适配。
+
+JSON 本身不保存 Python 类型：`NamedTuple` 过线后是 list，dataclass/Pydantic
+过线后是 object。`.returns(T)` 在调用端声明要恢复成什么，也递归处理
+`NamedTuple`、`TypedDict`、Enum、datetime、UUID 和上述容器：
 
 ```python
 class AgentJob(NamedTuple):
@@ -451,8 +486,8 @@ jobs = await ah.pull_jobs.returns(list[AgentJob])()
 
 转换失败抛本地 `TypeError`，消息带远端身份、方法名和出错的 JSON 路径；远端方法
 此时已经成功运行，失败只发生在结果恢复阶段。协议仍是普通 JSON，不会在线上传
-Python 类名。返回值本身必须可被 JSON 表达；`.returns()` 只恢复类型，不替服务端
-序列化任意对象。
+Python 类名。只有标准 dataclass 和 Pydantic model 是明确支持的模型边界；其他
+任意 Python 对象仍会像 `json.dumps` 一样被拒绝。
 
 `.returns()` 和 `.timeout()` 都是单次调用的修饰符，可以任意顺序组合：
 
@@ -507,7 +542,7 @@ me.registry.supports("publication_ordering") -> bool
 
 ```console
 $ curl -s http://registry:7000/health
-{"status":"ok","version":"0.16.0","protocol":2}
+{"status":"ok","version":"0.17.0","protocol":2}
 ```
 
 | protocol | 含义 |

@@ -21,7 +21,7 @@ from typing import Any
 
 import msgspec
 
-from ._json import dumps, loads
+from ._json import convert, dumps, loads
 from ._rpc import MAX_BATCH, _batch_request_id
 
 # A caller that announces a body and never sends it pins a thread for as long
@@ -237,13 +237,11 @@ def _coerce(
             continue
         kind = sig.parameters[name].kind
         if kind is kinds.VAR_POSITIONAL:
-            bound.arguments[name] = tuple(msgspec.convert(v, want, strict=False) for v in value)
+            bound.arguments[name] = tuple(convert(v, want) for v in value)
         elif kind is kinds.VAR_KEYWORD:
-            bound.arguments[name] = {
-                k: msgspec.convert(v, want, strict=False) for k, v in value.items()
-            }
+            bound.arguments[name] = {k: convert(v, want) for k, v in value.items()}
         else:
-            bound.arguments[name] = msgspec.convert(value, want, strict=False)
+            bound.arguments[name] = convert(value, want)
 
     if injected:
         # Defaults fill positional gaps before an injected parameter, but are

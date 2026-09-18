@@ -32,7 +32,7 @@ from ._errors import (
     RemoteError,
     Unreachable,
 )
-from ._json import dumps, loads
+from ._json import convert, dumps, loads
 
 # Past this a call is warned about, not refused. The control plane carries
 # facts about where things are, not the things -- but a call is point to point,
@@ -515,7 +515,7 @@ async def abatch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TI
 
 def _restore_return(value: Any, want: Any, target: str) -> Any:
     try:
-        return msgspec.convert(value, want, strict=False)
+        return convert(value, want)
     except (msgspec.ValidationError, TypeError) as e:
         label = getattr(want, "__qualname__", repr(want))
         raise TypeError(f"{target} returned JSON that does not match {label}: {e}") from e

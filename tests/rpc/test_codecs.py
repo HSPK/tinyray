@@ -109,17 +109,26 @@ def test_decoder_preserves_stdlib_values(value):
         b"binary",
         bytearray(b"binary"),
         {1, 2},
-        Record(1),
         Struct(1),
         datetime(2026, 1, 1, tzinfo=timezone.utc),
         Decimal("1.25"),
         {(1, 2): "tuple key"},
-        {"nested": Record(1)},
     ],
 )
 def test_encoder_does_not_adopt_msgspec_specific_object_encodings(value):
     with pytest.raises(TypeError) as legacy:
         json.dumps(value)
+    with pytest.raises(TypeError) as current:
+        _json.dumps(value)
+    assert str(current.value) == str(legacy.value)
+
+
+def test_dataclasses_are_normalized_without_widening_unrelated_values():
+    assert json.loads(_json.dumps({"record": Record(1)})) == {"record": {"value": 1}}
+
+    value = {"record": Record(1), "raw_datetime": datetime(2026, 1, 1)}
+    with pytest.raises(TypeError) as legacy:
+        json.dumps(value["raw_datetime"])
     with pytest.raises(TypeError) as current:
         _json.dumps(value)
     assert str(current.value) == str(legacy.value)
@@ -448,7 +457,7 @@ def echo():
             return value
 
         def bad(self):
-            return Record(1)
+            return object()
 
     server = MethodServer(Echo(), "codec/0#1", host="127.0.0.1", max_concurrency=1)
     handle = tinyray.Handle(
@@ -471,7 +480,7 @@ def test_single_call_round_trips_keep_legacy_values(echo):
 def test_invalid_inputs_never_send_and_invalid_returns_stay_remote_errors(echo):
     server, handle = echo
     with pytest.raises(TypeError, match="not JSON serializable"):
-        handle.echo(Record(1))
+        handle.echo(object())
     assert server.counters.snapshot()["calls"] == 0
     with pytest.raises(tinyray.RemoteError, match="cannot be sent as JSON"):
         handle.bad()

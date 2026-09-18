@@ -1,10 +1,12 @@
-"""Fast JSON for ordinary RPC values, with the stdlib as the compatibility boundary.
+"""Fast JSON for RPC values, with the stdlib as the compatibility boundary.
 
 The encoder fast path is reserved for payloads with an ASCII string of at least
 1 KiB; small messages retain the stdlib's wire formatting. It only accepts exact
 builtin types, ASCII strings, finite floats and 64-bit integers. Msgspec's extra
-support for dataclasses, bytes and dates must not make invalid RPC values valid.
-Non-string keys, subclasses, cycles and large/deep containers stay with json.dumps.
+support for bytes and dates must not make invalid ordinary RPC values valid.
+Dataclass and Pydantic model subtrees are the deliberate exception: they are
+normalized to plain JSON values, while unrelated siblings retain stdlib semantics.
+Non-string keys, subclasses, cycles and large/deep containers stay with JSONEncoder.
 
 Decoding uses Python's float conversion and msgspec's exact integer decoding.
 Unicode, NaN/Infinity literals and large/deep containers go straight to json.loads;
@@ -17,6 +19,10 @@ from __future__ import annotations
 
 import json
 import math
+import sys
+import typing
+from dataclasses import is_dataclass
+from functools import lru_cache
 from typing import Any
 
 import msgspec
@@ -26,6 +32,92 @@ _GUARD_NODES = 32
 # Python's conversion even for overflow, subnormals and negative zero. Untyped
 # integers already use PyLong_FromString, not the floating-point decoder.
 _decode_fast = msgspec.json.Decoder(float_hook=float).decode
+_PYDANTIC_BASE: type[Any] | None = None
+
+
+def _pydantic_base() -> type[Any] | None:
+    """Find Pydantic only after the application has imported it."""
+    global _PYDANTIC_BASE
+    if _PYDANTIC_BASE is None:
+        module = sys.modules.get("pydantic")
+        candidate = getattr(module, "BaseModel", None)
+        if isinstance(candidate, type):
+            _PYDANTIC_BASE = candidate
+    return _PYDANTIC_BASE
+
+
+def _pydantic_type(value: Any, base: type[Any]) -> bool:
+    return isinstance(value, type) and (
+        issubclass(value, base) or is_dataclass(value) and hasattr(value, "__pydantic_validator__")
+    )
+
+
+def _contains_pydantic(value: Any, base: type[Any], seen: set[int]) -> bool:
+    marker = id(value)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    if _pydantic_type(value, base):
+        return True
+    if any(_contains_pydantic(arg, base, seen) for arg in typing.get_args(value)):
+        return True
+    annotations = getattr(value, "__annotations__", None)
+    if not isinstance(value, type) or not annotations:
+        return False
+    try:
+        annotations = typing.get_type_hints(value)
+    except (NameError, TypeError):
+        pass
+    return any(_contains_pydantic(field, base, seen) for field in annotations.values())
+
+
+@lru_cache(maxsize=256)
+def _uses_pydantic(value: Any) -> bool:
+    base = _pydantic_base()
+    return base is not None and _contains_pydantic(value, base, set())
+
+
+@lru_cache(maxsize=128)
+def _type_adapter(value: Any) -> Any:
+    return sys.modules["pydantic"].TypeAdapter(value)
+
+
+def _validate(validator: Any, value: Any) -> Any:
+    try:
+        return validator(value)
+    except Exception as exc:
+        validation_error = getattr(sys.modules.get("pydantic"), "ValidationError", None)
+        if isinstance(validation_error, type) and isinstance(exc, validation_error):
+            raise msgspec.ValidationError(str(exc)) from None
+        raise
+
+
+def convert(value: Any, want: Any) -> Any:
+    """Restore a JSON value, using Pydantic only for types that contain it."""
+    base = _pydantic_base()
+    if base is not None:
+        if isinstance(want, type) and issubclass(want, base):
+            model_type: Any = want
+            return _validate(model_type.model_validate, value)
+        if _uses_pydantic(want):
+            return _validate(_type_adapter(want).validate_python, value)
+    return msgspec.convert(value, want, strict=False)
+
+
+class _ModelEncoder(json.JSONEncoder):
+    def default(self, value: Any) -> Any:
+        base = _pydantic_base()
+        if base is not None and isinstance(value, base):
+            return value.model_dump(mode="json", by_alias=True)
+        if is_dataclass(value) and not isinstance(value, type):
+            kind = type(value)
+            if base is not None and _uses_pydantic(kind):
+                return _type_adapter(kind).dump_python(value, mode="json", by_alias=True)
+            return msgspec.to_builtins(value, enc_hook=self.default)
+        return super().default(value)
+
+
+_encode_legacy = _ModelEncoder().encode
 
 
 def _compatible(value: Any) -> bool:
@@ -87,10 +179,10 @@ def _many_values(raw: str | bytes | bytearray) -> bool:
 
 
 def dumps(value: Any) -> bytes:
-    """Encode with json.dumps' accepted values and wire meaning, not its spacing."""
+    """Encode ordinary JSON compatibly, plus declared application models."""
     if _compatible(value):
         return msgspec.json.encode(value)
-    return json.dumps(value).encode()
+    return _encode_legacy(value).encode()
 
 
 def loads(raw: Any) -> Any:

@@ -10,6 +10,7 @@ python bench.py --json out.json       # 机器可读
 python bench.py --only rpc_latency    # 只跑一项
 python bench.py --check               # 对着 bench-baseline.json 比，退化就非零退出
 python bench.py --only point_lookup rpc_batch
+python bench.py --only rpc_models     # dict、dataclass、Pydantic 与手写转换
 python bench.py --only discovery watch_wakeup --coalesce-ms 1
 ```
 
@@ -27,12 +28,31 @@ python bench.py --only discovery watch_wakeup --coalesce-ms 1
 `rpc_latency_separate` / `rpc_concurrency`。`rpc_batch` 比较同样的 32 项逻辑
 操作逐个调用和合成一批的代价，不混淆请求数与操作数。`point_lookup` 使用最多
 5,000 个成员的稳定座位池；`all_filtered_ms` 和 `pick_filtered_ms` 各量自己的操作。
+`rpc_models` 交错测普通 dict、自动 dataclass/Pydantic 和应用手写的同等转换，
+同时报告纯 codec 微秒数与完整 RPC 往返，避免把网络成本冒充序列化成本。
 
 默认 50 ms 合并预算是请求量与延迟的取舍，不是网络下限。`discovery` 量突发变化，
 `discovery_spaced` 每 150 ms 变一次；显式调整 `coalesce_ms` 再比较不同策略。
 
 注册中心的独立测量可构建运行 `crates/tinyray-registry/examples/perf_registry.rs`。
 它明确区分拥有数据的应答组装与 HTTP/共享应答，不把前者冒充端到端吞吐。
+
+### 类型化 RPC 实测
+
+Python 3.12.13、24-vCPU AMD EPYC，同一进程拓扑，五种路径每轮轮换顺序，各跑
+1,000 次，下面是三次独立运行的中位数：
+
+| 路径 | 编码 | 恢复 | RPC p50 |
+|---|---:|---:|---:|
+| 普通 dict | 5.13 us | — | 0.7123 ms |
+| 自动 dataclass | 5.58 us | 1.33 us | 0.7305 ms |
+| 手写 dataclass 转换 | — | — | 0.7239 ms |
+| 自动 Pydantic | 6.37 us | 1.74 us | 0.7540 ms |
+| 手写 Pydantic 转换 | — | — | 0.7571 ms |
+
+自动 Pydantic 已不慢于应用手写 `model_dump()` / `model_validate()`；自动 dataclass
+比手写最佳路径多约 6.6 us，即完整调用的 0.9%。普通 RPC 对旧 `json.dumps` 与
+新缓存编码器做六轮平衡 A/B，p50 中位数为 0.6725/0.6717 ms，没有可测回退。
 
 ## 基线
 

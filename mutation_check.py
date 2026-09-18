@@ -17,6 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 PY = ROOT / ".venv/bin/python"
 
 PY_INIT = "python/tinyray/__init__.py"
+PY_JSON = "python/tinyray/_json.py"
 RS_BEAT = "crates/tinyray-client/src/beat.rs"
 RS_PROTO = "crates/tinyray-proto/src/lib.rs"
 RS_STATE = "crates/tinyray-registry/src/state.rs"
@@ -712,7 +713,7 @@ MUTANTS = [
     (
         "typed RPC returns are handed back as raw JSON",
         PY_RPC,
-        "        return msgspec.convert(value, want, strict=False)",
+        "        return convert(value, want)",
         "        return value",
         "tests/rpc/test_calling.py"
         "::test_returns_restores_a_nested_named_tuple",
@@ -720,7 +721,7 @@ MUTANTS = [
     (
         "typed RPC returns cannot restore JSON object keys",
         PY_RPC,
-        "        return msgspec.convert(value, want, strict=False)",
+        "        return convert(value, want)",
         "        return msgspec.convert(value, want, strict=True)",
         "tests/rpc/test_calling.py"
         "::test_returns_restores_nested_standard_data_structures",
@@ -1151,10 +1152,42 @@ MUTANTS = [
         "::test_a_class_on_the_served_object_is_not_a_method",
     ),
     (
+        "dataclass RPC values are rejected again",
+        PY_JSON,
+        "        if is_dataclass(value) and not isinstance(value, type):",
+        "        if False:",
+        "tests/rpc/test_codecs.py"
+        "::test_dataclasses_are_normalized_without_widening_unrelated_values",
+    ),
+    (
+        "Pydantic RPC values stop using their JSON aliases",
+        PY_JSON,
+        '            return value.model_dump(mode="json", by_alias=True)',
+        '            return value.model_dump(mode="json")',
+        "tests/rpc/test_models.py"
+        "::test_pydantic_models_are_direct_rpc_inputs_and_outputs",
+    ),
+    (
+        "Pydantic RPC inputs are left as dictionaries",
+        PY_JSON,
+        "            return _validate(model_type.model_validate, value)",
+        "            return value",
+        "tests/rpc/test_models.py"
+        "::test_pydantic_models_are_direct_rpc_inputs_and_outputs",
+    ),
+    (
+        "nested Pydantic types bypass their cached adapter",
+        PY_JSON,
+        "            return _validate(_type_adapter(want).validate_python, value)",
+        "            return msgspec.convert(value, want, strict=False)",
+        "tests/rpc/test_models.py"
+        "::test_dataclasses_and_pydantic_models_can_be_nested",
+    ),
+    (
         "only the first of a *args run gets its annotation",
         "python/tinyray/_serve.py",
-        "tuple(msgspec.convert(v, want, strict=False) for v in value)",
-        "tuple(msgspec.convert(v, want, strict=False) if i == 0 else v "
+        "tuple(convert(v, want) for v in value)",
+        "tuple(convert(v, want) if i == 0 else v "
         "for i, v in enumerate(value))",
         "tests/rpc/test_validation.py"
         "::test_the_annotation_covers_every_value_it_names",

@@ -15,6 +15,7 @@ python bench.py --only rpc_latency    # one scenario
 python bench.py --check               # compare against bench-baseline.json,
                                       # non-zero exit on a regression
 python bench.py --only point_lookup rpc_batch
+python bench.py --only rpc_models     # dict, dataclass, Pydantic, manual codecs
 python bench.py --only discovery watch_wakeup --coalesce-ms 1
 ```
 
@@ -38,7 +39,10 @@ Use `rpc_latency_separate` and `rpc_concurrency` for a callee with its own GIL.
 `rpc_batch` compares the same 32 logical calls individually and in one request,
 not 32 requests against one logical operation. `point_lookup` uses stable
 seated rosters up to 5,000 members. `all_filtered_ms` and `pick_filtered_ms`
-now measure the operations their names describe.
+now measure the operations their names describe. `rpc_models` interleaves plain
+dicts, automatic dataclass/Pydantic conversion, and equivalent hand-written
+conversion. It reports codec microseconds and complete RPC round trips
+separately so network cost is not mislabeled serialization cost.
 
 The 50 ms default coalescing budget is a traffic/latency choice, not a network
 floor. `discovery` measures a burst; `discovery_spaced` spaces changes by
@@ -48,6 +52,26 @@ For registry-only work, build and run the portable
 `crates/tinyray-registry/examples/perf_registry.rs` example. Its output
 distinguishes owned acknowledgment assembly from HTTP/shared-response costs;
 do not report the former as end-to-end throughput.
+
+### Typed RPC measurements
+
+Python 3.12.13 on the same 24-vCPU AMD EPYC host, same-process topology, with
+five paths rotated on every round and 1,000 calls per path. These are medians
+from three independent runs:
+
+| Path | Encode | Restore | RPC p50 |
+|---|---:|---:|---:|
+| Plain dict | 5.13 us | — | 0.7123 ms |
+| Automatic dataclass | 5.58 us | 1.33 us | 0.7305 ms |
+| Hand-written dataclass conversion | — | — | 0.7239 ms |
+| Automatic Pydantic | 6.37 us | 1.74 us | 0.7540 ms |
+| Hand-written Pydantic conversion | — | — | 0.7571 ms |
+
+Automatic Pydantic is no slower than application-written
+`model_dump()`/`model_validate()`. Automatic dataclass conversion adds about
+6.6 us over the best hand-written path, or 0.9% of the full call. Six balanced
+A/B runs of ordinary RPC with the old `json.dumps` and the cached encoder had
+median p50 values of 0.6725/0.6717 ms, with no measurable regression.
 
 ## The baseline
 
