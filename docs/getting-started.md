@@ -10,6 +10,47 @@ pip install tinyray
 
 wheel 里带着注册中心，不用再装第二个东西。
 
+### 嵌入式 Rust 服务
+
+源码或 workspace 用户可以直接使用受支持的 `tinyray` crate，不依赖 Python/PyO3：
+
+```rust
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tinyray::{MemberBuilder, Router};
+
+#[derive(Deserialize, Serialize)]
+struct Job { step: u64 }
+
+let mut router = Router::new();
+router.typed_arg("run", |context, job: Job| async move {
+    println!("request {} from {}", context.request_id, context.caller);
+    Ok(Job { step: job.step + 1 })
+})?;
+
+let member = MemberBuilder::new("127.0.0.1:8760", "workers")
+    .policy("stateful")
+    .slot(0)
+    .size(1)
+    .router(router)
+    .join(Duration::from_secs(15))?;
+member.ready(&serde_json::json!({"language": "rust"}))?;
+member.flush(Duration::from_secs(5))?;
+```
+
+它发布的 method metadata 与 Python `join(serves=...)` 完全相同；Python 和 Rust
+handle 通过同一套 framed MessagePack 协议调用。
+
+同一台 **Linux** 主机上的大 payload 可以显式使用：
+
+```python
+with tinyray.blob(weights) as ref:
+    worker.load(ref)
+```
+
+接收端得到只读映射的 `BlobRef`；`.view()` 零复制访问，只有 `bytes(ref)` 才明确
+复制。跨机器绝不会自动 fallback。
+
 ```bash
 tinyray --listen 127.0.0.1:8760 --ttl-ms 20000
 ```
@@ -64,12 +105,15 @@ with tinyray.join("collector", "stateful", slot=0,
 
 `max_concurrency` 给并发封顶。超了直接拒绝而不是排队 —— 拒绝是有界的，排队不是。
 
-底下就是普通 HTTP，所以 `curl` 排障的本事一点没丢：
+登记的是原生 `host:port` 端点。调用复用持久 TCP，每帧是 `u32` 大端长度加
+MessagePack envelope：
 
-```bash
-curl -X POST http://host:port/call/assign -d '{"task":"t"}'
-curl http://host:port/_methods
+```text
+{v: 1, id, from, to, op: "call", method, body: <MessagePack bytes>}
 ```
+
+没有 HTTP listener 或 JSON fallback。正常调用用 Python API；要手工看帧，运行
+`examples/15_native_rpc.py`。
 
 ## 找人，然后调用
 

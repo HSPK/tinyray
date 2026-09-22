@@ -85,10 +85,10 @@ def _reason(endpoint: str) -> str:
 
 
 def test_an_unreachable_port_is_not_blamed_on_the_protocol():
-    """h2c 的提示挂在所有连接错误上，会把人送去查一个不存在的代理。"""
+    """协议提示挂在所有连接错误上，会把人送去查一个不存在的代理。"""
     got = _reason(f"127.0.0.1:{free_port()}")
     assert "cannot reach it" in got
-    assert "h2c" not in got
+    assert "MessagePack" not in got
 
 
 def test_a_peer_that_only_speaks_http11_says_so():
@@ -98,7 +98,7 @@ def test_a_peer_that_only_speaks_http11_says_so():
     srv.start()
     try:
         got = _reason(f"127.0.0.1:{srv.port}")
-        assert "h2c" in got, got
+        assert "length-prefixed MessagePack" in got, got
         assert "the connection came up" in got, got
     finally:
         srv.close()

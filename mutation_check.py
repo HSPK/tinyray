@@ -6,6 +6,9 @@ behaviour it describes is broken. Each entry here breaks exactly one thing and
 names the test that must go red for it.
 """
 
+# Exact source anchors are intentionally kept on one line.
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import json
@@ -18,8 +21,27 @@ PY = ROOT / ".venv/bin/python"
 
 PY_INIT = "python/tinyray/__init__.py"
 PY_JSON = "python/tinyray/_json.py"
-RS_BEAT = "crates/tinyray-client/src/beat.rs"
+PY_MSGPACK = "python/tinyray/_msgpack.py"
+RS_BEAT = "crates/tinyray-membership/src/lib.rs"
+RS_MEMBERSHIP_CACHE = "crates/tinyray-membership/src/cache.rs"
+RS_MEMBERSHIP_HEARTBEAT = "crates/tinyray-membership/src/heartbeat.rs"
+RS_MEMBERSHIP_SHARED = "crates/tinyray-membership/src/shared.rs"
+RS_MEMBERSHIP_WAIT = "crates/tinyray-membership/src/wait.rs"
 RS_PROTO = "crates/tinyray-proto/src/lib.rs"
+RS_RPC = "crates/tinyray-client/src/rpc.rs"
+RS_WIRE = "crates/tinyray-proto/src/wire.rs"
+RS_RPC_PROTO = "crates/tinyray-proto/src/rpc.rs"
+RS_MEMBERSHIP_MANIFEST = "crates/tinyray-membership/Cargo.toml"
+RS_SDK_DISCOVERY = "crates/tinyray/src/discovery.rs"
+RS_SDK_MANIFEST = "crates/tinyray/Cargo.toml"
+RS_SDK_MEMBER = "crates/tinyray/src/member.rs"
+RS_SDK_SERVICE = "crates/tinyray/src/service.rs"
+RS_SDK_TRANSPORT = "crates/tinyray/src/transport.rs"
+RS_SDK_TRANSPORT_CLIENT = "crates/tinyray/src/transport/client.rs"
+RS_SDK_TRANSPORT_SERVER = "crates/tinyray/src/transport/server.rs"
+RS_BLOB = "crates/tinyray/src/blob.rs"
+RS_CLIENT_BLOB = "crates/tinyray-client/src/blob.rs"
+RS_REGISTRY_SERVER = "crates/tinyray-registry/src/server.rs"
 RS_STATE = "crates/tinyray-registry/src/state.rs"
 RS_LIB = "crates/tinyray-client/src/lib.rs"
 PY_RPC = "python/tinyray/_rpc.py"
@@ -31,18 +53,14 @@ UNTIL_BOOTSTRAP = (
     "            return snap\n"
     "        # Hand over the revision this snapshot stood at, so a change that\n"
 )
-AWAIT_READY = (
-    "        await self.auntil(\n"
-    '            enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}"\n'
-    "        )\n"
-    "        return found"
-)
+AWAIT_READY = "        result = await _await_native(self._c, waiter, deadline)"
 
 # (label, file, find, replace, test that must fail)
+# fmt: off
 MUTANTS = [
     (
         "removals in a delta are ignored",
-        RS_BEAT,
+        RS_MEMBERSHIP_CACHE,
         "        for id in &d.removed {\n            membership_changed |= self.remove(*id);\n        }",
         "",
         # test_deltas.py does not see this one -- it checks that a delta
@@ -51,7 +69,7 @@ MUTANTS = [
     ),
     (
         "the cached version is never advanced",
-        RS_BEAT,
+        RS_MEMBERSHIP_CACHE,
         "        self.version = d.version;",
         "",
         "tests/discovery/test_deltas.py",
@@ -66,10 +84,10 @@ MUTANTS = [
     ),
     (
         "an unparked beat gets a flat deadline instead of the interval",
-        "crates/tinyray-client/src/beat.rs",
+        RS_MEMBERSHIP_HEARTBEAT,
         "    if hold_ms == 0 {",
         "    if false {",
-        "cargo:tinyray-client",
+        "cargo:tinyray-membership",
     ),
     (
         "a beat body is read whatever size it announces",
@@ -195,24 +213,41 @@ MUTANTS = [
     (
         "a frozen round is handed out as an editable list",
         PY_INIT,
-        "        self.members = tuple(members)\n        self.roster = roster",
-        "        self.members = list(members)\n        self.roster = roster",
+        "            self._materialized = self._view.materialize(\n"
+        "                self._handle_cls._from_native, _StateBatch, immutable=True\n"
+        "            )\n"
+        "        return self._materialized\n\n"
+        "    @property\n"
+        "    def valid",
+        "            self._materialized = self._view.materialize(\n"
+        "                self._handle_cls._from_native, _StateBatch, immutable=False\n"
+        "            )\n"
+        "        return self._materialized\n\n"
+        "    @property\n"
+        "    def valid",
         "tests/collectives/test_epochs.py"
         "::test_a_frozen_round_cannot_be_edited",
     ),
     (
         "a snapshot is handed out as an editable list",
         PY_INIT,
-        "        # that can be edited afterwards is not one.\n"
-        "        self.members = tuple(members)",
-        "        # that can be edited afterwards is not one.\n        self.members = list(members)",
+        "            self._materialized = self._view.materialize(\n"
+        "                self._handle_cls._from_native, _StateBatch, immutable=True\n"
+        "            )\n"
+        "        return self._materialized\n\n"
+        "    def __len__",
+        "            self._materialized = self._view.materialize(\n"
+        "                self._handle_cls._from_native, _StateBatch, immutable=False\n"
+        "            )\n"
+        "        return self._materialized\n\n"
+        "    def __len__",
         "tests/collectives/test_epochs.py"
         "::test_a_snapshot_cannot_be_edited_either",
     ),
     (
         "a round never notices it has broken",
         PY_INIT,
-        "        return self._c.accepted and (info is None or info[1] == self.roster)",
+        "        return self._c.epoch_valid(self.pool, self.roster)",
         "        return True",
         "tests/collectives/test_epochs.py"
         "::test_readiness_does_not_break_a_round_but_leaving_does",
@@ -323,16 +358,18 @@ MUTANTS = [
     (
         "wait_departure watches the seat instead of the tenure",
         PY_INIT,
-        "            return snap.get(identity) is None\n\n        try:\n            self.until(departed,",
-        "            return snap.slot(0) is None\n\n        try:\n            self.until(departed,",
+        "        result = _wait_native(\n"
+        "            self._c.departure_waiter(self._name, identity),",
+        "        result = _wait_native(\n"
+        '            self._c.departure_waiter(self._name, f"{self._name}/0#0"),',
         "tests/discovery/test_waiting.py"
-        "::test_wait_departure_is_about_the_tenure_not_the_seat",
+        "::test_wait_departure_says_no_rather_than_hanging",
     ),
     (
         "await_ready blocks the event loop",
         PY_INIT,
         AWAIT_READY,
-        "        return self.wait(count, timeout, **filt)",
+        "        result = _wait_native(waiter, deadline)",
         "tests/discovery/test_waiting.py"
         "::test_await_ready_leaves_the_event_loop_turning",
     ),
@@ -340,8 +377,7 @@ MUTANTS = [
         "await_ready borrows an executor thread",
         PY_INIT,
         AWAIT_READY,
-        "        found = await asyncio.to_thread(self.wait, count, timeout, **filt)\n"
-        "        return found",
+        "        result = await asyncio.to_thread(_wait_native, waiter, deadline)",
         "tests/discovery/test_waiting.py"
         "::test_await_ready_holds_no_executor_thread",
     ),
@@ -382,7 +418,9 @@ MUTANTS = [
         PY_INIT,
         "            raise StopAsyncIteration\n            await bell.wait(ms / 1000)",
         "            raise StopAsyncIteration\n"
-        "            await asyncio.to_thread(self._c.wait_revision, self._tick, ms)",
+        "            await asyncio.to_thread(\n"
+        "                self._c.wait_revision, self._tick, min(ms, 2000)\n"
+        "            )",
         "tests/discovery/test_watch_lifecycle.py"
         "::test_async_watchers_hold_no_executor_thread",
     ),
@@ -396,9 +434,9 @@ MUTANTS = [
     ),
     (
         "wait_replacement returns any occupant, not a new tenure",
-        PY_INIT,
-        "        return now is not None and now.identity != was",
-        "        return now is not None",
+        RS_MEMBERSHIP_WAIT,
+        "                        .is_none_or(|identity| !identity_matches(&self.pool, member, identity))",
+        "                        .is_none_or(|_identity| true)",
         "tests/discovery/test_watch_lifecycle.py"
         "::test_wait_replacement_names_the_new_tenure",
     ),
@@ -412,7 +450,7 @@ MUTANTS = [
     ),
     (
         "the request replacing a cancelled one is parked like any other",
-        RS_BEAT,
+        RS_MEMBERSHIP_HEARTBEAT,
         "            let hold = if cancelled_last {\n                0\n            } else {\n                shared.hold_ms.load(Ordering::Relaxed)\n            };",
         "            let hold = shared.hold_ms.load(Ordering::Relaxed);",
         "tests/registry/test_long_poll.py"
@@ -436,7 +474,7 @@ MUTANTS = [
     ),
     (
         "the post-beat pause reads the last request's hold, not the loop's intent",
-        RS_BEAT,
+        RS_MEMBERSHIP_HEARTBEAT,
         "            if shared.hold_ms.load(Ordering::Relaxed) == 0 {\n"
         "                shared.short_polls",
         "            if hold == 0 {\n                shared.short_polls",
@@ -615,16 +653,16 @@ MUTANTS = [
     (
         "the shape cache is keyed by the bound method",
         "python/tinyray/_serve.py",
-        '    key = getattr(fn, "__func__", fn)',
-        "    key = fn",
+        '    key = getattr(fn, "__func__", fn)\n    got = _SHAPES.get(key)',
+        "    key = fn\n    got = _SHAPES.get(key)",
         "tests/membership/test_membership.py"
         "::test_leaving_lets_go_of_what_it_was_serving",
     ),
     (
         "a member told it lost the seat can be told otherwise later",
-        "crates/tinyray-client/src/beat.rs",
-        "            self.accepted.store(false, Ordering::Relaxed);",
-        "            self.accepted.store(true, Ordering::Relaxed);",
+        RS_MEMBERSHIP_SHARED,
+        "            changed |= self.accepted.swap(false, Ordering::Relaxed);",
+        "            changed |= self.accepted.swap(true, Ordering::Relaxed);",
         "tests/registry/test_restart.py"
         "::test_a_frozen_owner_waking_after_a_restart_does_not_take_the_seat_back",
     ),
@@ -663,7 +701,7 @@ MUTANTS = [
     (
         "any path at all reaches a method",
         "python/tinyray/_serve.py",
-        '        if not batching and not self.path.startswith("/call/"):',
+        '        if not batching and not (raw_result or self.path.startswith("/call/")):',
         "        if False:",
         "tests/rpc/test_http.py"
         "::test_only_the_call_path_reaches_a_method",
@@ -713,18 +751,18 @@ MUTANTS = [
     (
         "typed RPC returns are handed back as raw JSON",
         PY_RPC,
-        "        return convert(value, want)",
-        "        return value",
+        "        return convert_json(raw, want)",
+        "        return loads(raw)",
         "tests/rpc/test_calling.py"
         "::test_returns_restores_a_nested_named_tuple",
     ),
     (
-        "typed RPC returns cannot restore JSON object keys",
-        PY_RPC,
-        "        return convert(value, want)",
-        "        return msgspec.convert(value, want, strict=True)",
-        "tests/rpc/test_calling.py"
-        "::test_returns_restores_nested_standard_data_structures",
+        "legacy typed RPC returns stop coercing JSON values",
+        PY_JSON,
+        "    return msgspec.convert(value, want, strict=False)",
+        "    return msgspec.convert(value, want, strict=True)",
+        "tests/rpc/test_models.py"
+        "::test_legacy_result_fallback_restores_json_object_keys",
     ),
     (
         "setting a timeout forgets the requested return type",
@@ -745,16 +783,21 @@ MUTANTS = [
     (
         "an async typed RPC return is not restored",
         PY_RPC,
-        "        if inspect.isawaitable(result):\n"
-        "            return _restore_awaited(result, self._return_type, target)",
-        "        if inspect.isawaitable(result):\n            return result",
+        "        return self._send(\n"
+        "            self._handle,\n"
+        "            self._name,\n"
+        "            payload,\n"
+        "            self._timeout,\n"
+        "            _return_type=self._return_type,\n"
+        "        )",
+        "        return self._send(self._handle, self._name, payload, self._timeout)",
         "tests/rpc/test_calling.py"
         "::test_returns_restores_the_async_result_too",
     ),
     (
         "a typed return mismatch omits which call and type were wrong",
         PY_RPC,
-        '        raise TypeError(f"{target} returned JSON that does not match {label}: {e}") from e',
+        '        raise TypeError(f"{target} returned JSON that does not match {type_name}: {e}") from e',
         "        raise TypeError(str(e)) from e",
         "tests/rpc/test_calling.py"
         "::test_returns_names_the_call_and_json_path_when_the_shape_is_wrong",
@@ -802,23 +845,29 @@ MUTANTS = [
     (
         "a forked child inherits the lock still held",
         PY_INIT,
-        "    _live_watches.clear()\n    _rpc.reset_after_fork()",
-        "    _live_watches.clear()",
+        "    _live_watches.clear()\n"
+        "    _live_native_waits.clear()\n"
+        "    _rpc.reset_after_fork()",
+        "    _live_watches.clear()\n"
+        "    _live_native_waits.clear()",
         "tests/discovery/test_watch_lifecycle.py"
         "::test_a_child_forked_while_the_lock_was_held_can_still_watch",
     ),
     (
         "the blocking replacement wait only sees what comes next",
         PY_INIT,
-        "        try:\n"
-        "            snap = self.until(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))\n"
-        "        except TimeoutError:\n"
+        "        waiter = self._c.replacement_waiter(self._name, seat, was, capture)\n"
+        "        result = _wait_native(waiter, deadline)\n"
+        "        if result[0] == _WAIT_FENCED:\n"
+        "            _fenced_wait(self._name)\n"
+        "        if result[0] != _WAIT_READY or result[1] is None:\n"
         "            return None\n"
-        "        return snap.slot(seat)",
+        "        return result[1].slot(seat, self._handle_cls._from_native)",
         "        with self.changes(timeout=timeout) as w:\n"
         "            for snap in w:\n"
-        "                if _taken_over(seat, was)(snap):\n"
-        "                    return snap.slot(seat)\n"
+        "                now = snap.slot(seat)\n"
+        "                if now is not None and now.identity != was:\n"
+        "                    return now\n"
         "        return None",
         "tests/discovery/test_watch_lifecycle.py"
         "::test_a_replacement_that_already_happened_is_not_missed",
@@ -826,15 +875,21 @@ MUTANTS = [
     (
         "the async replacement wait only sees what comes next",
         PY_INIT,
-        "        try:\n"
-        "            snap = await self.auntil(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))\n"
-        "        except TimeoutError:\n"
+        "        result = await _await_native(\n"
+        "            self._c,\n"
+        "            self._c.replacement_waiter(self._name, seat, was, capture),\n"
+        "            deadline,\n"
+        "        )\n"
+        "        if result[0] == _WAIT_FENCED:\n"
+        "            _fenced_wait(self._name)\n"
+        "        if result[0] != _WAIT_READY or result[1] is None:\n"
         "            return None\n"
-        "        return snap.slot(seat)",
+        "        return result[1].slot(seat, self._handle_cls._from_native)",
         "        async with self.achanges(timeout=timeout) as w:\n"
         "            async for snap in w:\n"
-        "                if _taken_over(seat, was)(snap):\n"
-        "                    return snap.slot(seat)\n"
+        "                now = snap.slot(seat)\n"
+        "                if now is not None and now.identity != was:\n"
+        "                    return now\n"
         "        return None",
         "tests/discovery/test_watch_lifecycle.py"
         "::test_a_replacement_that_already_happened_is_not_missed",
@@ -849,7 +904,7 @@ MUTANTS = [
     ),
     (
         "the digest leaves out who the members are",
-        RS_BEAT,
+        RS_MEMBERSHIP_CACHE,
         "            m.id.hash(&mut h);\n            m.incarnation.hash(&mut h);",
         "",
         "tests/discovery/test_watch_lifecycle.py"
@@ -930,8 +985,8 @@ MUTANTS = [
     (
         "every call reuses one request id",
         PY_RPC,
-        "else f\"{_identity or 'anon'}-{next(_seq)}\"",
-        "else f\"{_identity or 'anon'}-1\"",
+        'else _generated_request_id(_identity or "anon", next(_seq))',
+        'else _generated_request_id(_identity or "anon", 1)',
         "tests/membership/test_identity_and_fencing.py"
         "::test_every_call_carries_a_request_id_that_names_that_attempt",
     ),
@@ -971,9 +1026,9 @@ MUTANTS = [
     (
         "flush blames the registry for a seat that was taken",
         PY_INIT,
-        "            if not self._c.accepted:\n"
-        '                raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")',
-        '            if False:\n                raise SeatTaken("")',
+        "        if not accepted:\n"
+        '            raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")',
+        '        if False:\n            raise SeatTaken("")',
         "tests/membership/test_seats.py"
         "::test_flush_says_the_seat_was_taken_rather_than_blaming_the_registry",
     ),
@@ -987,17 +1042,46 @@ MUTANTS = [
     ),
     (
         "a superseded member keeps beating",
-        RS_BEAT,
+        RS_MEMBERSHIP_HEARTBEAT,
         "                    if !alive {\n"
         "                        // Superseded. Beating on would only be waiting for the\n"
         "                        // replacement to die so we could take the seat back.\n"
-        "                        shared.ring();\n"
         "                        return;\n"
         "                    }",
-        "                    if false {\n                        shared.ring();\n"
-        "                        return;\n                    }",
+        "                    if false {\n                        return;\n                    }",
         "tests/membership/test_seats.py"
         "::test_a_superseded_member_stops_beating_instead_of_hammering_the_registry",
+    ),
+    (
+        "empty heartbeat acknowledgements broadcast cache changes",
+        RS_MEMBERSHIP_HEARTBEAT,
+        "                    shared.note_beat();\n"
+        "                    if changed {\n"
+        "                        shared.ring();\n"
+        "                    }",
+        "                    shared.note_beat();\n"
+        "                    if true {\n"
+        "                        shared.ring();\n"
+        "                    }",
+        "tests/registry/test_long_poll.py"
+        "::test_idle_heartbeats_do_not_broadcast_cache_changes",
+    ),
+    (
+        "publication acknowledgements do not wake publication waiters",
+        RS_MEMBERSHIP_HEARTBEAT,
+        "                    shared.acked.notify_one();\n"
+        "                    shared.note_beat();",
+        "                    shared.acked.notify_one();",
+        "tests/membership/test_identity_and_fencing.py"
+        "::test_flush_is_released_by_the_exact_publication_ack",
+    ),
+    (
+        "Rust registration returns to 100ms sliced waits",
+        RS_SDK_MEMBER,
+        "        if !shared.wait_registered(timeout) {",
+        "        if !shared.wait_registered(Duration::from_millis(100)) {",
+        "tests/project/test_api.py"
+        "::test_rust_member_registration_waits_on_one_event_deadline",
     ),
     (
         "a filter compares big integers as doubles",
@@ -1031,16 +1115,12 @@ MUTANTS = [
     (
         "wait() runs its own loop and cannot report a lost seat",
         PY_INIT,
-        '        self.until(enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}")',
-        "        deadline = time.monotonic() + timeout\n"
-        "        while True:\n"
-        "            rev = self._c.cache_revision()\n"
-        "            if enough(None):\n"
-        "                return found\n"
-        "            ms = _left_ms(deadline)\n"
-        "            if ms is None:\n"
-        '                raise TimeoutError(f"waited {timeout}s, saw {len(found)}")\n'
-        "            self._c.wait_revision(rev, ms)",
+        "        result = _wait_native(waiter, deadline)\n"
+        "        if result[0] == _WAIT_FENCED:\n"
+        "            _fenced_wait(self._name)\n"
+        "        if result[0] == _WAIT_READY and result[1] is not None:",
+        "        result = _wait_native(waiter, deadline)\n"
+        "        if result[0] == _WAIT_READY and result[1] is not None:",
         "tests/membership/test_seats.py"
         "::test_every_wait_says_it_was_fenced_rather_than_blaming_the_pool",
     ),
@@ -1094,7 +1174,7 @@ MUTANTS = [
     ),
     (
         "the client's own fingerprint is not the registry's hash",
-        RS_BEAT,
+        RS_MEMBERSHIP_CACHE,
         "let roster = members.iter().fold(0, |h, m| h ^ m.roster_hash());",
         "let roster = members.iter().fold(0u64, |h, m| h.wrapping_add(m.roster_hash()));",
         "tests/collectives/test_roster_fingerprint.py"
@@ -1160,34 +1240,50 @@ MUTANTS = [
         "::test_dataclasses_are_normalized_without_widening_unrelated_values",
     ),
     (
-        "Pydantic RPC values stop using their JSON aliases",
-        PY_JSON,
-        '            return value.model_dump(mode="json", by_alias=True)',
-        '            return value.model_dump(mode="json")',
+        "typed calls stop using the raw result path",
+        PY_RPC,
+        "    path = \"/_batch\" if batching else f\"{RAW_RESULT_PATH if raw_result else '/call/'}{name}\"",
+        '    path = "/_batch" if batching else f"/call/{name}"',
         "tests/rpc/test_models.py"
-        "::test_pydantic_models_are_direct_rpc_inputs_and_outputs",
+        "::test_typed_calls_fall_back_to_a_legacy_result_envelope",
     ),
     (
-        "Pydantic RPC inputs are left as dictionaries",
-        PY_JSON,
-        "            return _validate(model_type.model_validate, value)",
-        "            return value",
+        "the server wraps a negotiated raw result again",
+        "python/tinyray/_serve.py",
+        '                if raw_result and code == 200 and not failed and set(body) == {"result"}:',
+        '                if False and code == 200 and not failed and set(body) == {"result"}:',
         "tests/rpc/test_models.py"
-        "::test_pydantic_models_are_direct_rpc_inputs_and_outputs",
+        "::test_raw_result_negotiation_returns_the_value_as_the_whole_body",
     ),
     (
-        "nested Pydantic types bypass their cached adapter",
-        PY_JSON,
-        "            return _validate(_type_adapter(want).validate_python, value)",
-        "            return msgspec.convert(value, want, strict=False)",
+        "model arguments rebuild the whole generic request graph",
+        "python/tinyray/_serve.py",
+        "        if raw and _takes_model(fn):",
+        "        if False:",
         "tests/rpc/test_models.py"
-        "::test_dataclasses_and_pydantic_models_can_be_nested",
+        "::test_model_rpc_skips_both_generic_object_graphs",
+    ),
+    (
+        "plain dataclass JSON rebuilds a generic object graph",
+        PY_JSON,
+        "    return msgspec.json.decode(raw, type=want, strict=False)",
+        "    return convert(loads(bytes(raw)), want)",
+        "tests/rpc/test_models.py"
+        "::test_model_rpc_skips_both_generic_object_graphs",
+    ),
+    (
+        "direct dataclass JSON drops legacy NaN and surrogate support",
+        PY_JSON,
+        "    except msgspec.DecodeError as direct_error:",
+        "    except ():",
+        "tests/rpc/test_models.py"
+        "::test_direct_dataclass_json_keeps_legacy_nan_and_surrogate_semantics",
     ),
     (
         "only the first of a *args run gets its annotation",
         "python/tinyray/_serve.py",
-        "tuple(convert(v, want) for v in value)",
-        "tuple(convert(v, want) if i == 0 else v "
+        "tuple(_coerce_value(v, want) for v in value)",
+        "tuple(_coerce_value(v, want) if i == 0 else v "
         "for i, v in enumerate(value))",
         "tests/rpc/test_validation.py"
         "::test_the_annotation_covers_every_value_it_names",
@@ -1202,7 +1298,7 @@ MUTANTS = [
     ),
     (
         "the first beat ignores the loop's ack and waits out its own budget",
-        RS_BEAT,
+        RS_MEMBERSHIP_HEARTBEAT,
         "            _ = s.acked.notified(), if stop_when_registered => None,",
         "            _ = s.acked.notified(), if false => None,",
         "tests/registry/test_network_faults.py"
@@ -1211,26 +1307,18 @@ MUTANTS = [
     (
         "flush counts beats instead of asking whether its state was acked",
         PY_INIT,
-        "        mine, _ = self._c.publish_versions()\n"
-        "        deadline = time.monotonic() + timeout\n"
-        "        while True:\n"
-        "            rev = self._c.cache_revision()\n"
-        "            if self._c.publish_versions()[1] >= mine:",
-        '        mine = self._c.stats()["beats_ok"] + 2\n'
-        "        deadline = time.monotonic() + timeout\n"
-        "        while True:\n"
-        "            rev = self._c.cache_revision()\n"
-        '            if self._c.stats()["beats_ok"] >= mine:',
+        "        mine, _ = self._c.publish_versions()",
+        '        mine = self._c.stats()["beats_ok"] + 2',
         "tests/registry/test_long_poll.py"
         "::test_flush_waits_for_its_own_state_not_for_two_more_beats",
     ),
     (
         "flush is satisfied by an ack for the state before the one it published",
         PY_INIT,
-        "            if self._c.publish_versions()[1] >= mine:",
-        "            if self._c.publish_versions()[1] >= mine - 1:",
+        "        confirmed, accepted = self._c.wait_publication(mine, 0 if ms is None else ms)",
+        "        confirmed, accepted = self._c.wait_publication(mine - 1, 0 if ms is None else ms)",
         "tests/membership/test_identity_and_fencing.py"
-        "::test_flush_waits_until_the_registry_has_it",
+        "::test_flush_is_released_by_the_exact_publication_ack",
     ),
     (
         "the beat connection leaves Nagle on, so a close-following beat stalls",
@@ -1242,7 +1330,7 @@ MUTANTS = [
     ),
     (
         "a refused beat counts as confirmation of the state it carried",
-        RS_BEAT,
+        RS_MEMBERSHIP_HEARTBEAT,
         "                    if alive {\n"
         "                        shared.confirmed.fetch_max(showing, Ordering::Relaxed);\n"
         "                    }",
@@ -1290,8 +1378,8 @@ MUTANTS = [
     (
         "a fenced epoch trusts its unchanged cached fingerprint",
         PY_INIT,
-        "return self._c.accepted and (info is None or info[1] == self.roster)",
-        "return info is None or info[1] == self.roster",
+        "return self._c.epoch_valid(self.pool, self.roster)",
+        "return True",
         "tests/collectives/test_epochs.py"
         "::test_fencing_invalidates_epochs_even_without_a_final_cache_refresh",
     ),
@@ -1419,24 +1507,24 @@ MUTANTS = [
     ),
     (
         "the client omits publication ordering",
-        RS_BEAT,
+        RS_MEMBERSHIP_SHARED,
         "publication: Some(published.version),",
         "publication: None,",
-        "cargo:tinyray-client",
+        "cargo:tinyray-membership",
     ),
     (
         "an old acknowledgment rolls the cache back",
-        RS_BEAT,
+        RS_MEMBERSHIP_SHARED,
         "            if d.version < c.version {\n                continue;\n            }\n",
         "",
-        "cargo:tinyray-client",
+        "cargo:tinyray-membership",
     ),
     (
         "the short-lease request budget outlives the lease",
-        RS_BEAT,
+        RS_MEMBERSHIP_HEARTBEAT,
         "hold_ms + hold_ms / 2 + (hold_ms / 2).min(200)",
         "hold_ms + hold_ms / 2 + 200",
-        "cargo:tinyray-client",
+        "cargo:tinyray-membership",
     ),
     (
         "reading the heartbeat body starts another full timeout",
@@ -1463,25 +1551,25 @@ MUTANTS = [
     ),
     (
         "slot lookup ignores readiness",
-        RS_BEAT,
-        "            (!require_ready || m.ready).then_some(m)",
-        "            Some(m)",
+        RS_MEMBERSHIP_CACHE,
+        "            (!require_ready || member.ready).then(|| member.clone())",
+        "            Some(member.clone())",
         "tests/discovery/test_fast_lookups.py"
         "::test_duplicate_slots_choose_the_lowest_eligible_wire_id",
     ),
     (
         "native snapshots survive a changed publication",
-        RS_BEAT,
+        RS_MEMBERSHIP_CACHE,
         "            *self.snapshots.get_mut().unwrap() = Default::default();",
         "",
-        "cargo:tinyray-client",
+        "cargo:tinyray-membership",
     ),
     (
         "field digest memoization survives a changed publication",
-        RS_BEAT,
+        RS_MEMBERSHIP_CACHE,
         "            *self.digest.get_mut().unwrap() = None;",
         "",
-        "cargo:tinyray-client",
+        "cargo:tinyray-membership",
     ),
     (
         "shared registry deltas survive a pool change",
@@ -1519,6 +1607,1328 @@ MUTANTS = [
         "tests/project/test_bench.py::test_benchmark_teardown_closes_members_and_restores_environment",
     ),
 ]
+
+# HTTP/JSON method RPC was removed in 0.18. Keep the historical entries above
+# readable, but replace their dead anchors with invariants of the native
+# framed transport. Filtering by label also makes duplicate old entries
+# impossible to leave active accidentally.
+_REPLACED_METHOD_RPC_MUTANTS = {
+    "a beat body is read whatever size it announces",
+    "the listen backlog goes back to socketserver's default of 5",
+    "positional arguments are left positional when a context is injected",
+    "a call is counted only after its answer is on the wire",
+    "closing leaves the handler threads parked",
+    "a closed server keeps its lookup table",
+    "missing required arguments pass through signature binding",
+    "a dispatch that came apart is never counted",
+    "any path at all reaches a method",
+    "a body that timed out leaves the connection open",
+    "an unreadable content-length leaves the connection open",
+    "a negative content-length leaves the connection open",
+    "a payload refused as too large is not the caller's fault",
+    "a status nobody agreed on is read as a good answer",
+    "typed RPC returns are handed back as raw JSON",
+    "legacy typed RPC returns stop coercing JSON values",
+    "a typed return mismatch omits which call and type were wrong",
+    "a handle with no address is posted to anyway",
+    "a method the far side does not have is called a maybe",
+    "a request the callee never read is called maybe-ran",
+    "a forked child keeps the parent's shared connection",
+    "a forked child keeps the parent's transports",
+    "the serving side stops counting refusals",
+    "a connection that says nothing keeps its thread for good",
+    "typed calls stop using the raw result path",
+    "the server wraps a negotiated raw result again",
+    "only the first of a *args run gets its annotation",
+    "the beat connection leaves Nagle on, so a close-following beat stalls",
+    "context binding permits a duplicate argument",
+    "reading the heartbeat body starts another full timeout",
+    "a batch does not recheck fencing between items",
+    "a batch continues after an item failed",
+    "a method name that cannot go in a URL is served anyway",
+    "a pool name is accepted whatever is in it",
+    "pool() takes a name join() would have refused",
+    "a request id that cannot be a header is accepted",
+    "dataclass RPC values are rejected again",
+    "plain dataclass JSON rebuilds a generic object graph",
+    "direct dataclass JSON drops legacy NaN and surrogate support",
+    "an envelope that cannot be unpacked comes back as maybe-ran",
+    "model arguments rebuild the whole generic request graph",
+}
+MUTANTS = [
+    m
+    for m in MUTANTS
+    if m[0] not in _REPLACED_METHOD_RPC_MUTANTS and m[1] != PY_JSON
+]
+MUTANTS.extend(
+    [
+        (
+            "a frame length is trusted before allocation",
+            RS_WIRE,
+            "    if length > maximum {\n"
+            "        return Err(FrameError::FrameTooLarge { length, maximum });\n"
+            "    }",
+            "    if false {\n"
+            "        return Err(FrameError::FrameTooLarge { length, maximum });\n"
+            "    }",
+            "cargo:tinyray-proto",
+        ),
+        (
+            "a method request with the wrong protocol version is dispatched",
+            RS_SDK_TRANSPORT_SERVER,
+            "    if request.protocol != RPC_PROTOCOL {",
+            "    if false {",
+            "tests/rpc/test_transport.py"
+            "::test_invalid_protocol_metadata_is_correlated_and_never_dispatched",
+        ),
+        (
+            "a reply with the wrong protocol version is accepted",
+            RS_SDK_TRANSPORT_CLIENT,
+            "    if reply.protocol != RPC_PROTOCOL {",
+            "    if false {",
+            "tests/rpc/test_transport.py"
+            "::test_reply_protocol_mismatch_is_unknown_and_discards_the_connection",
+        ),
+        (
+            "multiplexed replies are routed by arrival order instead of request id",
+            RS_SDK_TRANSPORT_CLIENT,
+            "        if let Some(pending) = state.pending.remove(&reply.request_id) {",
+            "        let arrived_first = state.pending.keys().min().cloned();\n"
+            "        if let Some(pending) = arrived_first\n"
+            "            .as_ref()\n"
+            "            .and_then(|request_id| state.pending.remove(request_id))\n"
+            "        {",
+            "tests/rpc/test_transport.py"
+            "::test_one_multiplexed_connection_routes_mixed_sync_and_async_replies_out_of_order",
+        ),
+        (
+            "the shared listener ignores the Python service target fencing token",
+            RS_SDK_TRANSPORT_SERVER,
+            "    if request.target != state.identity {",
+            "    if false {",
+            "tests/rpc/test_transport.py"
+            "::test_every_complete_reply_leaves_the_connection_correlated",
+        ),
+        (
+            "a partial request write is called outcome-unknown",
+            RS_SDK_TRANSPORT_CLIENT,
+            "                connection.poison(\n"
+            "                    CallError::NotDelivered(format!(\n"
+            '                        "the request was not completely written to {endpoint} before timeout"\n'
+            "                    )),\n"
+            "                    CallError::OutcomeUnknown(format!(\n"
+            '                        "{endpoint} failed after a complete request was written"\n'
+            "                    )),\n"
+            "                    false,\n"
+            "                );",
+            "                connection.poison(\n"
+            "                    CallError::NotDelivered(format!(\n"
+            '                        "the request was not completely written to {endpoint} before timeout"\n'
+            "                    )),\n"
+            "                    CallError::OutcomeUnknown(format!(\n"
+            '                        "{endpoint} failed after a complete request was written"\n'
+            "                    )),\n"
+            "                    true,\n"
+            "                );",
+            "tests/rpc/test_transport.py"
+            "::test_timeout_during_a_partial_write_is_not_delivered",
+        ),
+        (
+            "a timeout after the complete write is called not-delivered",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            CallError::OutcomeUnknown(format!(\"{endpoint} did not answer before the call timeout\"))",
+            "            CallError::NotDelivered(format!(\"{endpoint} did not answer before the call timeout\"))",
+            "tests/rpc/test_transport.py"
+            "::test_timeout_after_complete_write_is_outcome_unknown",
+        ),
+        (
+            "async cancellation retains its multiplexed waiter",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            if let Some(connection) = target.connection.upgrade() {\n"
+            "                let _ = connection.abandon(&target.request_id);\n"
+            "            }",
+            "",
+            "cargo:tinyray:external_client_cancellation_removes_the_waiter_synchronously",
+        ),
+        (
+            "overloaded method calls wait in a queue",
+            RS_SDK_TRANSPORT_SERVER,
+            "        Some(admission) => match admission.clone().try_acquire_owned() {",
+            "        Some(admission) => match admission.clone().acquire_owned().await {",
+            "tests/rpc/test_outcomes.py"
+            "::test_going_over_the_concurrency_limit_is_refused_not_queued",
+        ),
+        (
+            "served calls disappear from native statistics",
+            RS_SDK_TRANSPORT_SERVER,
+            "        flight.answered(reply.status != RpcStatus::Success);",
+            "",
+            "tests/rpc/test_transport.py"
+            "::test_answer_is_counted_before_the_client_can_observe_it",
+        ),
+        (
+            "a complete sync response is never returned to the pool",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            let _ = sender.send(Ok(ReceivedRpcReply { reply, _ack: ack }));\n"
+            "            if close {",
+            "            let _ = sender.send(Ok(ReceivedRpcReply { reply, _ack: ack }));\n"
+            "            if true {",
+            "tests/rpc/test_transport.py"
+            "::test_sync_calls_return_a_complete_connection_to_the_native_pool",
+        ),
+        (
+            "the idle connection cap becomes per-endpoint and unbounded",
+            RS_SDK_TRANSPORT,
+            "const MAX_IDLE_CONNECTIONS: usize = 64;",
+            "const MAX_IDLE_CONNECTIONS: usize = usize::MAX;",
+            "tests/rpc/test_transport.py"
+            "::test_idle_connection_cap_is_process_global_not_per_endpoint",
+        ),
+        (
+            "closing a local listener leaves its client pool behind",
+            "python/tinyray/_serve.py",
+            "        for endpoint in self._endpoints:\n"
+            "            _native.rpc_drop_endpoint(endpoint)\n",
+            "",
+            "tests/membership/test_cleanup.py"
+            "::test_a_round_of_membership_leaves_nothing_behind",
+        ),
+        (
+            "closing a native listener keeps the served object",
+            "python/tinyray/_serve.py",
+            "        self.dispatch.clear()\n",
+            "",
+            "tests/rpc/test_transport.py"
+            "::test_closing_a_native_listener_releases_the_served_object",
+        ),
+        (
+            "legacy HTTP method endpoints reach the native dialer",
+            PY_RPC,
+            '    if "://" in endpoint:\n',
+            "    if False:\n",
+            "tests/rpc/test_transport.py"
+            "::test_endpoint_is_bare_and_legacy_http_is_rejected_explicitly",
+        ),
+        (
+            "a handle with no native endpoint is dialled anyway",
+            PY_RPC,
+            "    if endpoint is None:\n",
+            "    if False:\n",
+            "tests/rpc/test_outcomes.py::test_no_address_never_left_this_process",
+        ),
+        (
+            "method-not-found is reported as outcome-unknown",
+            PY_RPC,
+            "    if status == _native.RPC_STATUS_METHOD_NOT_FOUND:\n",
+            "    if False:\n",
+            "tests/rpc/test_outcomes.py"
+            "::test_a_method_the_far_side_does_not_have_is_not_a_maybe",
+        ),
+        (
+            "an unknown native status is treated as success",
+            PY_RPC,
+            '    raise OutcomeUnknown(f"{target} returned unknown native RPC status {status!r}")',
+            "    return",
+            "tests/rpc/test_outcomes.py::test_every_native_status_lands_in_the_right_class",
+        ),
+        (
+            "a typed return error omits the remote call and expected type",
+            PY_RPC,
+            "    except msgspec.ValidationError as exc:\n"
+            '        label = getattr(want, "__qualname__", repr(want))\n'
+            '        raise TypeError(f"{call} returned MessagePack that does not match {label}: {exc}") from exc',
+            "    except msgspec.ValidationError as exc:\n"
+            '        label = getattr(want, "__qualname__", repr(want))\n'
+            "        raise TypeError(str(exc)) from exc",
+            "tests/rpc/test_calling.py"
+            "::test_returns_names_the_call_and_messagepack_path_when_the_shape_is_wrong",
+        ),
+        (
+            "missing arguments pass partial signature binding",
+            "python/tinyray/_serve.py",
+            "        bound = public.bind(*args, **public_kwargs)",
+            "        bound = public.bind_partial(*args, **public_kwargs)",
+            "tests/rpc/test_validation.py"
+            "::test_arguments_that_do_not_fit_are_the_callers_mistake",
+        ),
+        (
+            "only the first variadic argument is coerced",
+            "python/tinyray/_serve.py",
+            "            bound.arguments[name] = tuple(_coerce_value(item, want) for item in value)",
+            "            bound.arguments[name] = tuple(\n"
+            "                _coerce_value(item, want) if index == 0 else item\n"
+            "                for index, item in enumerate(value)\n"
+            "            )",
+            "tests/rpc/test_validation.py"
+            "::test_the_annotation_covers_every_value_it_names",
+        ),
+        (
+            "a caller can forge an injected CallContext argument",
+            "python/tinyray/_serve.py",
+            "        public_kwargs = {key: value for key, value in kwargs.items() if key not in injected}",
+            "        public_kwargs = kwargs",
+            "tests/rpc/test_validation.py"
+            "::test_context_injection_preserves_python_binding_and_conversion",
+        ),
+        (
+            "a batch stops checking ownership between items",
+            "python/tinyray/_serve.py",
+            "            if not self.still_ours():",
+            "            if False:",
+            "tests/rpc/test_batch.py"
+            "::test_takeover_between_items_fences_the_remaining_prefix",
+        ),
+        (
+            "a batch continues after the first failed item",
+            "python/tinyray/_serve.py",
+            "            if result[0] != _native.RPC_STATUS_SUCCESS:",
+            "            if False:",
+            "tests/rpc/test_batch.py"
+            "::test_first_failure_stops_execution_with_completed_results",
+        ),
+        (
+            "dataclass arguments rebuild a generic MessagePack object graph",
+            "python/tinyray/_serve.py",
+            "        if raw and _takes_model(fn):",
+            "        if False:",
+            "tests/rpc/test_models.py"
+            "::test_typed_dataclass_rpc_skips_generic_object_graphs",
+        ),
+        (
+            "arbitrary-size integers stop using the reserved extension",
+            PY_MSGPACK,
+            "        except OverflowError:\n"
+            "            encoded = _encoder.encode(_prepare_bigints(value, set()))",
+            "        except ():\n"
+            "            encoded = _encoder.encode(_prepare_bigints(value, set()))",
+            "tests/rpc/test_codecs.py"
+            "::test_arbitrary_size_python_integers_round_trip_as_values_and_keys",
+        ),
+        (
+            "ordinary MessagePack encoding always opens BlobRef tracking",
+            PY_MSGPACK,
+            "    try:\n"
+            "        return _fast_encoder.encode(value), ()\n"
+            "    except (_BlobScopeRequired, OverflowError):\n"
+            "        return _encode_with_blob_scope(value)",
+            "    return _encode_with_blob_scope(value)",
+            "tests/rpc/test_codecs.py"
+            "::test_ordinary_values_skip_blob_tracking_scopes",
+        ),
+        (
+            "ordinary MessagePack decoding always opens BlobRef tracking",
+            PY_MSGPACK,
+            "    try:\n"
+            "        return fast_decoder.decode(raw)\n"
+            "    except _BlobScopeRequired:\n"
+            "        return _decode_with_scope(decoder, raw)",
+            "    return _decode_with_scope(decoder, raw)",
+            "tests/rpc/test_codecs.py"
+            "::test_ordinary_values_skip_blob_tracking_scopes",
+        ),
+        (
+            "framework dataclasses are silently encoded as standard dataclasses",
+            PY_MSGPACK,
+            "def dumps(value: Any) -> bytes:\n"
+            '    """Encode one application value with native MessagePack semantics."""\n'
+            "    _reject_pydantic_values(value)\n"
+            "    return _encode_prepared(value)[0]",
+            "def dumps(value: Any) -> bytes:\n"
+            '    """Encode one application value with native MessagePack semantics."""\n'
+            "    return _encode_prepared(value)[0]",
+            "tests/rpc/test_codecs.py"
+            "::test_framework_model_objects_and_types_are_explicitly_unsupported",
+        ),
+        (
+            "unsupported framework return types execute the remote method",
+            PY_RPC,
+            "        validate_type(return_type)\n"
+            "        return BoundMethod(self._handle, self._name, self._timeout, self._send, return_type)",
+            "        return BoundMethod(self._handle, self._name, self._timeout, self._send, return_type)",
+            "tests/rpc/test_codecs.py"
+            "::test_framework_model_objects_and_types_are_explicitly_unsupported",
+        ),
+        (
+            "the registry beat leaves Nagle enabled",
+            RS_MEMBERSHIP_HEARTBEAT,
+            "    stream\n"
+            "        .set_nodelay(true)\n"
+            '        .map_err(|e| format!("the connection came up but TCP_NODELAY failed: {e}"))\n',
+            "    stream\n"
+            "        .set_nodelay(false)\n"
+            '        .map_err(|e| format!("the connection came up but TCP_NODELAY failed: {e}"))\n',
+            "cargo:tinyray-membership",
+        ),
+        (
+            "the heartbeat reconnects for every beat",
+            RS_MEMBERSHIP_HEARTBEAT,
+            "            let sending = post(shared.clone(), &beat, budget, connection.take());",
+            "            let sending = post(shared.clone(), &beat, budget, None);",
+            "tests/registry/test_persistent_connections.py"
+            "::test_idle_heartbeats_reuse_one_clean_connection",
+        ),
+        (
+            "a stale registry reply is accepted on the reusable stream",
+            RS_MEMBERSHIP_HEARTBEAT,
+            "    if header.request_id != request_id {",
+            "    if false {",
+            "cargo:tinyray-membership",
+        ),
+        (
+            "member changes leave the scalar filter index stale",
+            RS_MEMBERSHIP_CACHE,
+            "            self.filter_index.get_mut().unwrap().invalidate();",
+            "",
+            "cargo:tinyray-membership",
+        ),
+        (
+            "the scalar filter index conflates booleans with integers",
+            RS_MEMBERSHIP_CACHE,
+            "            serde_json::Value::Bool(value) => Some(Self::Bool(*value)),",
+            "            serde_json::Value::Bool(value) => {\n"
+            "                Some(Self::I64(if *value { 1 } else { 0 }))\n"
+            "            }",
+            "cargo:tinyray-membership",
+        ),
+        (
+            "the registry reply body gets a fresh timeout budget",
+            RS_MEMBERSHIP_HEARTBEAT,
+            "    tokio::time::timeout_at(deadline, read_frame_body(reader, length))",
+            "    tokio::time::timeout(budget, read_frame_body(reader, length))",
+            "cargo:tinyray-membership",
+        ),
+        (
+            "a silent method socket gets a fresh first-frame deadline",
+            RS_SDK_TRANSPORT_SERVER,
+            "    tokio::time::timeout_at(deadline, reader.readable()).await",
+            "    tokio::time::timeout_at(deadline + SERVER_FRAME_TIMEOUT, reader.readable()).await",
+            "cargo:tinyray:transport::server::tests::silent_first_frame_readiness_uses_the_absolute_deadline",
+        ),
+        (
+            "the method frame body starts a fresh timeout budget",
+            RS_SDK_TRANSPORT_SERVER,
+            "    let bytes = tokio::time::timeout_at(deadline, read_frame_body(reader, length))\n"
+            "        .await\n"
+            "        .map_err(|_| ServerFrameError::TimedOut)?\n"
+            "        .map_err(ServerFrameError::Frame)?;\n"
+            "    Ok(AdmittedFrame {",
+            "    let bytes = tokio::time::timeout(SERVER_FRAME_TIMEOUT, read_frame_body(reader, length))\n"
+            "        .await\n"
+            "        .map_err(|_| ServerFrameError::TimedOut)?\n"
+            "        .map_err(ServerFrameError::Frame)?;\n"
+            "    Ok(AdmittedFrame {",
+            "cargo:tinyray:transport::server::tests::prefix_and_body_share_the_original_absolute_deadline",
+        ),
+        (
+            "method connections ignore their per-server admission limit",
+            RS_SDK_TRANSPORT_SERVER,
+            "    let server = server.clone().try_acquire_owned().ok()?;",
+            "    let server = Arc::new(Semaphore::new(1))\n"
+            "        .try_acquire_owned()\n"
+            "        .ok()?;",
+            "cargo:tinyray:transport::server::tests::connection_admission_is_global_and_per_server",
+        ),
+        (
+            "bulk method frames stop charging the per-server byte budget",
+            RS_SDK_TRANSPORT,
+            "            endpoint\n"
+            "                .bulk_bytes\n"
+            "                .clone()\n"
+            "                .try_acquire_many_owned(permits)\n"
+            "                .ok()?,",
+            "            endpoint\n"
+            "                .bulk_bytes\n"
+            "                .clone()\n"
+            "                .try_acquire_many_owned(1)\n"
+            "                .ok()?,",
+            "cargo:tinyray:transport::server::tests::bulk_server_frames_cannot_consume_the_small_control_frame_reserve",
+        ),
+        (
+            "bulk method frames stop charging the process byte budget",
+            RS_SDK_TRANSPORT,
+            "            global\n"
+            "                .bulk_bytes\n"
+            "                .clone()\n"
+            "                .try_acquire_many_owned(permits)\n"
+            "                .ok()?,",
+            "            global\n"
+            "                .bulk_bytes\n"
+            "                .clone()\n"
+            "                .try_acquire_many_owned(1)\n"
+            "                .ok()?,",
+            "cargo:tinyray:transport::server::tests::bulk_server_frame_bytes_are_bounded_globally",
+        ),
+        (
+            "bulk method reservations can consume the small control-frame reserve",
+            RS_SDK_TRANSPORT,
+            "    let (global_bytes, endpoint_bytes) = if length <= SMALL_FRAME_MAX_BYTES {",
+            "    let (global_bytes, endpoint_bytes) = if false {",
+            "cargo:tinyray:transport::server::tests::bulk_server_frames_cannot_consume_the_small_control_frame_reserve",
+        ),
+        (
+            "method RPC accepts 256 MiB frames again",
+            RS_RPC_PROTO,
+            "pub const MAX_RPC_FRAME_BYTES: usize = 32 << 20;",
+            "pub const MAX_RPC_FRAME_BYTES: usize = 256 << 20;",
+            "cargo:tinyray-proto:method_frames_keep_the_documented_control_plane_cap",
+        ),
+        (
+            "malformed typed method envelopes lose their request ID",
+            RS_SDK_TRANSPORT_SERVER,
+            "                    .write(RpcReply::error(\n"
+            "                        header.request_id,\n"
+            "                        RpcStatus::MalformedProtocol,",
+            "                    .write(RpcReply::error(\n"
+            "                        String::new(),\n"
+            "                        RpcStatus::MalformedProtocol,",
+            "tests/rpc/test_transport.py"
+            "::test_malformed_typed_envelopes_keep_the_minimal_request_id",
+        ),
+        (
+            "composite large-integer map keys lose their hashable shape",
+            PY_MSGPACK,
+            "            _encoded_item(_prepare_hashable(key, active)),",
+            "            _encoded_item(_prepare_bigints(key, active)),",
+            "tests/rpc/test_codecs.py"
+            "::test_composite_large_integer_keys_preserve_hashable_shapes",
+        ),
+        (
+            "a malformed extension map key escapes as an internal listener failure",
+            "python/tinyray/_serve.py",
+            "                except (BlobError, TypeError) as exc:\n"
+            "                    return _reply(\n"
+            "                        _native.RPC_STATUS_CALLER_FAULT,\n"
+            '                        error_type="TypeError",\n'
+            '                        message=f"{name}(): malformed MessagePack: {exc}",\n'
+            "                    )\n",
+            "",
+            "tests/rpc/test_codecs.py"
+            "::test_unhashable_extension_map_key_is_a_correlated_type_error",
+        ),
+        (
+            "a malformed extension batch key escapes as an internal listener failure",
+            "python/tinyray/_serve.py",
+            "        except (BlobError, TypeError) as exc:\n"
+            "            return _reply(\n"
+            "                _native.RPC_STATUS_CALLER_FAULT,\n"
+            '                error_type="TypeError",\n'
+            '                message=f"malformed batch MessagePack: {exc}",\n'
+            "            )\n",
+            "",
+            "tests/rpc/test_codecs.py"
+            "::test_unhashable_extension_map_key_is_a_correlated_type_error",
+        ),
+        (
+            "generated request IDs use an overlong caller identity verbatim",
+            PY_RPC,
+            "    if len(direct) <= _MAX_REQUEST_ID:\n"
+            "        return direct",
+            "    if True:\n"
+            "        return direct",
+            "tests/membership/test_identity_and_fencing.py"
+            "::test_generated_request_ids_bound_long_identities_without_colliding",
+        ),
+        (
+            "registry typed-envelope errors lose a recovered request ID",
+            RS_REGISTRY_SERVER,
+            "                send_error(\n"
+            "                    &mut writer,\n"
+            "                    request_id,\n"
+            '                    "malformed_request",\n'
+            "                    error.to_string(),\n"
+            "                )",
+            "                send_error(\n"
+            "                    &mut writer,\n"
+            "                    0,\n"
+            '                    "malformed_request",\n'
+            "                    error.to_string(),\n"
+            "                )",
+            "cargo:tinyray-registry",
+        ),
+        (
+            "registry envelope headers require a payload again",
+            RS_WIRE,
+            "pub struct RegistryEnvelopeHeader {\n"
+            "    pub request_id: u64,\n"
+            "    pub operation: String,\n"
+            "}",
+            "pub struct RegistryEnvelopeHeader {\n"
+            "    pub request_id: u64,\n"
+            "    pub operation: String,\n"
+            '    #[serde(rename = "payload")]\n'
+            "    _payload: serde::de::IgnoredAny,\n"
+            "}",
+            "cargo:tinyray-registry",
+        ),
+        (
+            "registry beat sockets are absent from the fork descriptor tracker",
+            RS_MEMBERSHIP_HEARTBEAT,
+            "            let fd = stream.as_raw_fd();\n"
+            "            shared.registry_fds.register(fd);",
+            "",
+            "tests/membership/test_fork.py"
+            "::test_a_forked_child_closes_inherited_registry_sockets_only",
+        ),
+        (
+            "a forked child forgets the heartbeat runtime before closing its sockets",
+            RS_LIB,
+            "        self.shared.registry_fds.close_all();\n"
+            "        if let Some(rt) = self.rt.lock().unwrap().take() {",
+            "        if let Some(rt) = self.rt.lock().unwrap().take() {",
+            "tests/membership/test_fork.py"
+            "::test_a_forked_child_closes_inherited_registry_sockets_only",
+        ),
+        (
+            "native listeners return to a fixed backlog of 128",
+            RS_WIRE,
+            "pub const OS_MAX_LISTEN_BACKLOG: i32 = i32::MAX;",
+            "pub const OS_MAX_LISTEN_BACKLOG: i32 = 128;",
+            "cargo:tinyray-proto",
+        ),
+        (
+            "native roster views survive changed member data",
+            RS_MEMBERSHIP_CACHE,
+            "            *self.native.get_mut().unwrap() = Default::default();",
+            "",
+            "cargo:tinyray-membership",
+        ),
+        (
+            "snapshot construction eagerly materializes every Handle",
+            PY_INIT,
+            "        snapshot._view = view\n"
+            "        snapshot._materialized = None\n"
+            "        snapshot._handle_cls = handle_cls",
+            "        snapshot._view = view\n"
+            "        snapshot._materialized = view.materialize(\n"
+            "            handle_cls._from_native, immutable=True\n"
+            "        )\n"
+            "        snapshot._handle_cls = handle_cls",
+            "tests/discovery/test_native_views.py"
+            "::test_snapshot_and_epoch_materialize_handles_only_when_requested",
+        ),
+        (
+            "native Handles eagerly copy state during construction",
+            PY_INIT,
+            "        handle._native = member\n"
+            "        handle._methods = methods\n"
+            "        return handle",
+            "        handle._native = member\n"
+            "        handle._methods = methods\n"
+            "        handle._state = member.materialize_state() or {}\n"
+            "        return handle",
+            "tests/discovery/test_native_views.py"
+            "::test_native_handles_keep_fields_and_state_lazy_while_proxying_methods",
+        ),
+        (
+            "native Handle state is never installed into its direct slot",
+            PY_INIT,
+            "            state = self._native.materialize_state() or {}\n"
+            "            self.state = state\n"
+            "            self._state = state\n"
+            "            return state",
+            "            state = self._native.materialize_state() or {}\n"
+            "            self._state = state\n"
+            "            return state",
+            "tests/discovery/test_native_views.py"
+            "::test_snapshot_and_epoch_materialize_handles_only_when_requested",
+        ),
+        (
+            "a roster state batch decodes again for every Handle",
+            PY_INIT,
+            "            self._states = states\n"
+            "            self._native = None",
+            "",
+            "tests/discovery/test_fast_lookups.py"
+            "::test_roster_state_batch_decodes_only_once",
+        ),
+        (
+            "small serialized state batches are never cached",
+            RS_MEMBERSHIP_CACHE,
+            "        if encoded.len() <= SNAPSHOT_BYTES {\n"
+            "            let _ = self.states.set(encoded.clone());\n"
+            "        }\n"
+            "        encoded",
+            "        encoded",
+            "cargo:tinyray-membership:tests::serialized_state_batches_are_cached_and_invalidated",
+        ),
+        (
+            "native count waits accept fewer members than requested",
+            RS_MEMBERSHIP_WAIT,
+            "                let ready = cached.is_some() && (matched as i128) >= *target;",
+            "                let ready = true;",
+            "tests/discovery/test_native_views.py"
+            "::test_built_in_waits_bypass_python_predicate_and_roster_loops",
+        ),
+        (
+            "native snapshots lose the cache revision they froze at",
+            RS_MEMBERSHIP_CACHE,
+            "    pub fn frozen(&self, require_ready: bool) -> FrozenPool {\n"
+            "        FrozenPool {\n"
+            "            members: self.native(require_ready),\n"
+            "            roster: self.roster,\n"
+            "            version: self.version,",
+            "    pub fn frozen(&self, require_ready: bool) -> FrozenPool {\n"
+            "        FrozenPool {\n"
+            "            members: self.native(require_ready),\n"
+            "            roster: self.roster,\n"
+            "            version: 0,",
+            "tests/discovery/test_native_views.py"
+            "::test_native_views_remain_frozen_and_state_copies_stay_isolated",
+        ),
+        (
+            "sync RPC eagerly extracts Python bytes into a Vec",
+            RS_RPC,
+            "    // PyBackedBytes avoids PyO3's eager Vec extraction copy at the FFI boundary.\n"
+            "    payload: PyBackedBytes,",
+            "    // PyBackedBytes avoids PyO3's eager Vec extraction copy at the FFI boundary.\n"
+            "    payload: Vec<u8>,",
+            "tests/project/test_bench.py"
+            "::test_native_bytes_boundaries_keep_zero_copy_pybacked_extraction",
+        ),
+        (
+            "async RPC eagerly extracts Python bytes into a Vec",
+            RS_RPC,
+            "    // Keep the borrowed Python buffer until the one owned async request copy.\n"
+            "    payload: PyBackedBytes,",
+            "    // Keep the borrowed Python buffer until the one owned async request copy.\n"
+            "    payload: Vec<u8>,",
+            "tests/project/test_bench.py"
+            "::test_native_bytes_boundaries_keep_zero_copy_pybacked_extraction",
+        ),
+        (
+            "RPC replies eagerly extract Python bytes into a Vec",
+            RS_RPC,
+            "                            u8,\n"
+            "                            PyBackedBytes,\n"
+            "                            String,",
+            "                            u8,\n"
+            "                            Vec<u8>,\n"
+            "                            String,",
+            "tests/project/test_bench.py"
+            "::test_native_bytes_boundaries_keep_zero_copy_pybacked_extraction",
+        ),
+        (
+            "the Python RPC adapter creates a second Tokio client runtime",
+            RS_RPC,
+            "            tinyray::Client::from_current().map_err(|error| error.to_string())?",
+            "            tinyray::Client::new(tinyray::ClientConfig::default())\n"
+            "                .map_err(|error| error.to_string())?",
+            "tests/project/test_bench.py"
+            "::test_native_rpc_binding_is_a_thin_public_transport_adapter",
+        ),
+        (
+            "Python async cancellation aborts without synchronously removing its waiter",
+            RS_RPC,
+            "    fn stop(&self) {\n"
+            "        self.cancellation.cancel();\n"
+            "        if let Some(task) = self.task.lock().unwrap().take() {",
+            "    fn stop(&self) {\n"
+            "        if let Some(task) = self.task.lock().unwrap().take() {",
+            "cargo:tinyray-client:rpc::tests::rpc_ticket_cancels_before_aborting_the_task",
+        ),
+        (
+            "the public Rust service SDK acquires a Python runtime dependency",
+            RS_SDK_MANIFEST,
+            "async-trait.workspace = true\nsha2.workspace = true",
+            'async-trait.workspace = true\npyo3 = "0.22"\nsha2.workspace = true',
+            "tests/project/test_api.py"
+            "::test_public_rust_sdk_has_no_python_runtime_dependency",
+        ),
+        (
+            "Rust service calls lose their request context",
+            RS_SDK_TRANSPORT_SERVER,
+            "                request_id: Arc::from(request_id.clone()),",
+            '                request_id: Arc::from(""),',
+            "cargo:tinyray",
+        ),
+        (
+            "Rust service target fencing is skipped",
+            RS_SDK_TRANSPORT_SERVER,
+            "        if request.target != state.identity {",
+            "        if false {",
+            "cargo:tinyray",
+        ),
+        (
+            "Rust service task completion cancels a partially read frame",
+            RS_SDK_TRANSPORT_SERVER,
+            "        let frame = tokio::select! {\n"
+            "            _ = state.shutdown.notified() => break,\n"
+            "            _ = connection.shutdown.notified() => break,\n"
+            "            frame = read_server_frame_after_first(\n"
+            "                &mut reader,\n"
+            "                first[0],\n"
+            "                &state.global_frames,\n"
+            "                &state.frames,\n"
+            "                deadline,\n"
+            "            ) => frame,\n"
+            "        };",
+            "        let frame = tokio::select! {\n"
+            "            _ = state.shutdown.notified() => break,\n"
+            "            _ = connection.shutdown.notified() => break,\n"
+            "            _ = requests.join_next(), if !requests.is_empty() => continue,\n"
+            "            frame = read_server_frame_after_first(\n"
+            "                &mut reader,\n"
+            "                first[0],\n"
+            "                &state.global_frames,\n"
+            "                &state.frames,\n"
+            "                deadline,\n"
+            "            ) => frame,\n"
+            "        };",
+            "cargo:tinyray:blob_capable_rust_transport_preserves_128_concurrent_raw_calls",
+        ),
+        (
+            "Rust batch items are dispatched out of order",
+            RS_SDK_SERVICE,
+            "        for (index, item) in envelope.calls.into_iter().enumerate() {",
+            "        for (index, item) in envelope.calls.into_iter().rev().enumerate() {",
+            "cargo:tinyray",
+        ),
+        (
+            "a delivered Rust call timeout is classified as not-delivered",
+            RS_SDK_TRANSPORT_CLIENT,
+            "        AbandonedCall::Written | AbandonedCall::Completed => {\n"
+            "            CallError::OutcomeUnknown(format!(\"{endpoint} did not answer before the call timeout\"))\n"
+            "        }",
+            "        AbandonedCall::Written | AbandonedCall::Completed => {\n"
+            "            CallError::NotDelivered(format!(\"{endpoint} did not answer before the call timeout\"))\n"
+            "        }",
+            "cargo:tinyray",
+        ),
+        (
+            "a reply that becomes ready after the absolute client deadline is accepted",
+            RS_SDK_TRANSPORT_CLIENT,
+            "    let result = match tokio::time::timeout_at(deadline, &mut receive).await {",
+            "    let result = match tokio::time::timeout_at(\n"
+            "        deadline + Duration::from_secs(60),\n"
+            "        &mut receive,\n"
+            "    )\n"
+            "    .await\n"
+            "    {",
+            "cargo:tinyray:late_abandoned_blob_replies_are_acked_and_connection_stays_reusable",
+        ),
+        (
+            "BlobRef descriptors skip the Linux boot identity check",
+            RS_BLOB,
+            "        if self.boot != boot_fingerprint()? {",
+            "        if false {",
+            "tests/rpc/test_blobref.py"
+            "::test_descriptor_rejects_boot_inode_fd_size_and_reuse",
+        ),
+        (
+            "BlobRef descriptors skip the inode reuse check",
+            RS_BLOB,
+            "            if metadata.ino() != self.inode {",
+            "            if false {",
+            "tests/rpc/test_blobref.py"
+            "::test_descriptor_rejects_boot_inode_fd_size_and_reuse",
+        ),
+        (
+            "BlobRef descriptors skip the mapping size bound",
+            RS_BLOB,
+            "        check_size(self.size, maximum)?;",
+            "",
+            "tests/rpc/test_blobref.py"
+            "::test_descriptor_rejects_boot_inode_fd_size_and_reuse",
+        ),
+        (
+            "BlobRef receivers accept an unsealed descriptor",
+            RS_BLOB,
+            "            if seals < 0 || seals & REQUIRED_SEALS != REQUIRED_SEALS {",
+            "            if false {",
+            "tests/rpc/test_blobref.py"
+            "::test_descriptor_rejects_boot_inode_fd_size_and_reuse",
+        ),
+        (
+            "BlobRef mappings request write access",
+            RS_BLOB,
+            "                libc::PROT_READ,",
+            "                libc::PROT_READ | libc::PROT_WRITE,",
+            "tests/rpc/test_blobref.py"
+            "::test_blobref_is_read_only_zero_copy_and_explicit_bytes_copy",
+        ),
+        (
+            "BlobRef MessagePack decoding eagerly copies payload bytes",
+            PY_MSGPACK,
+            "        blob = BlobRef.from_descriptor(raw)\n"
+            "        if state is not None:\n"
+            '            state["cache"][raw] = blob\n'
+            "        return blob",
+            "        blob = BlobRef.from_descriptor(raw)\n"
+            "        if state is not None:\n"
+            '            state["cache"][raw] = blob\n'
+            "        return bytes(blob)",
+            "tests/rpc/test_blobref.py"
+            "::test_blobref_messagepack_is_explicit_and_regular_bytes_are_unchanged",
+        ),
+        (
+            "outgoing RPC drops temporary BlobRef lifetime retention",
+            PY_RPC,
+            "    body, keepalive = dumps_with_blob_refs(payload)",
+            "    body, _ = dumps_with_blob_refs(payload)\n"
+            "    keepalive = ()",
+            "tests/rpc/test_blobref.py"
+            "::test_async_cancellation_retains_temporary_blob_until_delayed_decode",
+        ),
+        (
+            "Python BlobRef decoding skips the per-message count limit",
+            PY_MSGPACK,
+            '            if state["refs"] > _MAX_BLOB_REFS_PER_MESSAGE:',
+            "            if False:",
+            "tests/rpc/test_blobref.py"
+            "::test_decoder_deduplicates_descriptors_and_bounds_count_and_bytes",
+        ),
+        (
+            "Python BlobRef decoding skips the aggregate mapped-byte limit",
+            PY_MSGPACK,
+            "                if mapped > _MAX_BLOB_MAPPED_BYTES_PER_MESSAGE:",
+            "                if False:",
+            "tests/rpc/test_blobref.py"
+            "::test_decoder_deduplicates_descriptors_and_bounds_count_and_bytes",
+        ),
+        (
+            "Python BlobRef decoding maps duplicate descriptors repeatedly",
+            PY_MSGPACK,
+            '            cached = state["cache"].get(raw)\n'
+            "            if cached is not None:\n"
+            "                return cached._clone()",
+            "            cached = None\n"
+            "            if cached is not None:\n"
+            "                return cached._clone()",
+            "tests/rpc/test_blobref.py"
+            "::test_decoder_deduplicates_descriptors_and_bounds_count_and_bytes",
+        ),
+        (
+            "Rust BlobRef decoding skips the per-message count limit",
+            RS_BLOB,
+            "        if state.refs > state.limits.max_refs {",
+            "        if false {",
+            "cargo:tinyray",
+        ),
+        (
+            "Rust BlobRef decoding skips the aggregate mapped-byte limit",
+            RS_BLOB,
+            "        if state.mapped_bytes > state.limits.max_mapped_bytes {",
+            "        if false {",
+            "cargo:tinyray",
+        ),
+        (
+            "Rust BlobRef decoding maps duplicate descriptors repeatedly",
+            RS_BLOB,
+            "            if let Some(inner) = resources.cache.get(&key).and_then(Weak::upgrade) {\n"
+            "                return Ok(BlobRef {\n"
+            "                    inner: Some(inner),\n"
+            "                    decoded_handle,\n"
+            "                });\n"
+            "            }",
+            "            if let Some(inner) = None::<Arc<BlobInner>> {\n"
+            "                return Ok(BlobRef {\n"
+            "                    inner: Some(inner),\n"
+            "                    decoded_handle,\n"
+            "                });\n"
+            "            }",
+            "cargo:tinyray",
+        ),
+        (
+            "public BlobRef descriptor opens skip the process handle bound",
+            RS_BLOB,
+            "    if resources.handles >= MAX_DECODED_BLOB_HANDLES {",
+            "    if false {",
+            "tests/rpc/test_blobref.py"
+            "::test_public_from_descriptor_is_process_bounded",
+        ),
+        (
+            "Python RPC abandons delivered BlobRef owners",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            state.abandoned.insert(request_id.to_owned(), blob_owners);",
+            "            state.abandoned.insert(\n"
+            "                request_id.to_owned(),\n"
+            "                RpcBlobOwners::track(Vec::new()).unwrap(),\n"
+            "            );",
+            "tests/rpc/test_blobref.py"
+            "::test_async_cancellation_retains_temporary_blob_until_delayed_decode",
+        ),
+        (
+            "Rust RPC abandons delivered BlobRef owners",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            state.abandoned.insert(request_id.to_owned(), blob_owners);",
+            "            state.abandoned.insert(\n"
+            "                request_id.to_owned(),\n"
+            "                RpcBlobOwners::track(Vec::new()).unwrap(),\n"
+            "            );",
+            "cargo:tinyray",
+        ),
+        (
+            "forwarded BlobRef descriptors keep the original owner fd",
+            RS_BLOB,
+            "        #[cfg(target_os = \"linux\")]\n"
+            "        {\n"
+            "            let mut descriptor = inner.descriptor.clone();\n"
+            "            descriptor.owner_pid = std::process::id();\n"
+            "            descriptor.fd = inner.file.as_raw_fd();\n"
+            "            Ok(descriptor)\n"
+            "        }",
+            "        #[cfg(target_os = \"linux\")]\n"
+            "        {\n"
+            "            Ok(inner.descriptor.clone())\n"
+            "        }",
+            "tests/rpc/test_blobref.py"
+            "::test_exported_child_blobref_serializes_child_owned_descriptor",
+        ),
+        (
+            "BlobRef tokens use deterministic zero bytes instead of getrandom",
+            RS_BLOB,
+            "            fill_token(&mut token)?;",
+            "            token.fill(0);",
+            "cargo:tinyray",
+        ),
+        (
+            "BlobRef descriptor validation skips the header token",
+            RS_BLOB,
+            "        && header[8..24] == descriptor.token",
+            "        && true",
+            "tests/rpc/test_blobref.py"
+            "::test_descriptor_rejects_boot_inode_fd_size_and_reuse",
+        ),
+        (
+            "Python serialization misses nested BlobRef owners",
+            PY_MSGPACK,
+            '            state["owners"].append(value)',
+            "            pass",
+            "tests/rpc/test_blobref.py"
+            "::test_async_cancellation_retains_temporary_blob_until_delayed_decode",
+        ),
+        (
+            "native BlobRef construction skips fork registration",
+            RS_CLIENT_BLOB,
+            "        states.push(Arc::downgrade(&state));",
+            "",
+            "tests/rpc/test_blobref.py"
+            "::test_public_blobref_constructors_are_registered_for_fork_cleanup",
+        ),
+        (
+            "service replies drop BlobRef owners before acknowledgement",
+            RS_SDK_TRANSPORT_SERVER,
+            "            connection_for_request.admit_blob_response(&mut reply, blob_owners);",
+            "            connection_for_request.admit_blob_response(&mut reply, Vec::new());",
+            "tests/rpc/test_blobref.py"
+            "::test_blob_response_ack_releases_temporary_service_owners",
+        ),
+        (
+            "BlobRef replies skip the per-reply owner-count limit",
+            RS_SDK_TRANSPORT_SERVER,
+            "        if unique.len() > self.max_blob_refs_per_reply {",
+            "        if false {",
+            "cargo:tinyray",
+        ),
+        (
+            "BlobRef replies skip the per-reply byte limit",
+            RS_SDK_TRANSPORT_SERVER,
+            "        if bytes > self.max_blob_bytes_per_reply {",
+            "        if false {",
+            "cargo:tinyray",
+        ),
+        (
+            "outstanding BlobRef replies skip count admission",
+            RS_SDK_TRANSPORT,
+            "        if state.refs.checked_add(refs)? > self.max_refs",
+            "        if false",
+            "cargo:tinyray",
+        ),
+        (
+            "outstanding BlobRef replies skip byte admission",
+            RS_SDK_TRANSPORT,
+            "            || state.bytes.checked_add(bytes)? > self.max_bytes",
+            "            || false",
+            "cargo:tinyray",
+        ),
+        (
+            "Rust raw replies acknowledge BlobRefs before caller decoding",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            _ack: self._ack,",
+            "            _ack: None,",
+            "cargo:tinyray",
+        ),
+        (
+            "fork reset leaves native-only RPC BlobRef owners alive",
+            RS_RPC,
+            "    if let Some(inherited) = slot.take() {\n"
+            "        inherited.abandon_after_fork();\n"
+            "        std::mem::forget(inherited);\n"
+            "    }",
+            "    if let Some(inherited) = slot.take() {\n"
+            "        std::mem::forget(inherited);\n"
+            "    }",
+            "tests/rpc/test_blobref.py"
+            "::test_fork_clears_native_pending_blob_owners_before_runtime_forget",
+        ),
+        (
+            "forked BlobRef serialization keeps the parent pid",
+            RS_BLOB,
+            "        #[cfg(target_os = \"linux\")]\n"
+            "        {\n"
+            "            let mut descriptor = inner.descriptor.clone();\n"
+            "            descriptor.owner_pid = std::process::id();\n"
+            "            descriptor.fd = inner.file.as_raw_fd();\n"
+            "            Ok(descriptor)\n"
+            "        }",
+            "        #[cfg(target_os = \"linux\")]\n"
+            "        {\n"
+            "            Ok(inner.descriptor.clone())\n"
+            "        }",
+            "cargo:tinyray",
+        ),
+        (
+            "Rust MessagePack decoding accepts trailing bytes",
+            RS_BLOB,
+            "    if decoder.get_ref().position() != bytes.len() as u64 {",
+            "    if false {",
+            "cargo:tinyray",
+        ),
+        (
+            "BlobRef file ingestion mutates the caller cursor",
+            RS_BLOB,
+            "    file.read_at(data, offset)",
+            "    let mut shared = file.try_clone()?;\n"
+            "    shared.seek(SeekFrom::Start(offset))?;\n"
+            "    std::io::Read::read(&mut shared, data)",
+            "cargo:tinyray",
+        ),
+        (
+            "BlobRef file ingestion misses truncation",
+            RS_BLOB,
+            "        if count == 0 {\n"
+            "            return Err(BlobError::Invalid(\n"
+            '                "source file changed while creating BlobRef".into(),\n'
+            "            ));\n"
+            "        }",
+            "        if count == 0 {\n"
+            "            break;\n"
+            "        }",
+            "cargo:tinyray",
+        ),
+        (
+            "BlobRef response acknowledgements do not release owners",
+            RS_SDK_TRANSPORT_SERVER,
+            "        self.blob_responses.lock().unwrap().remove(request_id);",
+            "        let _ = request_id;",
+            "tests/rpc/test_blobref.py"
+            "::test_blob_response_ack_releases_temporary_service_owners",
+        ),
+        (
+            "Rust client idle eviction ignores guarded BlobRef replies",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            if reply.blob_refs {\n"
+            "                state.guarded_replies.insert(reply.request_id.clone());\n"
+            "            }",
+            "",
+            "cargo:tinyray:raw_reply_guard_holds_blob_owner_until_decode_or_drop",
+        ),
+        (
+            "Python client idle eviction ignores guarded BlobRef replies",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            if reply.blob_refs {\n"
+            "                state.guarded_replies.insert(reply.request_id.clone());\n"
+            "            }",
+            "",
+            "tests/rpc/test_blobref.py"
+            "::test_native_raw_reply_guard_survives_client_and_server_idle_deadlines",
+        ),
+        (
+            "server idle expiry ignores unacknowledged BlobRef replies",
+            RS_SDK_TRANSPORT_SERVER,
+            "        responses\n"
+            "            .values()\n"
+            "            .map(|lease| lease.expires_at)\n"
+            "            .min()\n"
+            "            .map(TokioInstant::from_std)\n"
+            "            .unwrap_or_else(|| TokioInstant::now() + SERVER_FRAME_TIMEOUT)",
+            "        TokioInstant::now() + SERVER_FRAME_TIMEOUT",
+            "cargo:tinyray",
+        ),
+        (
+            "Python partial batch missing-method drops completed BlobRef owners",
+            "python/tinyray/_serve.py",
+            '                    message=f"no method {name!r}",\n'
+            "                    batch_index=index,\n"
+            "                    completed=index,\n"
+            "                    blob_owners=tuple(blob_owners),",
+            '                    message=f"no method {name!r}",\n'
+            "                    batch_index=index,\n"
+            "                    completed=index,",
+            "tests/rpc/test_blobref.py"
+            "::test_partial_batch_missing_method_keeps_completed_blob",
+        ),
+        (
+            "Python partial batch fencing drops completed BlobRef owners",
+            "python/tinyray/_serve.py",
+            '                    message=f"{self.identity} is held by a later tenure",\n'
+            "                    batch_index=index,\n"
+            "                    completed=index,\n"
+            "                    blob_owners=tuple(blob_owners),",
+            '                    message=f"{self.identity} is held by a later tenure",\n'
+            "                    batch_index=index,\n"
+            "                    completed=index,",
+            "tests/rpc/test_blobref.py"
+            "::test_partial_batch_fencing_keeps_completed_blob",
+        ),
+        (
+            "Rust non-success conversion drops the BlobRef ACK guard",
+            RS_SDK_TRANSPORT_CLIENT,
+            "        _blob_ack: ack,",
+            "        _blob_ack: None,",
+            "cargo:tinyray",
+        ),
+        (
+            "Python late abandoned BlobRef replies omit their ACK",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            if reply.blob_refs {\n"
+            "                self.queue_blob_ack(&reply.request_id);\n"
+            "            }\n"
+            "            if close {",
+            "            if close {",
+            "tests/rpc/test_blobref.py"
+            "::test_late_blob_replies_are_acked_after_timeout_and_async_cancellation",
+        ),
+        (
+            "Rust late abandoned BlobRef replies omit their ACK",
+            RS_SDK_TRANSPORT_CLIENT,
+            "            if reply.blob_refs {\n"
+            "                self.queue_blob_ack(&reply.request_id);\n"
+            "            }\n"
+            "            if close {",
+            "            if close {",
+            "cargo:tinyray:late_abandoned_blob_replies_are_acked_and_connection_stays_reusable",
+        ),
+        (
+            "Python pending connects are not registered before await",
+            RS_SDK_TRANSPORT_CLIENT,
+            "        client.fds.register(fd);\n"
+            "        Self {\n"
+            "            socket: Some(socket),\n"
+            "            fd,\n"
+            "            pid: client.pid,\n"
+            "            client: Arc::downgrade(client),\n"
+            "            transferred: false,\n"
+            "        }",
+            "        Self {\n"
+            "            socket: Some(socket),\n"
+            "            fd,\n"
+            "            pid: client.pid,\n"
+            "            client: Arc::downgrade(client),\n"
+            "            transferred: false,\n"
+            "        }",
+            "tests/membership/test_fork.py"
+            "::test_fork_closes_a_connect_in_progress_rpc_socket_and_parent_continues",
+        ),
+        (
+            "Rust pending connects are not registered before await",
+            RS_SDK_TRANSPORT_CLIENT,
+            "        client.fds.register(fd);\n"
+            "        Self {\n"
+            "            socket: Some(socket),\n"
+            "            fd,\n"
+            "            pid: client.pid,\n"
+            "            client: Arc::downgrade(client),\n"
+            "            transferred: false,\n"
+            "        }",
+            "        Self {\n"
+            "            socket: Some(socket),\n"
+            "            fd,\n"
+            "            pid: client.pid,\n"
+            "            client: Arc::downgrade(client),\n"
+            "            transferred: false,\n"
+            "        }",
+            "cargo:tinyray:fork_closes_a_connect_in_progress_rust_client_socket",
+        ),
+        (
+            "Rust service readiness wait consumes the first frame byte",
+            RS_SDK_TRANSPORT_SERVER,
+            "async fn wait_server_readable(\n"
+            "    reader: &mut OwnedReadHalf,\n"
+            "    deadline: TokioInstant,\n"
+            ") -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {\n"
+            "    tokio::time::timeout_at(deadline, reader.readable()).await\n"
+            "}",
+            "async fn wait_server_readable(\n"
+            "    reader: &mut OwnedReadHalf,\n"
+            "    deadline: TokioInstant,\n"
+            ") -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {\n"
+            "    tokio::time::timeout_at(deadline, async {\n"
+            "        let mut consumed = [0u8; 1];\n"
+            "        reader.read(&mut consumed).await.map(|_| ())\n"
+            "    })\n"
+            "    .await\n"
+            "}",
+            "cargo:tinyray:ordinary_raw_128_way_multiplexing_keeps_frame_boundaries",
+        ),
+        (
+            "Rust discovery snapshots ignore their filter",
+            RS_SDK_DISCOVERY,
+            "            .map(|pool| Snapshot::new(self.name.clone(), pool.filtered(&filter, require_ready))))",
+            "            .map(|pool| Snapshot::new(self.name.clone(), pool.frozen(require_ready))))",
+            "cargo:tinyray:public_discovery_views_filter_freeze_wait_and_track_replacements",
+        ),
+        (
+            "Rust discovery count ignores its filter",
+            RS_SDK_DISCOVERY,
+            "            .map(|pool| pool.count(&filter, require_ready))",
+            "            .map(|pool| pool.ids(require_ready).len())",
+            "cargo:tinyray:public_discovery_views_filter_freeze_wait_and_track_replacements",
+        ),
+        (
+            "Rust async discovery waits are never notified",
+            RS_MEMBERSHIP_SHARED,
+            "        self.revision_notify.notify_waiters();",
+            "",
+            "cargo:tinyray:public_discovery_views_filter_freeze_wait_and_track_replacements",
+        ),
+        (
+            "Rust discovery epochs never invalidate",
+            RS_SDK_DISCOVERY,
+            "    pub fn valid(&self) -> bool {\n"
+            "        self.shared\n"
+            "            .epoch_valid(self.snapshot.pool(), self.snapshot.roster())\n"
+            "    }",
+            "    pub fn valid(&self) -> bool {\n"
+            "        true\n"
+            "    }",
+            "cargo:tinyray:public_discovery_views_filter_freeze_wait_and_track_replacements",
+        ),
+        (
+            "Rust server copies the decoded RPC payload twice",
+            RS_SDK_TRANSPORT_SERVER,
+            "        payload: Arc::from(request.payload),",
+            "        payload: Arc::from(request.payload.to_vec()),",
+            "tests/project/test_bench.py"
+            "::test_rust_server_borrows_rpc_payload_before_its_single_owned_copy",
+        ),
+        (
+            "Rust MemberBuilder creates a second client runtime",
+            RS_SDK_MEMBER,
+            "        let client = rpc_runtime.client();",
+            "        let client = Client::new(crate::ClientConfig {\n"
+            "            worker_threads: self.rpc_worker_threads,\n"
+            "        })?;",
+            "cargo:tinyray:member_builder_shares_one_rpc_worker_pool",
+        ),
+        (
+            "Rust MemberBuilder creates a second server runtime",
+            RS_SDK_MEMBER,
+            "            let server = rpc_runtime.start_server(config, owned)?;",
+            "            let server = Server::start(config, owned)?;",
+            "cargo:tinyray:member_builder_shares_one_rpc_worker_pool",
+        ),
+        (
+            "membership owns the fork-safe FD utility again",
+            RS_MEMBERSHIP_MANIFEST,
+            'tinyray-core = { path = "../tinyray-core" }\n',
+            "",
+            "tests/project/test_api.py"
+            "::test_rust_workspace_keeps_core_membership_and_sdk_layers_separate",
+        ),
+    ]
+)
+# fmt: on
 
 
 def build() -> bool:
@@ -1601,7 +3011,7 @@ def check_cargo_packages() -> list[str]:
 
     `cargo metadata --no-deps` answers in 0.021s, so this is free.
     """
-    wanted = {t.split(":", 1)[1] for *_, t in MUTANTS if t.startswith("cargo:")}
+    wanted = {t.split(":", 2)[1] for *_, t in MUTANTS if t.startswith("cargo:")}
     if not wanted:
         return []
     out = subprocess.run(
@@ -1669,8 +3079,12 @@ def main() -> int:
                 # on loopback, so a deadline that stopped following the
                 # interval would cost nothing there and everything on a real
                 # link.
+                cargo_target = test.split(":", 2)
+                command = ["cargo", "test", "-q", "-p", cargo_target[1]]
+                if len(cargo_target) == 3:
+                    command.extend([cargo_target[2], "--", "--exact", "--test-threads=1"])
                 r = subprocess.run(
-                    ["cargo", "test", "-q", "-p", test.split(":", 1)[1]],
+                    command,
                     cwd=ROOT,
                     capture_output=True,
                     text=True,

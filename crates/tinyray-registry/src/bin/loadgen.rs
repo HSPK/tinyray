@@ -1,66 +1,111 @@
 //! Drives many members against a registry from one process, so scale tests do
 //! not need thousands of Python interpreters.
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tinyray_proto::wire::{
+    decode_message, read_frame, write_frame, RegistryEnvelope, RegistryEnvelopeHeader,
+    RegistryProtocolError, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, OP_BEAT, OP_BEAT_ACK,
+    OP_ERROR,
+};
 use tinyray_proto::{Beat, BeatAck};
+use tokio::net::TcpStream;
+
+async fn request_beat(
+    endpoint: &str,
+    body: &Beat,
+    connection: Option<TcpStream>,
+    connections: &AtomicU64,
+) -> Result<(BeatAck, TcpStream), String> {
+    static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let mut stream = match connection {
+        Some(stream) => stream,
+        None => {
+            let stream = TcpStream::connect(endpoint)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            stream
+                .set_nodelay(true)
+                .map_err(|e| format!("TCP_NODELAY: {e}"))?;
+            connections.fetch_add(1, Ordering::Relaxed);
+            stream
+        }
+    };
+    let request = RegistryEnvelope::new(request_id, OP_BEAT, body);
+    write_frame(&mut stream, &request, MAX_REQUEST_FRAME_BYTES)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let raw = read_frame(&mut stream, MAX_RESPONSE_FRAME_BYTES)
+        .await
+        .map_err(|e| format!("read: {e}"))?
+        .ok_or_else(|| "read: EOF before reply".to_string())?;
+    let header: RegistryEnvelopeHeader =
+        decode_message(&raw).map_err(|e| format!("envelope: {e}"))?;
+    if header.request_id != request_id {
+        return Err(format!(
+            "correlation: got {}, expected {request_id}",
+            header.request_id
+        ));
+    }
+    match header.operation.as_str() {
+        OP_BEAT_ACK => {
+            let reply: RegistryEnvelope<BeatAck> =
+                decode_message(&raw).map_err(|e| format!("BeatAck: {e}"))?;
+            Ok((reply.payload, stream))
+        }
+        OP_ERROR => {
+            let reply: RegistryEnvelope<RegistryProtocolError> =
+                decode_message(&raw).map_err(|e| format!("protocol error: {e}"))?;
+            Err(format!("{}: {}", reply.payload.code, reply.payload.message))
+        }
+        operation => Err(format!("unexpected reply operation {operation:?}")),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut endpoint = "http://127.0.0.1:8760".to_string();
+    let mut endpoint = "127.0.0.1:8760".to_string();
     let mut members = 1000usize;
     let mut secs = 5u64;
     let mut interval_ms = 500u64;
     let mut watchers = 1usize;
     let mut offset = 0usize;
-    let mut conns = 16usize;
+    let mut _connections_hint = 16usize;
     let mut watch_pool = "load".to_string();
     let mut hold = 0u64;
+    let mut reconnect_every_beat = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--endpoint" => endpoint = args.next().map(|e| format!("http://{e}")).unwrap(),
+            "--endpoint" => endpoint = args.next().unwrap(),
             "--members" => members = args.next().unwrap().parse()?,
             "--seconds" => secs = args.next().unwrap().parse()?,
             "--interval-ms" => interval_ms = args.next().unwrap().parse()?,
             "--watchers" => watchers = args.next().unwrap().parse()?,
             "--offset" => offset = args.next().unwrap().parse()?,
-            "--conns" => conns = args.next().unwrap().parse()?,
+            // Kept so existing benchmark command lines continue to parse.
+            // Each synthetic member now owns one serial persistent socket.
+            "--conns" => _connections_hint = args.next().unwrap().parse()?,
             "--watch-pool" => watch_pool = args.next().unwrap(),
             "--hold-ms" => hold = args.next().unwrap().parse()?,
+            "--reconnect-every-beat" => reconnect_every_beat = true,
             o => return Err(format!("unknown argument {o}").into()),
         }
     }
 
-    // One h2 connection multiplexes, but only up to the server's stream limit.
-    // A real process holds one member; simulating thousands from one process
-    // needs several connections or we measure stream queueing, not the server.
-    let clients: Vec<Arc<Client<_, Full<Bytes>>>> = (0..conns)
-        .map(|_| {
-            Arc::new(
-                Client::builder(TokioExecutor::new())
-                    .timer(TokioTimer::new())
-                    .http2_only(true)
-                    .pool_max_idle_per_host(64)
-                    .build_http(),
-            )
-        })
-        .collect();
     let ok = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
+    let connections = Arc::new(AtomicU64::new(0));
     let lat_us = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     let deadline = Instant::now() + Duration::from_secs(secs);
 
     let mut tasks = Vec::new();
     for i in 0..members {
-        let http = clients[i % conns].clone();
         let (ok, failed, ep) = (ok.clone(), failed.clone(), endpoint.clone());
+        let connections = connections.clone();
         let lat = lat_us.clone();
         let watch_pool = watch_pool.clone();
         tasks.push(tokio::spawn(async move {
@@ -75,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut seen: HashMap<String, u64> = HashMap::new();
             let mut last_count = 0usize;
+            let mut connection = None;
             while Instant::now() < deadline {
                 let beat = Beat {
                     pool: "load".into(),
@@ -94,31 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seen: seen.clone(),
                     hold_ms: hold,
                 };
-                let body = Full::new(Bytes::from(serde_json::to_vec(&beat).unwrap()));
-                let req = hyper::Request::builder()
-                    .method("POST")
-                    .uri(format!("{ep}/v1/beat"))
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .unwrap();
                 let sent = Instant::now();
-                match http.request(req).await {
-                    Ok(r) => {
+                match request_beat(&ep, &beat, connection.take(), &connections).await {
+                    Ok((ack, returned)) => {
+                        if !reconnect_every_beat {
+                            connection = Some(returned);
+                        }
                         lat.lock().unwrap().push(sent.elapsed().as_micros() as u64);
-                        // h2 trips its own flood protection when one connection
-                        // carries thousands of requests a second. A real member
-                        // beats about once a second, so this is a harness limit.
-                        let Ok(collected) = r.into_body().collect().await else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-                            continue;
-                        };
-                        let Ok(ack) = serde_json::from_slice::<BeatAck>(&collected.to_bytes())
-                        else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-                            continue;
-                        };
                         for (n, d) in &ack.pools {
                             seen.insert(n.clone(), d.version);
                             if d.full {
@@ -158,11 +186,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     println!(
-        "{{\"members\":{},\"watcher_saw\":{},\"beats_ok\":{},\"beats_failed\":{},\"ops_per_s\":{:.0},\"p50_us\":{},\"p99_us\":{},\"max_us\":{}}}",
+        "{{\"members\":{},\"watcher_saw\":{},\"beats_ok\":{},\"beats_failed\":{},\"connections\":{},\"reuses\":{},\"ops_per_s\":{:.0},\"p50_us\":{},\"p99_us\":{},\"max_us\":{}}}",
         members,
         watcher_saw,
         ok.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
+        connections.load(Ordering::Relaxed),
+        ok.load(Ordering::Relaxed).saturating_sub(connections.load(Ordering::Relaxed)),
         ok.load(Ordering::Relaxed) as f64 / el,
         q(0.50), q(0.99), q(1.0)
     );

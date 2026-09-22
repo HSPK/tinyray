@@ -7,16 +7,19 @@ edition.workspace = true
 name = "_tinyray"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+gil-refs = []
+
 [dependencies]
 tinyray-proto = { path = "../tinyray-proto" }
 tinyray-registry = { path = "../tinyray-registry" }
+tinyray = { path = "../tinyray" }
+tinyray-membership = { path = "../tinyray-membership" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-http-body-util.workspace = true
-bytes.workspace = true
+rmp-serde.workspace = true
+async-trait.workspace = true
 fastrand = "2"
 pyo3 = { version = "0.22", features = ["extension-module"] }
 

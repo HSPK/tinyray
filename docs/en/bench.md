@@ -15,13 +15,19 @@ python bench.py --only rpc_latency    # one scenario
 python bench.py --check               # compare against bench-baseline.json,
                                       # non-zero exit on a regression
 python bench.py --only point_lookup rpc_batch
-python bench.py --only rpc_models     # dict, dataclass, Pydantic, manual codecs
+python bench.py --only rpc_models     # dict, dataclass, typed containers, manual codecs
+python bench.py --only rust_service   # Rust handler versus Python/GIL handler
+python bench.py --only blobref        # bytes versus same-host sealed memfd references
+python bench.py --only filter_index   # cold/warm scalar-filter indexing at 100/1,000/5,000
+python bench.py --only registry_connections  # persistent vs per-beat reconnect, 1,000 members
+python bench.py --only idle_waiters    # whether heartbeats wake 1,000 quiet watchers
 python bench.py --only discovery watch_wakeup --coalesce-ms 1
 ```
 
-Every scenario feature-detects: this one script has to run against old wheels,
-reporting `n/a` for what it cannot do rather than crashing, or cross-version
-comparison is impossible.
+Every scenario feature-detects within one wire generation, reporting `n/a`
+for what it cannot do rather than crashing. The 0.18 native registry and
+method transports are hard cutovers with no HTTP fallback; older wheels need
+their matching historical benchmark script.
 
 Known unsupported features are labeled `unsupported`; execution failures are
 errors and exit non-zero. `--check` also refuses missing metrics, empty
@@ -36,52 +42,204 @@ explicit low-latency policy against a default-policy baseline.
 
 `rpc_latency` and `rpc_throughput` retain the historical same-process topology.
 Use `rpc_latency_separate` and `rpc_concurrency` for a callee with its own GIL.
+`rpc_concurrency` measures 1/4/8/32/128 callers, p50/p99 and physical client
+connections; it therefore distinguishes multiplexing from merely opening more
+sockets.
 `rpc_batch` compares the same 32 logical calls individually and in one request,
 not 32 requests against one logical operation. `point_lookup` uses stable
-seated rosters up to 5,000 members. `all_filtered_ms` and `pick_filtered_ms`
-now measure the operations their names describe. `rpc_models` interleaves plain
-dicts, automatic dataclass/Pydantic conversion, and equivalent hand-written
+seated rosters up to 5,000 members and separates `snapshot_ms` (creating only
+the frozen native view) from `snapshot_materialize_ms` (first creation of all
+Handles). It also reports frozen-view len/slot/get, an already-satisfied
+`wait(count)`, epoch creation, and epoch materialization. State measurements
+separate the first batched decode (`all_state_ms` / `snapshot_state_ms`) from
+direct slot reads on the same Handles (`cached_all_state_ms` /
+`cached_snapshot_state_ms`). At 5,000 members, five-run medians are
+4.8658/5.0067 ms and 0.1648/0.2499 ms respectively; Handle-only all/snapshot
+materialization is 1.3480/1.3778 ms.
+`all_filtered_ms` and `pick_filtered_ms` now measure their named operations.
+`filter_index` reports cold construction and warm hits for count, pick, all,
+and wait at 100/1,000/5,000 members, plus live entry/byte counters and every
+configured bound. At 5,000 members the three-run medians are 0.000561 ms for
+warm count and 0.001783 ms for warm pick, versus 0.444125/0.447807 ms to build
+the first result. The one cached 625-member result is estimated at 5,143
+bytes; warm all/wait still materialize those matches and measure
+0.160748/0.162572 ms.
+`rpc_models` interleaves plain
+dicts, automatic dataclass/typed-container conversion, and equivalent hand-written
 conversion. It reports codec microseconds and complete RPC round trips
 separately so network cost is not mislabeled serialization cost.
 
 The 50 ms default coalescing budget is a traffic/latency choice, not a network
 floor. `discovery` measures a burst; `discovery_spaced` spaces changes by
 150 ms. Lower `coalesce_ms` explicitly to measure the latency/load tradeoff.
+`idle_beat_rate` also reports new connections and reused requests during the
+window. `registry_connections` has 1,000 members send six beats each:
+persistent mode accepts 1,000 sockets for 6,000 frames, while reconnecting
+each beat accepts 6,000—an **83.3%** reduction with the same 6,000 successful
+beats. The scenario also requires all 1,000 leases to remain present, reports
+zero failed beats, and compares p50/p99/max latency for persistent and
+reconnecting modes; the benchmark gate watches their median-latency ratio.
+`idle_waiters` parks 1,000 quiet watchers on one event loop and waits through
+four lease renewals. Its five-run median is **0 rechecks, 0 discovery wakes,
+and 1.684 ms CPU**. The former per-beat broadcast caused 4,000 rechecks and
+about 55 ms CPU, so both rechecks and wakeups are hard gates.
+
+With least-loaded scaling, the three-run separate-process medians are
+12,552 calls/s at 8 callers, 12,253 at 32 and 11,543 at 128. Four and eight
+callers use 2 and 4 client connections; 32 and 128 remain capped at 4, a
+96.875% socket reduction at 128 callers. Eight-caller p50/p99 are
+0.602158/1.832874 ms, and all three calibration p99s stayed at or below
+2.734274 ms.
+
+`rust_service` uses the same standalone Rust SDK client and native transport
+against both handlers. Three-run medians:
+
+| Workload | Python handler | Rust handler |
+|---|---:|---:|
+| Raw no-op p50 | 0.174334 ms | **0.097581 ms** |
+| 64 KiB p50 | 0.339040 ms | **0.216983 ms** |
+| Typed payload p50 | 0.181216 ms | **0.098363 ms** |
+| 32-item batch | 0.364817 ms | **0.114883 ms** |
+| 8 callers | 14,233/s | **56,090/s** |
+| 32 callers | 13,703/s | **114,551/s** |
+| 128 callers | 13,184/s | **129,489/s** |
+
+Both sides use four client connections at 8/32/128 callers. Rust handlers run
+directly on Tokio; Python handlers use the compatibility adapter on the same
+listener and transport.
+
+`rust_discovery` compares the public Rust SDK's Arc-backed views with the old
+owned `Member::members()` clone. Across 100/1,000/5,000 members, the three-run
+median snapshot creation time stays near 0.00007 ms. Materializing 5,000
+`MemberRef` values takes about 0.0778 ms versus 2.518 ms for complete
+member/state clones, a **34.1x** speedup. Warm filtered count is about
+0.00027 ms and pick about 0.00033 ms. Build it with
+`cargo build --release -p tinyray --example rust_discovery_bench`.
+
+`rpc_copy_profile` separates payload cloning, envelope encoding, and decoding.
+After the server switched to a borrowed MessagePack request, decoding a 64 KiB
+payload and making its single Arc-owned copy takes 1.693 us versus 81.782 us
+for the old owned decode, about **48.5x** faster. At 1 MiB the figures are
+30.136 and 59.911 us, about **2.0x**. In three end-to-end runs, ordinary
+64 KiB RPC moved from the 0.4443 ms baseline to 0.4104 ms, while the Rust
+handler's 64 KiB path moved from 0.2170 to 0.1786 ms. Wire and public APIs are
+unchanged.
+
+`rust_runtime` counts the native workers of a serving Rust member directly:
+membership keeps two workers, while RPC client and server share four, for
+**six total**. Before sharing this was 2 + 4 + 4, or ten. Three cold joins
+ranged from 0.94 to 1.18 ms with a 1.02 ms median. The public `RpcRuntime`
+also lets applications explicitly share a worker pool across clients and
+servers.
+
+`blobref` reports creation separately from reused-reference calls and direct
+mapped access. Three-run medians:
+
+| 16 MiB topology | Ordinary bytes call | Reused BlobRef call | Blob wire |
+|---|---:|---:|---:|
+| Python same process | 24.446 ms | **0.329 ms** | 166 B |
+| Python separate process | 24.630 ms | **0.311 ms** | 167 B |
+| Rust same process | 160.679 ms | **0.150 ms** | 165 B |
+| Rust separate process | 63.360 ms | **0.179 ms** | 168 B |
+
+The ordinary MessagePack argument is 16,777,236 bytes. BlobRef creation is a
+separate one-time copy (about 7 ms in Python and 12.8 ms in the Rust
+same-process calibration); reused calls and mapped access are nearly
+size-independent.
 
 For registry-only work, build and run the portable
 `crates/tinyray-registry/examples/perf_registry.rs` example. Its output
-distinguishes owned acknowledgment assembly from HTTP/shared-response costs;
-do not report the former as end-to-end throughput.
+distinguishes owned acknowledgment assembly from native framed
+MessagePack/shared-response costs; do not report the former as end-to-end
+throughput.
 
-### Typed RPC measurements
+### Native method RPC hard-cutover measurements (0.18)
 
-Python 3.12.13 on the same 24-vCPU AMD EPYC host, same-process topology, with
-five paths rotated on every round and 1,000 calls per path. These are medians
-from three independent runs:
+Python 3.11.15 on a 24-vCPU AMD EPYC host, comparing three release-mode runs
+of the published 0.17.0 wheel (HTTP/JSON) with three runs of 0.18 native
+TCP/MessagePack. Runs were sequential on the same host. The machine was shared,
+with one-minute load averages between 12.7 and 16.5, so these numbers are
+recorded and reproducible but not presented as idle-machine calibration.
 
-| Path | Encode | Restore | RPC p50 |
+| Scenario (p50 unless noted) | 0.17 HTTP | 0.18 native | Change |
 |---|---:|---:|---:|
-| Plain dict | 5.13 us | — | 0.7123 ms |
-| Automatic dataclass | 5.58 us | 1.33 us | 0.7305 ms |
-| Hand-written dataclass conversion | — | — | 0.7239 ms |
-| Automatic Pydantic | 6.37 us | 1.74 us | 0.7540 ms |
-| Hand-written Pydantic conversion | — | — | 0.7571 ms |
+| Same-process call | 0.7735 ms | **0.2326 ms** | -69.9% |
+| Separate-process call | 0.6982 ms | **0.2705 ms** | -61.3% |
+| Async call | 1.4525 ms | **0.3675 ms** | -74.7% |
+| Raising call | 0.9130 ms | **0.4289 ms** | -53.0% |
+| 32-call batch total | 1.3109 ms | **0.4841 ms** | -63.1% |
+| 1 / 4 / 8 concurrent callers | 1,342 / 1,204 / 1,019 per s | **3,175 / 6,588 / 6,383 per s** | +137% / +447% / +526% |
+| Plain model-shaped dict | 0.8211 ms | **0.3417 ms** | -58.4% |
+| Dataclass | 0.8406 ms | **0.2719 ms** | -67.7% |
+| 64 KiB string echo | 1.0201 ms | **0.4470 ms** | -56.2% |
 
-Automatic Pydantic is no slower than application-written
-`model_dump()`/`model_validate()`. Automatic dataclass conversion adds about
-6.6 us over the best hand-written path, or 0.9% of the full call. Six balanced
-A/B runs of ordinary RPC with the old `json.dumps` and the cached encoder had
-median p50 values of 0.6725/0.6717 ms, with no measurable regression.
+The first hard-cutover measurement's 64 KiB +105.3% regression came from
+extracting Python bytes directly into `Vec<u8>` at the Python/Rust boundary.
+After all three extraction boundaries moved to `PyBackedBytes`, the three-run
+median is 0.3758 ms. Three isolated runs after the resource/protocol fixes had
+a 0.4470 ms median with the final MemberRef/Pydantic-free build, still 56.2%
+faster than 0.17 and within the existing regression
+gate. The 1 MiB warning remains advisory;
+data-plane payloads should still travel by reference.
+
+0.18 no longer has a Pydantic benchmark or extra. The refreshed three-run
+`rpc_models` medians cover plain values, standard dataclasses,
+TypedDict/NamedTuple containers, and a 100-item dataclass batch. Encoding
+plain/dataclass/typed-container values took 0.641/0.742/0.871 us; restoring a
+dataclass and typed container took 0.772/1.052 us. Full RPC p50 was
+0.2675/0.2719/0.2763 ms, and the 100-item batch was 0.4934 ms. The removed
+Pydantic workload and the new dataclass batch do not have directly comparable
+payload sizes.
+
+A later full audit found that BlobRef hardening made ordinary values with no
+BlobRef unconditionally create thread-local encode/decode scopes. The codec
+now takes an extension-free fast path and retries under the bounded scope only
+when it encounters a MessagePack extension. Five-run medians are
+0.681/0.781/0.911 us for plain/dataclass/typed encoding and 0.862/1.142 us for
+dataclass/typed restoration; complete RPC p50 is
+0.2535/0.2605/0.2629 ms. All five fixed-cost codec metrics are now benchmark
+gates.
+
+### Native Snapshot/Epoch view measurements
+
+Measurements on the same shared 24-vCPU host with the same 0.18 native RPC
+code. The original architecture results are three-run medians; the final
+state-path results are five-run medians. A 5,000-member `snapshot()` now
+creates only the cached Arc-backed native view; `snapshot().members` measures
+first Handle materialization separately.
+
+| Operation | Before | After | Change |
+|---|---:|---:|---:|
+| Create 5,000-member `snapshot()` | 4.0072 ms | **0.001032 ms** | -99.97% |
+| Materialize all 5,000 Handles | 4.0072 ms | **1.3778 ms** | -65.6% |
+| 5,000-member `all()` | 4.0622 ms | **1.3480 ms** | -66.8% |
+| Frozen-view `len()` at 5,000 | - | **0.000230 ms** | new metric |
+| Frozen-view `slot()` / `get()` at 5,000 | - | **0.000712 / 0.000611 ms** | new metrics |
+| Create 5,000-member `epoch()` | - | **0.001664 ms** | new metric |
+| Create 1,000-member `epoch()` | 0.7953 ms | **0.001648 ms** | -99.8% |
+| 5,000-member `pool.slot()` / `pick()` | 0.002144 / 0.002214 ms | **0.001353 / 0.001373 ms** | faster |
+
+Handle materialization does not copy state. On first access to all 5,000 state
+values, roster-wide encoding and one decode bring total `all()` / snapshot
+time to 4.8658 / 5.0067 ms; reading the real state slots again takes only
+0.1648 / 0.2499 ms. Against the user's five-run 0.17 medians, those four paths
+are 4.9%, 4.8%, 5.8%, and 3.9% faster, while Handle-only paths remain about
+67% faster. The bounded scalar index reduces an already-satisfied
+`wait(count=1, idx=...)` at 5,000 members from 0.4823 to 0.003246 ms; nested
+or container filters still use the exact O(n) scan. After RPC multiplexing,
+ordinary p50/p99 are 0.263066/0.399071 ms, 64 KiB p50/p99
+0.444255/0.731057 ms, a 32-item batch 0.564224 ms, and separate-process
+eight-caller throughput 12,552 calls/s on four connections.
 
 ## The baseline
 
-The current format-2 baseline is the per-metric median of three independent
-optimized-build runs, followed by two independent verification runs. All 23
-watched metrics passed both verification runs. Relative tolerance is 20%,
-combined with calibrated absolute floors; the sub-millisecond `flush()` floor
-is now 0.1 ms, not the historical 50 ms allowance.
+The current format-2 baseline is the per-metric median of three 0.18 release
+runs on the shared host described above. Its calibration metadata records
+`host_idle: false` and the observed load range. A final independent run passed
+all 60 watched metrics. Relative tolerance remains 20%, combined with
+calibrated absolute floors; the sub-millisecond `flush()` floor is 0.1 ms.
 
-### Measured optimization results
+### Earlier measured optimization results (0.16)
 
 Same benchmark script, same Python 3.11.15 environment, same 24-vCPU AMD EPYC
 host, sequential runs with no tests/builds running alongside. The before build
@@ -105,7 +263,7 @@ batch of 32 no-op calls cost 1.12 ms versus about 20.7 ms individually
 
 The portable registry benchmark reduced quiet owned-ack assembly from
 39.4 us to 0.58 us and fresh one-change history replay from 2.29 us to
-0.73 us. A separate HTTP probe with a shared roughly 1 MiB roster improved
+0.73 us. A separate native-wire probe with a shared roughly 1 MiB roster improved
 from 3.27 ms to 2.84 ms: assembly gains are not network-throughput multipliers.
 
 Native caches trade bounded memory for repeated-read speed: clients retain

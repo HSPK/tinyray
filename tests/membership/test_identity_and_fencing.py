@@ -14,6 +14,9 @@ import time
 
 import pytest
 import tinyray
+from tinyray import _rpc
+
+from tests.support.ordering_proxy import OrderingProxy
 
 ECHO_CALLER = textwrap.dedent(
     """
@@ -106,6 +109,49 @@ def test_every_call_carries_a_request_id_that_names_that_attempt(peer):
     assert first.startswith(f"caller/3#{peer.incarnation}"), first
 
 
+def test_generated_request_ids_bound_long_identities_without_colliding():
+    first = _rpc._generated_request_id("a" * 512 + "/0#1", 7)
+    again = _rpc._generated_request_id("a" * 512 + "/0#1", 7)
+    next_attempt = _rpc._generated_request_id("a" * 512 + "/0#1", 8)
+    other_identity = _rpc._generated_request_id("b" * 512 + "/0#1", 7)
+    huge_sequence = _rpc._generated_request_id("a" * 512 + "/0#1", 10**500)
+    next_huge_sequence = _rpc._generated_request_id("a" * 512 + "/0#1", 10**500 + 1)
+    assert first == again
+    assert len({first, next_attempt, other_identity, huge_sequence, next_huge_sequence}) == 5
+    assert all(
+        1 <= len(request_id.encode("ascii")) <= 200
+        for request_id in (
+            first,
+            next_attempt,
+            other_identity,
+            huge_sequence,
+            next_huge_sequence,
+        )
+    )
+    assert first.endswith("-7") and next_attempt.endswith("-8")
+
+
+def test_a_registry_maximum_length_pool_can_make_native_rpc_calls(registry):
+    class Service:
+        def request(self, ctx: tinyray.CallContext) -> str:
+            return ctx.request_id
+
+    name = "p" * 512
+    with tinyray.join(
+        name,
+        "stateful",
+        slot=0,
+        size=1,
+        serves=Service(),
+        registry_url=registry.endpoint,
+    ) as me:
+        me.ready().flush()
+        handle = tinyray.pool(name).slot(0)
+        request_ids = [handle.request() for _ in range(3)]
+        assert len(set(request_ids)) == len(request_ids)
+        assert all(len(request_id.encode("ascii")) <= 200 for request_id in request_ids)
+
+
 def test_the_context_does_not_disturb_the_real_arguments(peer):
     """注入不能挤掉调用方自己的参数，也不能影响没有声明它的方法。"""
     h = tinyray.pool("svc").slot(0)
@@ -146,6 +192,55 @@ def test_flush_waits_until_the_registry_has_it(registry):
         assert mine.state["weights"] == "v9", "flush 返回了，状态却还没到"
     finally:
         me.leave()
+
+
+def test_flush_is_released_by_the_exact_publication_ack(registry):
+    release = threading.Event()
+    proxy = OrderingProxy(registry.endpoint, reply_gate=release)
+    waiting = None
+    try:
+        with tinyray.join(
+            "publication-bell",
+            registry_url=proxy.endpoint,
+            coalesce_ms=0,
+        ) as me:
+            me.ready(step=0).flush()
+            deadline = time.monotonic() + 5
+            while True:
+                with proxy.lock:
+                    held = any(
+                        isinstance(beat, dict) and beat.get("hold_ms", 0) > 0
+                        for _, beat in proxy.requests
+                    )
+                if held:
+                    break
+                assert time.monotonic() < deadline
+                revision = me._c.debug_beat_revision()
+                me._c.debug_wait_beat_revision(revision, 5000)
+
+            proxy.arm_reply.set()
+            me.update(step=1)
+            errors: list[BaseException] = []
+
+            def flush():
+                try:
+                    me.flush(timeout=5)
+                except BaseException as error:
+                    errors.append(error)
+
+            waiting = threading.Thread(target=flush)
+            waiting.start()
+            assert proxy.reply_held.wait(5), "publication ack was never held"
+            time.sleep(0.05)
+            assert waiting.is_alive(), "flush accepted the previous publication's ack"
+            release.set()
+            waiting.join(1)
+            assert not waiting.is_alive(), "the exact publication ack did not wake flush"
+            assert not errors
+    finally:
+        proxy.close()
+        if waiting is not None:
+            waiting.join(1)
 
 
 def test_a_member_learns_it_was_replaced_without_being_asked(registry):
@@ -284,15 +379,8 @@ def test_an_empty_request_id_is_refused(peer):
 
 
 @pytest.mark.parametrize("name", ["训练组", "grüße", "a\nb", "tab\there"])
-def test_a_pool_name_that_cannot_be_a_header_is_refused(registry, name):
-    """名字会随每次调用进 HTTP 头，而头值必须是可打印 ASCII。
-
-    不拦的话，`join("训练组")` 注册、被发现、被订阅全都正常 —— 然后**每一次
-    调用**死在一个裸的 `UnicodeEncodeError` 上：httpx 内部抛的，抛在调用现场，
-    离那个名字很远。半个能用的系统比一个明确的"不行"更糟。
-
-    `pool()` 也要拦：对端的 pool 名同样会进"要谁来答"那个头。
-    """
+def test_a_pool_name_that_cannot_be_protocol_identity_is_refused(registry, name):
+    """Pool names remain printable ASCII parts of caller and target identities."""
     with pytest.raises(ValueError, match="printable ASCII"):
         tinyray.join(name, "churn")
     with tinyray.join("ok", "churn") as me:
@@ -306,12 +394,8 @@ def test_an_empty_pool_name_is_refused(registry):
         tinyray.join("", "churn")
 
 
-def test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set(peer):
-    """不合法的 id 要在**设置它的那一行**报错。
-
-    否则它死在 httpx 里，而调用方收到的是"对端联系不上" —— 于是跑去查网络。
-    换行更糟：它在头里就是一行的结束。
-    """
+def test_a_request_id_that_cannot_be_an_envelope_field_is_refused_where_it_is_set(peer):
+    """Invalid IDs fail where pinned, before any native request is scheduled."""
     with pytest.raises(ValueError, match="printable ASCII"):
         with tinyray.request_id("a\nb"):
             pass
@@ -324,7 +408,7 @@ def test_a_request_id_that_cannot_be_a_header_is_refused_where_it_is_set(peer):
 
 
 def test_a_non_ascii_request_id_is_refused_too(peer):
-    """和 pool 名字同一条规则：进头的东西必须是可打印 ASCII。"""
+    """Request IDs keep the established printable-ASCII tracing contract."""
     with pytest.raises(ValueError, match="printable ASCII"):
         with tinyray.request_id("批次-42"):
             pass

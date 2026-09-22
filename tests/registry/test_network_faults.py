@@ -192,7 +192,7 @@ def test_calls_are_bounded_when_the_far_side_stops_answering(registry):
     try:
         black_hole = tinyray.Handle(
             "svc",
-            {"id": 0, "slot": 0, "incarnation": 1, "url": "http://10.255.255.1:9", "ready": True},
+            {"id": 0, "slot": 0, "incarnation": 1, "url": "10.255.255.1:9", "ready": True},
             ("anything",),
         )
         t0 = time.monotonic()

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import time
-import urllib.request
 
 import tinyray
 from tinyray import _tinyray
+
+from tests.support.registry_wire import beat as registry_beat
+from tests.support.registry_wire import debug_pools
 
 
 def _beat(endpoint: str, **kw) -> dict:
@@ -26,19 +27,11 @@ def _beat(endpoint: str, **kw) -> dict:
         seen={},
     )
     body.update(kw)
-    req = urllib.request.Request(
-        f"http://{endpoint}/v1/beat",
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    return registry_beat(endpoint, body)
 
 
 def _pools(endpoint: str) -> dict:
-    with urllib.request.urlopen(f"http://{endpoint}/v1/pools", timeout=5) as r:
-        return json.loads(r.read())
+    return debug_pools(endpoint)
 
 
 def test_a_superseded_tenure_cannot_take_the_seat_back(registry):
@@ -98,7 +91,7 @@ def test_a_beat_still_in_flight_cannot_undo_a_leave(registry):
 
     # 现在补上那一拍：同样的座位、同样的任期，就像它从未离开。
     straggler = _tinyray.Client(
-        endpoint=f"http://{registry.endpoint}",
+        endpoint=registry.endpoint,
         pool="late",
         id=ident,
         incarnation=tenure,

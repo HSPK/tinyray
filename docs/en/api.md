@@ -79,8 +79,10 @@ Seated policies need `slot=`, or read it from `TINYRAY_SLOT` / `RANK` /
   this spacing. Values must be nonnegative integers; the effective spacing
   is capped by the registry's lease/4 so a large setting cannot prevent renewal.
   Local publications may wake a resting client early.
-- **`url=`** -- set the advertised address by hand. By default it is probed
-  from the routing table; on a multi-homed machine use `TINYRAY_ADVERTISE`.
+- **`url=`** -- set the advertised native method endpoint (`host:port`) by
+  hand. By default the host is probed from the routing table and the native
+  listener's chosen port is added; on a multi-homed machine use
+  `TINYRAY_ADVERTISE`.
 - **`registry_url=`** -- which registry to report in to, overriding
   `TINYRAY_REGISTRY`. **Not to be confused with `url=` above**: that one is
   where others reach you, this one is who you go to. The environment stays the
@@ -92,14 +94,11 @@ Seated policies need `slot=`, or read it from `TINYRAY_SLOT` / `RANK` /
   and `apool()` follow whatever `join()` used. A list of addresses is
   **refused on the spot**.
 
-    !!! warning "A hostname only -- no scheme, no port"
-        `http://` and the port are composed around it, so
-        `TINYRAY_ADVERTISE=http://10.0.0.5` becomes
-        `http://http://10.0.0.5:33097`. That now **fails immediately** and
-        says why; it used to register happily and blow up when somebody called.
-
-        To advertise a genuinely different address -- behind a reverse proxy,
-        say -- use `join(url=...)`.
+    !!! warning "TINYRAY_ADVERTISE is a hostname only"
+        The listener's port is added to this value. Schemes, paths, and ports
+        are rejected. To advertise a different native TCP endpoint, use
+        `join(url="host:port")`. Old `http://...` method addresses are rejected
+        explicitly; there is no compatibility fallback.
 
 ---
 
@@ -280,10 +279,27 @@ exact -- nested objects need the same keys, arrays the same order and length --
 and only the numbers themselves are relaxed.
 Large integers are never rounded to floats to decide equality.
 
+Repeated filters made only of top-level scalar fields (`null`, booleans,
+strings, integers, and finite floats) use a bounded native result index.
+Nested objects, arrays, oversized keys, and filters outside the limits fall
+back to the same scan and therefore keep identical semantics. The per-pool
+cache holds at most 32 filters, 8 fields and 4 KiB of key data per filter,
+8,192 matching IDs per entry, and 1 MiB in total. Any member/state/readiness
+change, removal, full resync, or registry restart invalidates affected cached
+results. The index stores wire IDs only, not Handles or state copies.
+
 `slot()` uses a native slot index and `pick()` selects one eligible member
 before serialization; neither constructs a full Python roster just to return
-one handle. Repeated bulk reads reuse bounded native snapshots, but each
-returned handle still has its own independently decoded state.
+one handle. `all()`, `snapshot()`, `epoch()`, and the built-in waits now take
+immutable Rust roster views directly instead of encoding a whole roster as
+MessagePack for Python to decode. Each pool caches at most an all-members and
+a ready-members view, containing only `Arc<Member>` references and indexes,
+not copies of potentially large state. On the first state read across a
+roster, Rust encodes one bounded MessagePack state array and Python decodes it
+once, then gives each Handle its indexed, independent object. Encodings below
+1 MiB are cached with the immutable roster view and naturally disappear when
+member data changes. Mutating one result still cannot affect a later lookup
+or another snapshot.
 
 ### Snapshots and changes
 
@@ -325,15 +341,10 @@ really moved (or a member came or went, or a seat changed hands). `ready` and
 up in the state.
 
 The comparison happens **in the Rust cache**, before anything is serialised.
-Measured at 5,000 members:
-
-| | |
-|---|---|
-| `pool.snapshot()` | 8.78 ms |
-| `field_digest(["role", "ready"])` | **0.40 ms** |
-
-A predicate in Python saves none of that -- it needs the `Snapshot` before it
-can decide, and by then the money is spent.
+Creating a `Snapshot` now only creates a shared native view; Python Handles
+are built when `members` is first accessed or iteration starts. Consequently
+`len(snapshot)`, repr, `slot()`, `get()`, and field digests do not pay for
+whole-roster materialization.
 
 **Identity always counts.** A seat changing hands produces a snapshot even when
 the new tenure publishes exactly the fields the old one did -- otherwise you
@@ -362,9 +373,11 @@ to somewhere the flag is visible.
 non-daemon thread keeps the process from ever exiting.
 
 !!! note "The async side does not hold a thread"
-    `achanges()` waits on a pipe the heartbeat writes to, selected by the event
-    loop, and **borrows no executor thread**. Cancellation is therefore
-    immediate, and cancelling any number of them affects nothing else.
+    `achanges()` waits on a pipe written only for cache/lifecycle changes,
+    selected by the event loop, and **borrows no executor thread**. Empty
+    heartbeat acknowledgements do not write the pipe, so a quiet pool is not
+    repeatedly woken at heartbeat cadence. Cancellation is immediate, and
+    cancelling any number of watchers affects nothing else.
 
     An earlier implementation used `asyncio.to_thread`: cancelling the
     awaitable does not stop the thread underneath. On a 24-core machine, after
@@ -396,9 +409,17 @@ no gap, stop when `close()`d, and let `Fenced` out instead of treating it as
 between the first look and the subscription, the wait burns the whole timeout
 on a condition that was already true.
 
-Everything below is a special case of it. So is `pool.wait()` -- it used to
-write its own loop, which made it the one wait in the library that, once
-superseded, burned the whole timeout and then blamed the pool for being empty.
+Arbitrary Python predicates still use this generic path; they cannot move into
+Rust. The built-in conditions below no longer run as Python predicate loops:
+`wait()`, `wait_departure()`, `wait_replacement()`, and `epoch()` hand count,
+identity, fingerprint, and timeout checks to Rust on the same
+revision/condition-variable handoff. Their async forms reuse the event-loop
+pipe, with no executor worker and no sleep/poll loop.
+
+Heartbeat outcomes, publication acknowledgements, and discovery revisions use
+separate notification domains. A successful renewal with no roster change
+wakes registration/publication waiters only, not discovery. First registration
+also waits directly to one absolute deadline instead of waking every 100 ms.
 
 ### Waiting for members to be ready (async)
 
@@ -482,6 +503,12 @@ One pool as it stood at a revision, **unready members included**.
 | `get(identity)` | That exact tenure, or `None` |
 | `len()` / iteration | By member |
 
+`members` remains an immutable tuple, but it is lazy: constructing a snapshot
+creates no Handles. The first `members` access or iteration materializes and
+caches them once; `ready()` materializes only ready members. The view owns the
+old `Arc<Member>` references, so later publications, departures, and registry
+restarts cannot rewrite it.
+
 `get()` lives on the snapshot and not on the pool on purpose: "is that
 incarnation still there?" asks about **one moment**, and asking a live pool
 twice may reach two.
@@ -498,24 +525,74 @@ A reference to one member. Attribute access proxies to its methods.
 | `label` | The short form, for humans |
 | `pool` / `id` / `slot` / `incarnation` / `url` / `state` / `ready` | The record itself |
 
+Handles returned by Pool/Snapshot/Epoch retain a native `Arc<Member>`
+reference. Constructing thousands of Handles does not copy state; pool,
+identity, slot, incarnation, URL, readiness, identity/label, and method
+proxying read the native reference directly. The first `state` access creates
+one isolated Python dictionary and installs it in a real slot. Handles from
+one roster share a single batch decode; later reads avoid both a property and
+a native call. Mutating the value cannot affect another Handle, the cache, or
+a frozen snapshot. The manual
+`Handle(pool, raw, methods)` constructor and writable-field compatibility
+remain unchanged.
+
 ```python
 h.assign("task")  # call it
 h.assign.timeout(5.0)("task")  # this call's timeout; 30 seconds by default
-h.pull_job.returns(AgentJob)()  # restore the JSON result as an AgentJob
+h.pull_job.returns(AgentJob)()  # restore the MessagePack result as an AgentJob
 ```
 
-Standard dataclasses can be passed and returned directly. Pydantic 2 support is
-optional:
+`url` is a bare `host:port`. Method connections are persistent and
+multiplexed: one connection has one serialized frame writer, one reply reader,
+and up to 128 correlated requests in flight. Replies may arrive in any order.
+An endpoint admits at most 256 local calls across at most four connections;
+the process admits 512 calls and 256 client connections in total, with at most
+64 idle connections retained. Selection is least-loaded, and another endpoint
+connection is opened when every existing connection already has two reserved
+calls, until the four-connection cap. This keeps shallow writer/reader queues
+at ordinary concurrency without reverting to one socket per call. Every frame
+is a big-endian `u32` length followed by one MessagePack map:
 
-```bash
-pip install "tinyray[pydantic]"
+Python and embedded Rust calls use this same public `tinyray::Client`
+implementation. The PyO3 layer only adapts Python values, completion delivery,
+and cancellation; it does not maintain a second connection pool, socket
+reader/writer, or reply-routing state machine.
+
+```text
+call  = {v: 1, id, from, to, op: "call", method, body: bytes}
+batch = {v: 1, id, from, to, op: "batch", batch: count, body: bytes}
+reply = {v: 1, id, status, body: bytes, error?, batch_index?, completed?}
 ```
+
+`body` is opaque to Rust and contains one separately encoded application
+value. Reply statuses are `success`, `method_not_found`, `fenced`,
+`caller_fault`, `concurrency_refused`, `remote_error`,
+`malformed_protocol`, and `internal`. Malformed, truncated, oversized,
+duplicate, or unknown reply IDs poison that connection and fail every
+remaining request according to whether its frame completed. A timed-out or
+cancelled request whose complete frame was written removes only its waiter;
+its known late reply is discarded without poisoning unrelated calls. There
+is no HTTP/JSON listener or compatibility fallback. Method frames have a hard
+32 MiB cap, checked from the length prefix before body allocation. Connection
+count, in-flight frame count, and bulk-frame bytes have both process-global
+and per-server admission budgets; control frames up to 1 MiB use a separate
+byte reserve so a few maximum frames cannot crowd them out.
+`max_concurrency` still gates each request before Python invocation; a batch
+is one admission unit and remains sequential internally.
+
+Client pools reuse a connection for at most 10 idle seconds. The server closes
+a connection after 15 idle seconds when no calls are active, and gives a
+started frame one absolute 15-second prefix/body deadline. The five-second
+margin lets the client discard stale pool entries first while ensuring a
+silent peer never owns a server task forever.
+
+Standard dataclasses can be passed and returned directly:
 
 ```python
 from dataclasses import dataclass
-from pydantic import BaseModel
 
-class Request(BaseModel):
+@dataclass(frozen=True)
+class Request:
     prompt: str
     max_tokens: int
 
@@ -531,22 +608,37 @@ class Worker:
 reply = h.infer.returns(Reply)(Request(prompt="hello", max_tokens=32))
 ```
 
-The caller turns a model into JSON and the callee restores it from the method
-parameter annotation. A method may return a dataclass or Pydantic model
+The caller turns a dataclass into a MessagePack map and the callee restores it
+directly from the method parameter annotation. A method may return a dataclass
 directly. Without `.returns(T)` the caller receives ordinary dictionaries and
 lists; with it, the result is restored as the locally declared type.
-Dataclasses and Pydantic models may nest inside each other and inside
-`list[T]`, `dict[K, V]`, Optional/Union, tuples, and sets.
+Dataclasses may nest and may appear inside `list[T]`, `dict[K, V]`,
+Optional/Union, tuples, and sets. `NamedTuple`, `TypedDict`, Enum, datetime,
+date/time/timedelta, UUID, Decimal, and those containers restore recursively.
 
-Pydantic encoding uses `model_dump(mode="json", by_alias=True)`; decoding uses
-`model_validate()` or a cached `TypeAdapter`, so aliases, validators, and JSON
-serializers apply. TinyRay does not import Pydantic at startup and only enables
-the adapter after the application itself imports it.
+0.18 **intentionally removes Pydantic integration**. There is no
+`tinyray[pydantic]` extra, no special BaseModel/Pydantic-dataclass encoding,
+and no alias, validator, serializer, or strict-shape marker machinery.
+Passing a Pydantic object raises `TypeError` before sending;
+`.returns(PydanticType)` is also rejected before the call. Convert explicitly
+to a standard dataclass, TypedDict, or ordinary MessagePack value instead.
 
-JSON still does not retain Python types: a `NamedTuple` crosses the wire as an
-array, and dataclass/Pydantic values as objects. `.returns(T)` declares the
-type to restore on the calling side. It also recursively handles `NamedTuple`,
-`TypedDict`, Enum, datetime, UUID, and the containers above:
+Every successful native reply already carries the result as its opaque
+application payload; there is no `/_result/` path, HTTP status, or fallback
+request. Model arguments are constructed directly from `msgspec.Raw`
+MessagePack slices where the target type permits, avoiding a generic
+intermediate object graph.
+
+MessagePack arrays do not retain whether an ordinary input was a list, tuple,
+or set. `.returns(T)` declares the type to restore on the calling side:
+
+Untyped values follow `msgspec.msgpack`: bytes and datetime stay native; UUID
+and Enum become their wire values; tuple and set become arrays; integer and
+tuple map keys are retained; NaN and infinities remain floats. Python integers
+outside MessagePack's signed/unsigned 64-bit range use reserved extension code
+121. Codes 122, 123, 125, and 126 preserve large-integer mapping/set shapes
+and composite tuple/frozenset keys. These codes carry no Python class name;
+applications should not use raw `msgspec.msgpack.Ext` values with those codes.
 
 ```python
 class AgentJob(NamedTuple):
@@ -558,11 +650,10 @@ jobs = await ah.pull_jobs.returns(list[AgentJob])()
 ```
 
 A conversion failure raises a local `TypeError` naming the remote member,
-method, and failing JSON path. The remote method has already completed
-successfully at that point; only result restoration failed. The protocol
-remains plain JSON and never sends Python class names. Standard dataclasses
-and Pydantic models are the explicit model boundary; other arbitrary Python
-objects are still rejected as they are by `json.dumps`.
+method, and failing path. The remote method has already completed successfully
+at that point; only result restoration failed. The protocol never sends Python
+class names. Standard dataclasses and the typed containers above are the
+explicit model boundary; other arbitrary Python objects are rejected.
 
 `.returns()` and `.timeout()` are per-call modifiers and compose in either
 order:
@@ -594,6 +685,9 @@ A frozen round.
 | `valid` | `False` as soon as an occupant changes |
 | `slot(k)` | Seat k in this round |
 
+Like `Snapshot`, `members` is a lazily materialized, cached immutable tuple;
+`len()`, `slot()`, `valid`, and repr read the frozen native view directly.
+
 Checking `valid` inside the training loop is useless: a stuck rank never
 reaches that line. Use a background thread -- NCCL releases the GIL while it
 blocks.
@@ -612,6 +706,7 @@ me.registry.protocol  # an integer that only goes up; too old to say reads as 0
 me.registry.version  # the far side's version, to put in a log line
 me.registry.supports("long_poll") -> bool
 me.registry.supports("publication_ordering") -> bool
+me.registry.supports("native_registry") -> bool
 ```
 
 `RegistryInfo.FEATURES` maps a feature name to the protocol it needs, and it
@@ -620,21 +715,27 @@ about future features. A misspelled feature name raises `ValueError` rather
 than returning `False` -- the latter would let a typo walk quietly into the
 degraded branch.
 
-You can look without joining:
+Deployment probes can look without joining by connecting to `host:port` and
+sending a `health` frame. Each frame is a big-endian `u32` length followed by
+one MessagePack map:
 
-```console
-$ curl -s http://registry:7000/health
-{"status":"ok","version":"0.17.0","protocol":2}
+```text
+request  = {request_id: 7, operation: "health", payload: nil}
+response = {request_id: 7, operation: "health_ack",
+            payload: {status: "ok", version: "0.18.0", protocol: 3}}
 ```
+
+This is not an HTTP endpoint and there is no curl compatibility listener.
 
 | protocol | Meaning |
 |---|---|
 | 0 | Before long polling (earlier than 0.7.0) |
 | 1 | Understands `hold_ms`: park the answer while there is nothing to say, and return the moment a watched pool moves |
 | 2 | Understands `publication`: older payloads cannot undo newer state, readiness or URL |
+| 3 | Uses the native length-prefixed MessagePack registry transport |
 
-Legacy clients remain accepted, but ordering protection requires both sides
-to support publication sequences. New clients warn when the registry cannot.
+0.18 is a hard cutover for both transports: neither the registry nor method
+RPC listens for HTTP/JSON, and clients do not fall back to the old wire.
 
 !!! warning "Missing features affect performance or consistency"
     An old registry answers a long-poll request **quickly and correctly**, it
@@ -678,7 +779,9 @@ its own tenure number anyway. What it buys is that the caller cannot forget to
 send it or send the wrong one, and nothing more.
 
 `request_id` differs per call by default, so logs on both sides can point at
-the same attempt.
+the same attempt. If the caller identity is long, TinyRay keeps a readable
+prefix, adds the identity SHA-256 and exact sequence, and remains within 200
+bytes. Explicit `request_id()` values retain their existing length validation.
 
 To make **a retry share one name** (which idempotence needs), wrap the whole
 retry loop:
@@ -721,7 +824,7 @@ results = await tinyray.abatch(handle, calls)
 
 A batch contains at most 128 calls to one member. Calls run sequentially and
 stop at the first failure. An empty batch is a local no-op. This amortizes one
-HTTP exchange across several operations; it is **not a transaction**.
+framed TCP exchange across several operations; it is **not a transaction**.
 
 `BatchError` contains `failed_index` (zero-based), `completed_results`, and
 `cause` (`RemoteError`, `TypeError`, `AttributeError`, or `Fenced`). Earlier
@@ -732,8 +835,8 @@ the next item runs. Fencing is rechecked between items.
 The transport timeout applies to the batch exchange, not separately to every
 item. `OutcomeUnknown` means an unknown prefix, or the whole batch, may have
 run. Async cancellation stops waiting, not remote execution. Nothing is
-automatically retried; older peers without `/_batch` return `NotDelivered`
-without replaying the batch as individual requests.
+automatically retried. Old HTTP peers are rejected as incompatible endpoints;
+the batch is never replayed as individual requests.
 
 Each item receives a distinct, stable `CallContext.request_id` derived from
 the batch ID and its index. Short IDs use `<batch-id>:<index>`; long IDs retain
@@ -743,6 +846,103 @@ remains the application's responsibility.
 
 A batch occupies one concurrency slot and counts as one request in `calls`;
 it is counted as failed if any item fails.
+
+## Rust SDK
+
+The public workspace crate `tinyray` has no Python/PyO3 dependency. Its main
+types are:
+
+- `MemberBuilder` / `Member`: join, publish state/readiness, watch, flush, and
+  leave.
+- `DiscoveryPool` / `Snapshot` / `MemberRef` / `Epoch`: read the Arc-backed
+  roster directly, with filter/count/pick/slot/get, frozen views, validity
+  checks, and synchronous/asynchronous count, departure, and replacement
+  waits without copying member state.
+- `Service` / `Router`: advertise named methods and dispatch opaque
+  MessagePack payloads.
+- `CallContext`: caller identity, request ID, fencing target, and a
+  cancellation token that fires when the connection or server closes.
+- `Client` / `Target`: raw and serde-typed synchronous/asynchronous calls with
+  caller-controlled request IDs and no automatic retry.
+- `RpcRuntime`: lets multiple `Client` and `Server` values share one Tokio
+  worker pool. `MemberBuilder` places its client and server on the same
+  four-worker runtime by default.
+- `ReceivedRawReply` / `ReceivedRpcReply`: own the response's BlobRef
+  acknowledgement while raw bytes are inspected; `decode<T>()` maps BlobRefs
+  before releasing it.
+- `Server` / `ServerConfig`: standalone listener lifecycle, admission limits,
+  counters, and explicit shutdown.
+
+`Router::raw` does not deserialize application payloads. `typed` decodes the
+whole payload, while `typed_arg` and `typed_no_args` use the Python-compatible
+argument envelope. Batches remain one admitted request and run items
+sequentially, stopping at the first failure with `batch_index`, `completed`,
+and the encoded successful prefix.
+
+The generic listener is shared with Python. A Rust `Service` future runs
+directly on Tokio and never acquires the GIL or enters `spawn_blocking`.
+Python `serves=` installs a `PythonService` adapter on the same listener; only
+that adapter enters `spawn_blocking` and acquires the GIL.
+
+## BlobRef
+
+```python
+with tinyray.blob(data) as blob:
+    result = handle.consume(blob)
+    view = blob.view()       # read-only memoryview, no payload copy
+    copied = bytes(blob)     # explicit copy
+```
+
+`BlobRef` is explicit same-host transport, not a cross-host fallback. On Linux
+the creator copies the input once into a `memfd`, sets mode 0600/CLOEXEC,
+seals it against write/grow/shrink/further seal changes, and maps it read-only.
+`MAX_BLOB_BYTES` is the default 256 MiB creation and receive cap; Rust exposes
+the same limit as `DEFAULT_MAX_BLOB_BYTES`, and both APIs accept a lower
+per-operation cap. One decoded MessagePack value may contain at most
+`MAX_BLOB_REFS_PER_MESSAGE` (64) BlobRefs and
+`MAX_BLOB_MAPPED_BYTES_PER_MESSAGE` (512 MiB) of distinct mapped data.
+Identical descriptors in that value share one mapping. Native fallback
+admission also limits directly decoded/public `from_descriptor` handles to
+128, live decoded mappings to 64, and their aggregate mapped bytes to 512 MiB.
+MessagePack extension **124** carries only a bounded descriptor: protocol,
+Linux boot fingerprint, owner pid/fd, payload size, device/inode, and a random
+token from Linux `getrandom`, also stored in the sealed header.
+
+The receiver first checks the size limit (256 MiB by default), boot identity,
+numeric pid/fd, then opens only `/proc/<pid>/fd/<fd>` read-only. It verifies
+device, inode, exact file length, all required seals, header magic, token and
+size before mapping. A stale, reused, cross-boot, unsealed, oversized, or
+malformed descriptor raises `BlobError` before the method is invoked. Unknown
+MessagePack extensions remain ordinary `msgspec.msgpack.Ext` values and cannot
+forge a BlobRef.
+
+Outgoing call owners move into native pending state and remain there after a
+fully written timeout or cancellation until the late reply or connection
+teardown. Response owners remain on the server until the caller finishes
+decoding and sends a correlated BlobRef acknowledgement. Each reply is capped
+at 64 unique owners and 512 MiB. Outstanding replies are additionally bounded
+per connection (128 refs/512 MiB), server (512 refs/1 GiB), and process
+(2,048 refs/2 GiB); duplicate owners are charged once. Closing a connection
+releases all its unacknowledged permits and owners. A live raw-reply guard
+keeps both endpoints out of their normal 10/15-second idle expiry; an
+unacknowledged response still has a hard 60-second server deadline.
+
+Every public serialization uses the current process PID and local fd, so an
+inherited mapping that remains valid in a child never advertises the parent's
+descriptor. Once mapped, a `BlobRef` remains valid after its sender closes or
+exits, including SIGKILL. The kernel deletes the anonymous object when the
+final fd/mapping closes. Exported memoryviews prevent normal close; forked
+Python children close all native-registered BlobRefs and native-only RPC owner
+sets before inherited runtimes are forgotten.
+
+`BlobRef.from_descriptor(...)` is intentionally public for explicit protocol
+integration and testing. It does not accept paths and does not bypass identity,
+seal, strict full-consumption parsing, size, count, or mapped-byte admission.
+Rust `BlobRef::from_file` uses positional reads, leaving the caller's file
+cursor unchanged and rejecting truncation or growth during the snapshot.
+
+There is no non-Linux, missing-`/proc`, permission, or cross-host bytes
+fallback. Ordinary `bytes` encoding and transport are unchanged.
 
 ## Exceptions
 
@@ -827,11 +1027,27 @@ Publishing your own state is unaffected and always immediate (0.6 ms
 measured) -- when there is something to send, the parked request in flight is
 cancelled and replaced.
 
-A caller that does not ask to be parked -- including any client older than the
-field -- still gets an answer at once.
+A caller that does not ask to be parked still gets an answer at once.
 
-| Endpoint | What it is for |
-|---|---|
-| `GET /health` | A liveness probe |
-| `GET /v1/pools` | Each pool's version / roster / member count |
-| `POST /v1/beat` | The heartbeat (used by clients) |
+Production heartbeat connections are persistent but strictly serial: exactly
+one `beat` is in flight, and the next is sent only after a complete,
+correlated `beat_ack`. Publication cancellation, timeout, EOF, malformed or
+mis-correlated replies, registry restart, and refusal discard the connection;
+the following beat connects lazily, so a late reply cannot be consumed by a
+new request. The server closes a connection idle for 35 seconds. `health` and
+`debug_pools` remain one-request probes.
+
+Requests are capped at 512 KiB and replies at 64 MiB, with the declared length
+checked before allocating the body. Every reply echoes `request_id`. Health
+also reports cumulative accepts, active connections, and received frames for
+benchmarks and diagnosis.
+
+| operation | reply | What it is for |
+|---|---|---|
+| `health` | `health_ack` | Liveness, version and protocol probe |
+| `debug_pools` | `debug_pools_ack` | Each pool's version / roster / member count |
+| `beat` | `beat_ack` | Heartbeats, long polls and `leaving=true` goodbye |
+
+Unknown operations and malformed frames return a structured
+`operation="error"` reply. Seat or pool-shape refusal remains a normal
+`beat_ack` with `accepted=false`.

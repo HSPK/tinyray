@@ -16,7 +16,9 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "python"))
+sys.path.insert(0, str(HERE))
 import tinyray  # noqa: E402
 from _harness import Fleet, role_main  # noqa: E402
 
@@ -42,7 +44,7 @@ def run_client(_: list[str]) -> None:
         pool = tinyray.pool("worker")
         workers = pool.wait(count=2, timeout=20)
         for h in sorted(workers, key=lambda x: x.state["node"]):
-            host = h.url.split("//")[1].split(":")[0]
+            host = h.url.rsplit(":", 1)[0].strip("[]")
             print(f"[client] {h.state['node']:<8} advertises {h.url}", flush=True)
             assert not host.startswith("127."), "a loopback address was published"
             assert h.where() == h.state["node"]

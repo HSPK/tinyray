@@ -12,6 +12,49 @@ pip install tinyray
 
 The registry ships in the wheel; there is no second thing to install.
 
+### Embedded Rust service
+
+Workspace and source users can embed the supported `tinyray` crate without
+Python or PyO3:
+
+```rust
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tinyray::{MemberBuilder, Router};
+
+#[derive(Deserialize, Serialize)]
+struct Job { step: u64 }
+
+let mut router = Router::new();
+router.typed_arg("run", |context, job: Job| async move {
+    println!("request {} from {}", context.request_id, context.caller);
+    Ok(Job { step: job.step + 1 })
+})?;
+
+let member = MemberBuilder::new("127.0.0.1:8760", "workers")
+    .policy("stateful")
+    .slot(0)
+    .size(1)
+    .router(router)
+    .join(Duration::from_secs(15))?;
+member.ready(&serde_json::json!({"language": "rust"}))?;
+member.flush(Duration::from_secs(5))?;
+```
+
+The member advertises the same method metadata as `join(serves=...)`; Python
+and Rust handles call it through the same framed MessagePack protocol.
+
+For large payloads on the **same Linux host**, opt in explicitly:
+
+```python
+with tinyray.blob(weights) as ref:
+    worker.load(ref)
+```
+
+The receiver gets a read-only mapped `BlobRef`; use `.view()` for zero-copy
+access and `bytes(ref)` only when a copy is intentional. This never falls back
+across hosts.
+
 ```bash
 tinyray --listen 127.0.0.1:8760 --ttl-ms 20000
 ```
@@ -76,12 +119,15 @@ with tinyray.join(
 `max_concurrency` caps concurrency. Past it callers are refused rather than
 queued -- a refusal is bounded, a queue is not.
 
-Underneath it is ordinary HTTP, so nothing is lost for debugging with `curl`:
+The advertised address is a native `host:port` endpoint. Calls use persistent
+TCP, with a big-endian `u32` frame length and a MessagePack envelope:
 
-```bash
-curl -X POST http://host:port/call/assign -d '{"task":"t"}'
-curl http://host:port/_methods
+```text
+{v: 1, id, from, to, op: "call", method, body: <MessagePack bytes>}
 ```
+
+There is no HTTP listener or JSON fallback. Use the normal Python API for
+calls, or `examples/15_native_rpc.py` when inspecting frames by hand.
 
 ## Finding someone, then calling them
 

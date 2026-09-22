@@ -2,12 +2,109 @@
 
 import os
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 
+import msgspec
 import pytest
 import tinyray
+from tinyray import _msgpack
+
+from tests.support.ordering_proxy import OrderingProxy
+from tests.support.rpc_wire import frame, recv_frame
+
+
+def _proc_fd_links(fds=None) -> set[str]:
+    links = set()
+    names = os.listdir("/proc/self/fd") if fds is None else [str(fd) for fd in fds]
+    for name in names:
+        try:
+            links.add(os.readlink(f"/proc/self/fd/{name}"))
+        except FileNotFoundError:
+            pass
+    return links
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork") or not os.path.isdir("/proc/self/fd"),
+    reason="needs fork() and procfs descriptor inodes",
+)
+def test_fork_closes_a_connect_in_progress_rpc_socket_and_parent_continues():
+    tinyray._tinyray.rpc_debug_clear_pools()
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(0)
+    listener.settimeout(5)
+    endpoint = f"127.0.0.1:{listener.getsockname()[1]}"
+    filler = socket.create_connection(listener.getsockname(), timeout=2)
+    handle = tinyray.Handle(
+        "pending-connect",
+        {
+            "id": 0,
+            "slot": 0,
+            "incarnation": 1,
+            "url": endpoint,
+            "ready": True,
+        },
+        ("ping",),
+    )
+    result = []
+
+    def call():
+        try:
+            result.append(handle.ping.timeout(10)())
+        except BaseException as exc:
+            result.append(exc)
+
+    caller = threading.Thread(target=call)
+    caller.start()
+    deadline = time.monotonic() + 3
+    inherited = set()
+    while not inherited:
+        fds = tinyray._tinyray.rpc_debug_fds()
+        inherited = {link for link in _proc_fd_links(fds) if link.startswith("socket:[")}
+        assert time.monotonic() < deadline, "pending connect fd was never registered"
+        time.sleep(0.005)
+    assert caller.is_alive(), "connect completed before the backlog was saturated"
+
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        leaked = sorted(inherited & _proc_fd_links())
+        os.write(write_fd, repr(leaked).encode())
+        os._exit(0)
+    os.close(write_fd)
+    child_result = os.read(read_fd, 4096).decode()
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert child_result == "[]", f"child retained pending connect socket(s): {child_result}"
+    assert inherited <= _proc_fd_links(), "child cleanup closed the parent's pending socket"
+
+    first, _ = listener.accept()
+    first.close()
+    connection, _ = listener.accept()
+    request = msgspec.msgpack.decode(recv_frame(connection))
+    connection.sendall(
+        frame(
+            {
+                "v": 1,
+                "id": request["id"],
+                "status": "success",
+                "body": _msgpack.dumps("pong"),
+            }
+        )
+    )
+    caller.join(10)
+    assert result == ["pong"]
+    connection.close()
+    filler.close()
+    listener.close()
 
 
 def test_fork_child_gets_a_clear_error_not_a_frozen_client(registry):
@@ -99,7 +196,7 @@ def test_a_forked_child_that_exits_normally_does_not_hang(registry):
 FORK_THEN_BOTH_CALL = textwrap.dedent(
     """
     import asyncio, os, sys, tinyray
-    from tinyray import _rpc
+    from tinyray import _tinyray
 
     class S:
         def echo(self, x): return x
@@ -121,7 +218,8 @@ FORK_THEN_BOTH_CALL = textwrap.dedent(
                 bad.append(f"{type(e).__name__}: {e}")
         return bad
 
-    loop.run_until_complete(hammer("warm", 3))   # 让连接池装上父进程的 socket
+    loop.run_until_complete(hammer("warm", 3))   # 让原生连接池装上父进程的 socket
+    parent_generation = _tinyray.rpc_debug_state()["generation"]
 
     go_r, go_w = os.pipe()
     res_r, res_w = os.pipe()
@@ -129,12 +227,17 @@ FORK_THEN_BOTH_CALL = textwrap.dedent(
     if pid == 0:
         os.close(go_r); os.close(res_r)
         try:
-            carried = len(_rpc._loops)    # fork 之后第一件事：手里还攥着几个？
+            state = _tinyray.rpc_debug_state()
+            carried = state["idle_connections"]
+            reset = state["generation"] != parent_generation
             kid = tinyray.join("forkcli", "churn")
             kid.ready()
             os.write(go_w, b"x")          # 加入完了再一起开打，让重叠最大
             bad = loop.run_until_complete(hammer("C", 400))   # 沿用同一个 loop
-            os.write(res_w, f"CHILD carried={carried} {len(bad)} {bad[:2]}".encode()[:400])
+            os.write(
+                res_w,
+                f"CHILD carried={carried} reset={reset} {len(bad)} {bad[:2]}".encode()[:400],
+            )
         except BaseException as e:
             os.write(res_w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
         os._exit(0)
@@ -150,22 +253,7 @@ FORK_THEN_BOTH_CALL = textwrap.dedent(
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
 def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
-    """连接池是按事件循环存的，而 fork 把循环连同它的 socket 一起复制了。
-
-    子进程如果继续用 fork 之前那个 loop，拿到的就是**父进程那一个** httpx
-    client —— 同一批已经建立好的 TCP 连接。于是两个进程往同一条连接里写请求。
-
-    实测能坏成什么样：请求被拼接串了、服务端回 `HTTP 400`（而且是
-    `OutcomeUnknown`，这次调用可能已经执行了），或者事件循环拒绝这个 socket 报
-    `FileExistsError: [Errno 17]` —— 两个进程往同一个 epoll 注册同一个 fd。
-
-    但**断言的是机制不是损坏**：把修复撤掉，即使父子加了握手同时开打，400 次
-    调用也只有 1/5 的轮次真的串起来 —— 拿这个当唯一信号就是条会飘的测试。
-    子进程 fork 之后手里攥着几个连接池是确定的：0，撤掉修复就是 1。
-    （同步那条路上串号是 5/5 稳定复现的，危害由它去证。）
-
-    继承来的管道早就是这么处理的：丢掉但不关闭，描述符还是父进程的。
-    """
+    """The child gets a new native runtime generation and no inherited idle socket."""
     p = subprocess.Popen(
         [sys.executable, "-c", FORK_THEN_BOTH_CALL],
         stdout=subprocess.PIPE,
@@ -179,7 +267,7 @@ def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         out, err = p.communicate(timeout=10)
         raise AssertionError(f"fork 之后父子互相调用挂住了 stderr={err[-400:]!r}") from None
-    assert "CHILD carried=0 0 []" in out and "PARENT 0 []" in out, (
+    assert "CHILD carried=0 reset=True 0 []" in out and "PARENT 0 []" in out, (
         f"父子共用了一条连接：stdout={out!r} stderr={err[-600:]!r}"
     )
 
@@ -187,7 +275,7 @@ def test_a_forked_child_does_not_talk_down_the_parents_sockets(registry):
 FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
     """
     import os, sys, tinyray
-    from tinyray import _rpc
+    from tinyray import _tinyray
 
     class S:
         def echo(self, x): return x
@@ -208,7 +296,8 @@ FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
                 bad.append(f"{type(e).__name__}: {e}")
         return bad
 
-    hammer("warm", 3)   # 让共用的那个 client 装上父进程的 socket
+    hammer("warm", 3)   # 让原生连接池装上父进程的 socket
+    parent_generation = _tinyray.rpc_debug_state()["generation"]
 
     go_r, go_w = os.pipe()
     res_r, res_w = os.pipe()
@@ -216,12 +305,17 @@ FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
     if pid == 0:
         os.close(go_r); os.close(res_r)
         try:
-            carried = _rpc._sync is not None   # fork 之后还攥着父进程那个吗？
+            state = _tinyray.rpc_debug_state()
+            carried = state["idle_connections"]
+            reset = state["generation"] != parent_generation
             kid = tinyray.join("forksynccli", "churn")
             kid.ready()
             os.write(go_w, b"x")          # 加入完了再一起开打，让重叠最大
             bad = hammer("C", 400)
-            os.write(res_w, f"CHILD carried={carried} {len(bad)} {bad[:2]}".encode()[:400])
+            os.write(
+                res_w,
+                f"CHILD carried={carried} reset={reset} {len(bad)} {bad[:2]}".encode()[:400],
+            )
         except BaseException as e:
             os.write(res_w, f"CHILD-ERR {type(e).__name__}: {e}".encode()[:400])
         os._exit(0)
@@ -237,23 +331,7 @@ FORK_THEN_BOTH_CALL_SYNC = textwrap.dedent(
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")
 def test_a_forked_child_does_not_share_the_synchronous_connection(registry):
-    """同步这条路上，共用连接不是报错，是**拿回别人的答案**。
-
-    同步调用共用一个 httpx.Client —— 一个连接池，几条长连接。fork 把它连同
-    socket 一起复制过去，于是父子在同一条 keep-alive 连接上轮流发请求，应答就
-    按到达顺序发错了人。
-
-    实测父子各调 300 次，三轮里有两轮串号，而且是成对的：父进程 `want 'P118'`
-    拿到 `'C0'`，同一时刻子进程 `want 'C0'` 拿到 `'P118'`。**没有异常、没有
-    警告**，RPC 就是返回了另一个进程的结果 —— 比异步那条路上的 HTTP 400 更坏，
-    那边至少还会抛出来。
-
-    异步的连接池和继承来的管道都已经这么丢掉了。共用的这个是最后一个。
-
-    串号本身是竞态：单独跑 8/8 都能复现，但放进整轮变异检查里会飘过一次。所以
-    **确定性的主张是机制** —— 子进程 fork 之后手里不该还攥着那个 client；串号
-    作为它为什么要紧的证据留在这里一起断言。
-    """
+    """The synchronous path also starts from an empty child-native pool."""
     p = subprocess.Popen(
         [sys.executable, "-c", FORK_THEN_BOTH_CALL_SYNC],
         stdout=subprocess.PIPE,
@@ -267,12 +345,70 @@ def test_a_forked_child_does_not_share_the_synchronous_connection(registry):
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         out, err = p.communicate(timeout=10)
         raise AssertionError(f"fork 之后父子同步互调挂住了 stderr={err[-400:]!r}") from None
-    assert "CHILD carried=False" in out, (
-        f"子进程带着父进程那个 client 过了 fork：stdout={out!r} stderr={err[-600:]!r}"
+    assert "CHILD carried=0 reset=True" in out, (
+        f"子进程带着父进程连接过了 fork：stdout={out!r} stderr={err[-600:]!r}"
     )
-    assert "PARENT 0 []" in out and "CHILD carried=False 0 []" in out, (
+    assert "PARENT 0 []" in out and "CHILD carried=0 reset=True 0 []" in out, (
         f"父子共用了同一条同步连接：stdout={out!r} stderr={err[-600:]!r}"
     )
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork") or not os.path.isdir("/proc/self/fd"),
+    reason="needs fork() and procfs descriptor inodes",
+)
+def test_a_forked_child_closes_inherited_registry_sockets_only(registry):
+    """The child drops the active beat fd before abandoning its inherited runtime."""
+
+    class Service:
+        def echo(self, value: str) -> str:
+            return value
+
+    reply_gate = threading.Event()
+    proxy = OrderingProxy(registry.endpoint, reply_gate=reply_gate)
+    me = tinyray.join(
+        "forkbeat",
+        "stateful",
+        slot=0,
+        size=1,
+        serves=Service(),
+        registry_url=proxy.endpoint,
+    )
+    try:
+        me.ready().flush()
+        proxy.arm_reply.set()
+        me.ready(fork_probe=1)
+        assert proxy.reply_held.wait(5), "no heartbeat was held across fork"
+
+        fds = me._c.debug_registry_fds()
+        inherited = _proc_fd_links(fds)
+        inherited = {link for link in inherited if link.startswith("socket:[")}
+        assert inherited, f"the active registry socket was not tracked: fds={fds}"
+
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            child_links = _proc_fd_links()
+            leaked = sorted(inherited & child_links)
+            os.write(write_fd, repr(leaked).encode())
+            os._exit(0)
+
+        os.close(write_fd)
+        child_result = os.read(read_fd, 4096).decode()
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert child_result == "[]", f"child retained registry socket inode(s): {child_result}"
+
+        parent_links = _proc_fd_links()
+        assert inherited <= parent_links, "closing child descriptors damaged the parent socket"
+        reply_gate.set()
+        me.flush(timeout=10)
+        assert tinyray.pool("forkbeat").slot(0).echo("parent") == "parent"
+    finally:
+        reply_gate.set()
+        me.leave()
+        proxy.close()
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork()")

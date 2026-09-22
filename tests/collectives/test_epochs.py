@@ -452,7 +452,7 @@ def test_fencing_invalidates_epochs_even_without_a_final_cache_refresh(registry)
             assert epoch.valid, "Losing contact alone must not invalidate the epoch"
 
             replacement = Client(
-                endpoint=f"http://{registry.endpoint}",
+                endpoint=registry.endpoint,
                 pool=me.pool,
                 id=0,
                 incarnation=me.incarnation + 1,

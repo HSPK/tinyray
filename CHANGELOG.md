@@ -5,6 +5,252 @@
 
 ---
 
+## 0.18.0
+
+- 注册中心和方法 RPC 一起硬切到原生 Tokio TCP，没有 HTTP listener、JSON wire
+  或兼容 fallback。两者都复用 `u32` 大端长度 frame helper，并在分配 body 前检查
+  上限。方法端点改为裸 `host:port`；旧 `http://...` 地址会被明确拒绝。
+- 方法 call envelope 是 `{v,id,from,to,op,method?,batch?,body}`，reply 是
+  `{v,id,status,batch_index?,completed?,error?,body}`；`body` 用 `serde_bytes`
+  携带 Python 编码的 opaque MessagePack application value，Rust 不反序列化。
+  status 明确区分 success、method-not-found、fenced、caller fault、并发拒绝、
+  remote error、malformed protocol、internal/unknown outcome。方法 frame 上限
+  32 MiB，畸形、截断、超限、版本或 request ID 不匹配都会毒掉并丢弃连接。
+  首 frame、prefix、body 和连接 idle 共用绝对 15 秒读截止时间；连接数、在途 frame
+  数及字节数有 global/per-server 准入，小控制 frame 与 bulk frame 分预算。
+- 新的 process-global Tokio client runtime 按 endpoint/process generation 维护
+  持久连接池；一条连接同一时刻只跑一个请求，并发调用取多条连接。同步调用释放
+  GIL。连接、完整写入和回复阶段分别记账，保留 `NotDelivered` 与
+  `OutcomeUnknown` 的精确边界；timeout、cancel、EOF、partial write、decode 或
+  correlation 错误都不复用连接。endpoint pool 有界，local listener 关闭时对应
+  pool 当场失效。
+- async cancellation 只移除自己的 waiter，不中断独立 writer；即使取消正好撞上
+  frame 完整写出的瞬间，也会保留已发送 BlobRef owner 到迟到回复被消费，不再让
+  远端延迟 decode 偶发看到 stale fd。
+- 自动 request ID 在 caller identity 超过协议 200-byte 上限时保留前缀、SHA-256
+  与序号；显式固定 ID 的校验不变。方法与注册中心都先解最小 header，再解 typed
+  envelope，所以 unknown operation、缺 payload 或字段类型错误仍返回原 request ID。
+- 异步调用不再经过 `asyncio.to_thread` 或默认 executor。Python 建 Future，Rust
+  在 Tokio 上跑请求，再用 `loop.call_soon_threadsafe` 投递一个小 completion；
+  cancellation 只停止本地等待，并丢弃在途连接，不声称远端没执行。fork 后 child
+  用新 generation，lock-free FD 表关闭继承的 client/listener socket，不会串到
+  parent 的连接；心跳 TcpStream 也进入同一类 tracker，并在遗忘继承 runtime 前
+  关闭 child 副本。
+- `ThreadingHTTPServer` 被 PyO3 `RpcServer` 取代。Tokio accept loop 使用
+  SOMAXCONN backlog、`TCP_NODELAY`、持久连接、原生 target 检查与
+  `max_concurrency` try-admission，
+  Python callback 仍负责 signature/dataclass/同步与异步方法语义。`calls` 在写 reply
+  前记，`in_flight` 在写完后释放；batch 算一个请求。close 会停 accept、关闭
+  idle/live socket、终止未完成 connection task，并避免 interpreter shutdown
+  期间再进 Python callback。
+- Rust 心跳客户端保留首拍、绝对截止时间、取消、重试、fork 和拒绝分类语义，
+  并让每个 heartbeat loop 持久复用一条串行 TCP 连接。connect/write/read prefix/
+  read body 共用原绝对 deadline；只有完整且相关的 `beat_ack` 才归还连接。发布取消
+  长轮询、timeout、EOF、坏帧、错 request ID、拒绝与 registry epoch 重启都会
+  drop socket，下一拍懒重连。告别保持独立的一次性干净交换。Python/Rust 的
+  state、filter 和 discovery payload 改为 MessagePack bytes，不再在 FFI 上传
+  JSON 文本。
+- 注册中心 connection task 改为在同一 socket 上串行读取多张 beat frame，仍拒绝
+  pipelining；health/debug 保持 one-shot。连接有 35 秒 idle deadline、131,072
+  条全局 admission 上限和原有逐 frame 大小/超时限制；长轮询期间断连会立刻取消
+  hold。health 暴露 accept、active connection 和 frame 计数。
+- discovery cache 的成员改为不可变 `Arc<Member>`；每个 pool 最多缓存 all/ready
+  两份原生冻结视图与 id/slot 索引，成员或 readiness/state 变化时和序列化快照、
+  摘要一起失效。`Snapshot` / `Epoch` 的公开 Python 类型和 `members` tuple 不变，
+  但创建时不再编码/解码整份 roster，也不创建 Handle；第一次访问 `members` 或
+  迭代才物化并缓存。`len`、repr、`slot`、`get`、`ready` 子集和 `Epoch.valid`
+  直接走冻结原生视图；旧视图持有旧 Arc，后续发布、离场或注册中心重启都改不动。
+- Handle/AsyncHandle 改为持有 PyO3 `NativeMember`（共享同一 `Arc<Member>`）和可写
+  Python override。`Pool.all`、snapshot/epoch `members`、`slot`、`pick` 与内置等待
+  只创建轻量引用，不再构造整份 member dict，也不复制 state。`state` 第一次访问时
+  才生成独立 Python dict 并在该 Handle 上缓存；字段、identity/label、相等/hash、
+  方法代理、手工 Handle 构造、fork 与清理语义保持不变。
+- `Pool.all`、`wait(count/filter)`、`wait_departure`、`wait_replacement` 和
+  `epoch` 不再为条件检查往返整份 MessagePack roster。Rust 原生 waiter 在现有
+  revision/Condvar 上完成计数、身份、指纹、fencing、stale/no-size/mismatch 与
+  timeout 交接并释放 GIL；异步版本复用 event-loop bell，不使用
+  `asyncio.to_thread`、默认 executor 或 sleep/poll。任意 Python `until(predicate)`
+  仍保留在 Python。
+- heartbeat outcome、publication confirmation 与 discovery/lifecycle revision
+  拆成独立通知域。空 `beat_ack` 不再递增 cache revision、广播 Condvar 或写
+  event-loop pipe；首次注册也从 100 ms 分片 `wait_timeout` 改为一次绝对 deadline
+  等待。1,000 个安静 async watcher 连续四拍从 4,000 次重检、约 55 ms CPU 降为
+  **0 次重检、约 1.7 ms CPU**，join/flush/fencing 仍分别由自己的事件无缝交接。
+- 方法 application codec 改为 `msgspec.msgpack`。bytes、datetime、非字符串 map
+  key、NaN/Infinity 原生往返；普通 tuple/set 解成 array，`.returns(T)` 恢复声明
+  类型；超出 MessagePack 64-bit 范围的 Python int 用保留 ext type 精确往返。
+  标准 dataclass 直接编码，NamedTuple、TypedDict、Enum、datetime/UUID/Decimal
+  与类型化容器递归恢复；大整数复合 tuple/frozenset map key 也精确往返。
+  不再保留旧 `_json.py` 或 `httpx` 依赖。
+- BlobRef 的 per-message 计数、映射字节与 descriptor 去重仍由 thread-local scope
+  保证，但普通无扩展值先走无 scope 的快速 encoder/decoder，只有真的遇到
+  MessagePack extension 才重试受控路径。五轮中位数将 plain/dataclass/typed
+  encode 从 1.413/1.513/1.643 us 降到 0.681/0.781/0.911 us，dataclass/typed
+  restore 从 2.565/2.825 us 降到 0.862/1.142 us；BlobRef 安全与大整数语义不变。
+- **破坏性简化：0.18 完全移除 Pydantic 集成。** 删除 `tinyray[pydantic]` extra、
+  `_models.py`、TypeAdapter/model validator/serializer 路径、strict-shape wire
+  marker 与 ext 124/127 原有的 Pydantic 含义；ext 124 在下述 BlobRef 协议中重新
+  保留。Pydantic BaseModel、Pydantic dataclass 及包含
+  它们的返回类型都会明确抛 `TypeError`，不会静默当成 dict 或标准 dataclass。
+  需要这类模型的应用必须先显式转换成标准 dataclass、TypedDict 或普通
+  MessagePack 值。0.17 的历史支持记录保留在下面对应版本中。
+- 移除影响单独重录 `rpc_models` 三轮基线：plain/dataclass/TypedDict+NamedTuple
+  完整 RPC p50 为 0.2675/0.2719/0.2763 ms，100 项 dataclass batch 为
+  0.4934 ms。plain/dataclass/typed-container 编码为 0.641/0.742/0.871 us，
+  dataclass/typed-container 恢复为 0.772/1.052 us。相对本轮移除前的 dataclass
+  0.2940 ms，标准 dataclass 路径仍快 7.5%；旧 Pydantic workload 已删除，不能把
+  它的 payload 大小与新的 dataclass batch 当成同工作量比较。
+- Python 3.11.15、同机各三轮 release A/B（共享 24-vCPU 主机，不是空闲机校准）：
+  对 PyPI 0.17.0，普通 RPC p50 0.7735 -> 0.2326 ms（-69.9%），独立进程
+  0.6982 -> 0.2705 ms（-61.3%），async 1.4525 -> 0.3675 ms（-74.7%），
+  8 并发 1,019 -> 6,383 calls/s（+526%），32 项 batch 1.3109 -> 0.4841 ms
+  （-63.1%），dataclass 0.8406 -> 0.2719 ms（-67.7%）。`PyBackedBytes`
+  覆盖所有 Python bytes 提取边界后，
+  64 KiB 字符串回声最终为 0.4470 ms（比 0.17 快 56.2%），第一版硬切换记录的
+  +105.3% 退化已不存在，仍在既有噪声门内。
+  控制面大 payload 仍优先传引用。
+- 同机五轮 snapshot phase 中位数：5,000 成员 `snapshot()` 4.0072 ->
+  0.001032 ms（-99.97%），完整 Handle 物化 1.3778 ms，`all()` 4.0622 ->
+  1.3480 ms（-66.8%）；冻结视图 `len` / `slot` / `get` 分别为
+  0.000230 / 0.000712 / 0.000611 ms，`epoch()` 创建 0.001664 ms。
+  state 改为名单级 MessagePack 批量编码/单次 decode，并把结果安装到 Handle 的
+  真实 slot；小于 1 MiB 的编码随不可变 Rust 视图缓存。第一次读取全部 5,000 份
+  state 的 `all()` / snapshot 为 4.8658 / 5.0067 ms，同一批 Handle 再读为
+  0.1648 / 0.2499 ms，六条路径均快于 0.17 对照。
+- 顶层标量 state 等值过滤增加每 pool 有界 LRU 结果索引：最多 32 项、每项 8 个
+  字段/4 KiB 键/8,192 个 ID，总估算 1 MiB；嵌套与容器过滤保持原扫描。5,000
+  成员、625 个匹配者三轮中位热 count/pick 为 0.000561/0.001783 ms（原来
+  0.150039/0.158264 ms），冷构建为 0.444125/0.447807 ms；热 all/wait
+  0.160748/0.162572 ms。更新、readiness、移除、full resync 与 registry restart
+  都会失效索引，索引只保存 wire ID。
+- 多路复用前 RPC 对照三轮中位数为普通调用 0.2326 ms、64 KiB 0.4470 ms、
+  batch 0.4841 ms、8 线程 5,637 calls/s，作为本阶段比较基线。
+- 方法 RPC 连接改为 request-ID 相关的多路复用：每连接 128、每端点 256、
+  每进程 512 个在途调用，端点/进程物理连接上限 4/256，writer 串行、reader
+  独立路由乱序 reply。取消/超时移除 waiter，完整写出的迟到 reply 按已知 ID
+  丢弃；未知/重复 ID 或坏 reply 毒掉并分类全部在途调用。客户端按最小负载选择，
+  每条已有两个预留调用时继续扩到最多 4 条连接。三轮独立进程中位吞吐为
+  8/32/128 调用方 12,552/12,253/11,543 calls/s，物理连接数均为 4；
+  8 调用方 p50/p99 为 0.602158/1.832874 ms，三轮 p99 都不超过 2.734274 ms。
+  普通 p50/p99 0.263066/0.399071 ms、64 KiB 0.444255/0.731057 ms、
+  32 项 batch 0.564224 ms，均在旧基线 20% 门内。
+- 新增无 Python/PyO3 依赖的公开 Rust `tinyray` crate：`MemberBuilder` 可 join、
+  发布 state/readiness、flush 与 leave，`Router` 提供 raw/typed/单参数/no-args
+  async handler，`Client`/`Target` 提供 caller-controlled request ID 的 raw/serde
+  同步异步调用。Rust 与 Python 共用同一个 native listener；Rust handler 直接
+  await，Python `serves=` 通过 adapter 才进入 blocking pool/GIL。Python/Rust
+  mixed pool、batch first-failure、context/fencing、timeout/cancel、restart 与
+  方法广告均有交叉测试。
+- 同一个独立 Rust SDK client/transport 的三轮 handler 对照：raw no-op p50
+  Python/Rust 为 0.174334/0.097581 ms，64 KiB 为 0.339040/0.216983 ms，
+  typed payload 为 0.181216/0.098363 ms，32 项 batch 为
+  0.364817/0.114883 ms；8/32/128 调用方吞吐 Rust 为
+  56,090/114,551/129,489 calls/s，对应 Python 14,233/13,703/13,184。
+- 新增 Linux 同机显式 `BlobRef`：memfd 0600/CLOEXEC，write/grow/shrink/seal
+  全封口，只读 mmap；extension 124 的 descriptor 含 boot fingerprint、pid/fd、
+  size、device/inode 和由内核 `getrandom` 生成的 sealed header token。接收端在
+  mmap 前逐项验证，任何跨机、
+  过期、复用、未封口、权限或大小问题都抛 `BlobError`，绝不 fallback 成 bytes。
+  Python `.view()` 与 Rust `as_slice()` 零复制，显式 `bytes()` 才复制；同步/异步/
+  batch、Python↔Rust、retention、转发、cancel、fork 和 owner crash 均覆盖。
+  默认单对象上限 256 MiB，接收者在原 owner 退出后会把后续 descriptor 重新绑定到
+  自己已验证的 fd。每条消息最多 64 个 BlobRef、512 MiB 不重复映射；重复
+  descriptor 共享映射，直接 descriptor/serde 解码另有 128 handle、64 mapping、
+  512 MiB 的进程级兜底。完整写出后取消/超时的 request owner 保留到迟到 reply
+  或断连，response owner 则保留到接收方解码完成后的相关 ACK。
+  16 MiB 三轮中位普通 bytes/BlobRef 调用：Python 同进程
+  24.446/0.329 ms、跨进程 24.630/0.311 ms；Rust 同进程 160.679/0.150 ms、
+  跨进程 63.360/0.179 ms，descriptor 165–168 B。
+- BlobRef 二次加固：reply 在保留 owner 前先按不重复 backing object 计费，每条
+  reply 最多 64 个/512 MiB，未确认总量再受 connection 128/512 MiB、server
+  512/1 GiB、process 2,048/2 GiB 上限约束；未发 ACK 的恶意客户端只能耗尽自己的
+  有界额度，关闭连接立即归还，普通非 Blob RPC 仍可继续。Rust `call_raw*` 和
+  `request*` 返回持有 ACK 的 `ReceivedRawReply` / `ReceivedRpcReply`，typed decode
+  完成或 guard drop 后才确认。fork child 在遗忘继承 runtime 前通过独立的 lock-free
+  owner 表释放 pending/abandoned/response BlobRef，Python exported buffer 仍按引用
+  生命周期保留。descriptor 每次序列化都写当前 PID/本地 fd；descriptor 与 Rust
+  application MessagePack 都拒绝尾随字节；`from_file` 改用 positional read，保持
+  调用方 cursor，并检测读取期间的截断/增长。
+- BlobRef 第四轮审查修复当时仍分叉的两条 client path：迟到的 abandoned BlobRef reply
+  现在无条件排队相关 ACK；Rust/Python client 在 raw reply guard 存活时都不会进入
+  10 秒 idle eviction，server 对未确认 owner 使用 60 秒有界 ACK deadline。guard
+  drop/ACK 后连接重新进入正常 idle 回收。异步 connect 改为先创建非阻塞
+  `TcpSocket` 并登记 fd，再进入 await；成功时把登记转交给 established connection，
+  失败/取消时由 RAII 注销，fork child 在遗忘 runtime 前关闭 pending-connect fd，
+  parent 连接继续正常完成。
+- 方法 listener 的首字节读取改为 cancellation-safe readiness：`select!` 只竞争
+  `readable()`、shutdown、activity、request completion 和 deadline，只有 readiness
+  分支胜出后才 `try_read`。因此 request task/activity 与下一 frame 首字节同时到达时，
+  不会再由被取消的 consuming `read()` 偷走一个 byte，避免空 request ID、
+  malformed frame、Broken pipe 和整条 multiplexed connection 被误毒。readiness、
+  长度前缀和 body 也改为共享同一个绝对 deadline，不再在首字节后重新获得 15 秒。
+  Rust 与 Python 服务共用同一条公共 transport，并新增 128-way ordinary raw call 回归。
+- 将 heartbeat、持久 registry connection、本地 roster cache、原生 snapshot/wait、
+  scalar filter index 与 fork-safe fd tracker 从 PyO3 crate 抽成独立
+  `tinyray-membership` crate；公开 Rust SDK 与 Python extension 现在依赖同一 crate，
+  不再用跨 crate 的 `#[path]` 源文件包含。
+- 删除 `tinyray-client` 中已不再导出的旧 listener、server state、dispatch 和 framing
+  副本，`rpc.rs` 从 3,450 行缩到 2,308 行（删除 1,142 行，-33.1%）；Python
+  `MethodServer` 只包装公共 Rust `tinyray::Server`。测试增加 2,400 行上限，mutation
+  也全部改钉唯一生产路径，避免死代码上的假阳性。
+- 第二轮传输合并删除 `tinyray-client` 中剩余的 Python 专用 client pool、socket、
+  writer/reader、idle、admission、timeout/cancellation 与 reply routing 状态机；
+  PyO3 的同步/异步入口现在都包装公共 `tinyray::Client`，并在现有 Tokio runtime
+  内用 `Client::from_current()` 创建，不再启动第二套 runtime。`RpcOutcome` 直接持有
+  公共 `ReceivedRpcReply`，所以 BlobRef ACK guard 仍活到 Python outcome 被解码或
+  丢弃；`RpcCallTicket` 只桥接公共 cancellation handle 与 Tokio task。`rpc.rs`
+  从 2,308 行降到 853 行（再删除 1,455 行；相对 3,450 行原始版本共删除
+  2,597 行，-75.3%），对应代码预算收紧到 900 行。Python 与 Rust 调用现在共用
+  同一套连接池、fork FD 表、writer/reader、迟到 reply、ACK guard 与错误分类实现。
+- 公开 Rust SDK 新增 `DiscoveryPool`、Arc-backed `Snapshot` / `MemberRef` /
+  `Epoch`，提供 filter/count/pick/slot/get、冻结视图、epoch validity，以及同步/异步
+  count/departure/replacement wait。三轮 benchmark 在 5,000 成员下 snapshot 创建
+  约 0.00007 ms，5,000 个引用物化 0.0778 ms，完整 member/state clone 2.518 ms，
+  前者快 **34.1 倍**；四个新增 mutant 全部被定向测试捕获。
+- 方法 server 将完整消费检查后的 MessagePack frame 再按 borrowed request 解码，
+  application body 只做一次 Arc-owned copy，不再先生成 payload `Vec` 再复制。
+  64 KiB decode 从 81.782 us 降到 1.693 us（**48.5 倍**），1 MiB 从
+  59.911 us 降到 30.136 us（约 **2.0 倍**）；三轮端到端 64 KiB 普通 RPC
+  0.4443 -> 0.4104 ms，Rust handler 0.2170 -> 0.1786 ms。wire/API 不变。
+- 新增 leaf crate `tinyray-core`，将 fork-safe `FdTable` 从 membership 下沉，
+  transport 与 membership 都只依赖该基础层；公开 discovery 类型也从
+  `member.rs` 拆到独立 `discovery.rs`，member/discovery 分别约 522/438 行。
+- 继续按责任拆分大模块：原 3,502 行 `transport.rs` 变为 406 行公共
+  runtime/error/budget、1,923 行 client state machine 和 1,187 行 server/listener；
+  原 3,016 行 membership 单文件变为 `cache` 679、`shared` 503、`wait` 311、
+  `heartbeat` 401 行，测试独立 1,092 行，crate root 只保留 42 行导出。公开 API、
+  wire 和运行时行为不变，mutation anchor 同步指向新模块。
+- 新增公共 `RpcRuntime`，`MemberBuilder` 的 RPC client/server 默认共用一套
+  4-worker Tokio runtime。serving Rust member 的 native worker 从
+  2 membership + 4 client + 4 server = 10 个降到 **2 + 4 = 6 个**；三次冷 join
+  中位约 1.02 ms。两个 runtime 分裂 mutant 与 core 分层 mutant 均被捕获。
+- 连接复用实测：空闲 6 秒窗口内 11 次复用、0 次新连接；1,000 个成员各发 6 拍时，
+  持久模式 6,000 个 frame 只 accept 1,000 次，逐拍重连 accept 6,000 次，减少
+  **83.3%**，成功 beat 数均为 6,000，失败数均为 0，结束时 1,000 份租约全部仍在。
+  四轮同机 A/B 的中位 p50 为 0.667 / 2.308 ms，p99 为 60.414 / 67.663 ms，
+  连接复用没有换来租约或延迟回退。
+- 回归覆盖 framed partial/truncated/oversized/malformed 请求与回复、correlation、
+  persistent reuse/discard、写前/写后 timeout、async cancellation、fencing、request
+  ID、batch first-failure、stats 顺序、listener shutdown、fork、dataclass/类型化容器、
+  sync/async，以及原生 view 的 Arc 生命周期、缓存失效、重复座位、懒物化、
+  count/wait handoff、NativeMember 懒 state、标量过滤 LRU、RPC 乱序相关、取消迟到
+  reply、Rust/Python 交叉调用、重启与 fork。最终验证：Rust workspace 164 passed、
+  2 个显式 microbenchmark ignored；Python 默认集 743 passed、27 deselected，
+  examples 26 passed、slow 1 passed；cargo fmt/clippy、Windows target clippy、
+  Ruff、mypy、CPython 3.11/3.12 release wheel + registry/state smoke，以及
+  `rust_service` benchmark 连续 3/3 完整输出。最终 full benchmark gate 79/79
+  单轮全过，完整 mutation 264/264 caught，全部 anchor/selector 有效；第一轮
+  hardening 新增的
+  count/aggregate/dedup、pending owner、local descriptor、CSPRNG/token、嵌套
+  owner、fork registration 与 response ACK 共 16 个定向 mutant，以及二次 review
+  新增的 reply budget、raw ACK guard/idle、partial-batch error retention、fork
+  pending-owner cleanup、fork PID、trailing-byte 和 positional-read 共 17 个
+  定向 mutant 全被抓住；第四轮新增的 Python/Rust late-abandoned ACK 和
+  pending-connect tracking 四个 mirrored-path mutant，以及两个 consuming-read
+  frame-boundary mutant 也全部被抓住。
+
+---
+
 ## 0.17.0
 
 - RPC 参数和返回值可直接使用标准 dataclass 与 Pydantic 2 model。服务端参数注解负责
@@ -192,11 +438,11 @@ state 超尺寸、池形状不符 —— 注册中心**什么都没存**，所�
 
 上面那 41ms 不是 flush 的。实测 `update()` 到 ack：上一拍安顿好时 0.66ms，
 **连发 41ms**，二十次里十九次落在 40.83–42.22ms 的窄带上 —— 固定停顿，不是抖动。
-hyper 的 connector 默认不开 `TCP_NODELAY`，而一次心跳是"写-读-写"，第二次写要等
+Tokio 的 TCP socket 默认不开 `TCP_NODELAY`，而一次心跳是"写-读-写"，第二次写要等
 对端 40ms 的 delayed ACK。开了之后连发 **0.28ms**。
 
-注册中心那侧**没有**跟着开：实测发布路径和 watch 唤醒都纹丝不动（0.28 vs 0.28，
-51.49 vs 51.44），买不到东西就不加。
+注册中心和客户端两侧都显式开启；原生传输的一项请求占一条连接，不能把延迟留给
+任一端的默认值。
 
 **`join(registry_url=)`：去哪个注册中心报到。**
 

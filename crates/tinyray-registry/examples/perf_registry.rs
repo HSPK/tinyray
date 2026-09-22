@@ -1,7 +1,7 @@
 //! Portable before/after benchmark using only the v0.15.0 public API.
 //! Run in an otherwise idle measurement window:
 //! cargo run --release -p tinyray-registry --example perf_registry -- --iterations 2000
-//! This measures owned acknowledgment assembly, not HTTP/JSON encoding.
+//! This measures owned acknowledgment assembly, not framed MessagePack I/O.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -245,8 +245,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "scope": "public Registry::beat; owned ack assembly and assertions; no HTTP/JSON encoding",
-            "note": "Owned API still materializes shared payloads. Measure HTTP separately for shared-reply gains.",
+            "scope": "public Registry::beat; owned ack assembly and assertions; no framed MessagePack I/O",
+            "note": "Owned API still materializes shared payloads. Measure the native wire separately for shared-reply gains.",
             "config": {
                 "members": c.members, "payload_bytes": c.payload, "methods": c.methods,
                 "watched_pools": c.watched, "history_updates": c.history,

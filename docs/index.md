@@ -33,7 +33,8 @@ tinyray --listen 127.0.0.1:8760
 - **我该找谁** —— 按名字、座位或 state 过滤找人，然后直接调它的方法。
 - **一起点名** —— 冻住一轮名单，让每个 rank 拿到的必然相同。
 
-底下就是普通 HTTP，`curl` 排障的本事一点没丢。
+从 0.18 起，方法调用和注册中心都使用原生 TCP 长度前缀 MessagePack。方法端点是
+裸 `host:port`，连接会复用，两条传输都不提供 HTTP/JSON 兼容 listener。
 
 ## 它刻意不做
 
@@ -46,7 +47,8 @@ job 是什么、结果能有多大、能不能重跑。
 
 ## 状态
 
-**0.16.0 已发布**（[PyPI](https://pypi.org/project/tinyray/)），约 2,900 行。
+**0.18.0 已发布**（[PyPI](https://pypi.org/project/tinyray/)）。原生传输
+保留标准 dataclass 与类型化容器 RPC，刻意移除 Pydantic 集成。
 提供 py3.10–3.13 的 Linux x86_64 / aarch64 与 macOS universal2 wheel。
 
 多机与规模均已实测：三个容器跨网络命名空间互相发现并调用，指纹一致；10 万成员

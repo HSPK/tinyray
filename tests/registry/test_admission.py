@@ -7,12 +7,13 @@ peer must not be able to make a seat unusable or grow memory without bound.
 
 from __future__ import annotations
 
-import json
 import time
-import urllib.error
-import urllib.request
 
+import msgspec
 import pytest
+
+from tests.support.registry_wire import OP_ERROR, RegistryWireError, debug_pools, raw_exchange
+from tests.support.registry_wire import beat as registry_beat
 
 
 def beat(endpoint: str, **kw) -> dict:
@@ -32,19 +33,11 @@ def beat(endpoint: str, **kw) -> dict:
         "seen": {},
     }
     body.update(kw)
-    req = urllib.request.Request(
-        f"http://{endpoint}/v1/beat",
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    return registry_beat(endpoint, body)
 
 
 def pools(endpoint: str) -> dict:
-    with urllib.request.urlopen(f"http://{endpoint}/v1/pools", timeout=5) as r:
-        return json.loads(r.read())
+    return debug_pools(endpoint)
 
 
 def test_a_runaway_clock_cannot_lock_a_seat_forever(registry):
@@ -88,16 +81,54 @@ def test_watching_everything_is_refused(registry):
 
 def test_malformed_bodies_are_rejected_without_killing_anything(registry):
     ep = registry.endpoint
-    for raw in (b"", b"not json", b"[1,2,3]", b'{"pool":"p"}', b'{"pool":"p","id":"one"}'):
-        req = urllib.request.Request(
-            f"http://{ep}/v1/beat",
-            data=raw,
-            headers={"content-type": "application/json"},
-            method="POST",
-        )
-        with pytest.raises(urllib.error.HTTPError) as e:
-            urllib.request.urlopen(req, timeout=5)
-        assert e.value.code == 400
+    malformed = (
+        (b"", 0, {"empty_frame"}),
+        (b"\xc1", 0, {"malformed_frame"}),
+        (msgspec.msgpack.encode([1, 2, 3]), 0, {"malformed_frame"}),
+        (
+            msgspec.msgpack.encode({"request_id": 7, "operation": "beat"}),
+            7,
+            {"malformed_request"},
+        ),
+        (
+            msgspec.msgpack.encode(
+                {"request_id": 8, "operation": "beat", "payload": {"pool": "p"}}
+            ),
+            8,
+            {"malformed_request"},
+        ),
+        (
+            msgspec.msgpack.encode(
+                {
+                    "request_id": 9,
+                    "operation": "beat",
+                    "payload": {
+                        "pool": "p",
+                        "id": "one",
+                        "incarnation": 1,
+                        "policy": "churn",
+                    },
+                },
+            ),
+            9,
+            {"malformed_request"},
+        ),
+        (
+            msgspec.msgpack.encode({"request_id": 10, "operation": "teleport"}),
+            10,
+            {"unknown_operation"},
+        ),
+        (
+            msgspec.msgpack.encode({"request_id": 11, "operation": 7, "payload": None}),
+            11,
+            {"malformed_request"},
+        ),
+    )
+    for raw, request_id, codes in malformed:
+        reply = raw_exchange(ep, raw)
+        assert reply["operation"] == OP_ERROR
+        assert reply["request_id"] == request_id
+        assert reply["payload"]["code"] in codes
     # Still serving afterwards.
     assert beat(ep, pool="after", id=1)["accepted"] is True
 
@@ -112,14 +143,13 @@ def test_a_body_too_big_to_be_a_beat_is_refused_before_it_is_read(registry):
     个名字。所以这条只有手写请求能试，而它防的就是手写请求。
 
     实测（上限 512 KiB）：1 KiB 正常受理；400 KiB 进得来但因为状态超标被拒
-    （`accepted=False`，是内容的问题不是尺寸的问题）；600 KiB 拿到 **413**。
-    再大就会在写到一半时收到 Broken pipe —— 服务端不肯把剩下的读完只为了礼貌地
-    回一句，这是 HTTP 服务器的常规做法，所以这里断言的是那个还能干净回话的尺寸。
+    （`accepted=False`，是内容的问题不是尺寸的问题）；600 KiB 收到结构化的
+    `frame_too_large`，而且服务端没有按声明的尺寸分配。
     """
     # 尺寸之内、内容超标：413 之外的另一条路，确认这两件事没有混为一谈。
     fat_state = beat(registry.endpoint, pool="big", state={"pad": "x" * (400 << 10)})
     assert fat_state["accepted"] is False, "400 KiB 的状态该因为内容被拒"
 
-    with pytest.raises(urllib.error.HTTPError) as e:
+    with pytest.raises(RegistryWireError) as caught:
         beat(registry.endpoint, pool="big", state={"pad": "x" * (600 << 10)})
-    assert e.value.code == 413, f"超过上限的请求体应该是 413，拿到的是 {e.value.code}"
+    assert caught.value.code == "frame_too_large"

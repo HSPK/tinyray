@@ -12,16 +12,17 @@ Run against one build:
     python bench.py                     # human table
     python bench.py --json out.json     # machine-readable
 
-Every scenario is feature-detected, because this same file is meant to run
-against old wheels: anything the build cannot do is reported n/a rather than
-crashing, so one script can compare versions that do not share an API.
+Every scenario is feature-detected within one wire generation: anything the
+build cannot do is reported n/a rather than crashing. The 0.18 native registry
+and method cutovers have no HTTP fallback, so older wheels need their matching
+historical benchmark script.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
-import importlib.metadata
 import inspect
 import json
 import math
@@ -33,19 +34,22 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
+import warnings
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, TypedDict
 
-import httpx
 import msgspec
 import tinyray
+from tinyray import _msgpack
+
+from tests.support.registry_wire import beat as registry_beat
+from tests.support.registry_wire import debug_pools as registry_debug_pools
+from tests.support.registry_wire import health as registry_health
 
 TTL_MS = 2000
 FORMAT_VERSION = 2
@@ -89,13 +93,12 @@ class Registry:
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(f"http://{self.endpoint}/health", timeout=0.5) as r:
-                    if r.status == 200:
-                        self.previous_endpoint = os.environ.get("TINYRAY_REGISTRY")
-                        os.environ["TINYRAY_REGISTRY"] = self.endpoint
-                        _registries.append(self)
-                        return self
-            except (urllib.error.URLError, OSError):
+                if registry_health(self.endpoint, timeout=0.5)["status"] == "ok":
+                    self.previous_endpoint = os.environ.get("TINYRAY_REGISTRY")
+                    os.environ["TINYRAY_REGISTRY"] = self.endpoint
+                    _registries.append(self)
+                    return self
+            except (ConnectionError, EOFError, OSError, RuntimeError, TimeoutError):
                 time.sleep(0.02)
         self.stop()
         raise RuntimeError("registry did not come up")
@@ -199,11 +202,23 @@ def publish(member: Any, **state: Any) -> None:
 # scenarios
 # --------------------------------------------------------------------------
 class Service:
+    def ping_raw(self) -> str:
+        return "pong"
+
     def ping(self) -> str:
         return "pong"
 
     def echo(self, blob: str) -> str:
         return blob
+
+    def job(self, value):
+        return value
+
+    def bytes_len(self, value: bytes) -> int:
+        return len(value)
+
+    def blob_len(self, value: tinyray.BlobRef) -> int:
+        return len(value)
 
     def nothing(self) -> None:
         return None
@@ -272,6 +287,47 @@ def rpc_rate(handle: Any, threads: int = 8, duration: float = 5.0) -> int:
             stop.set()
         count = sum(future.result(timeout=35) for future in futures)
     return round(count / (time.perf_counter() - t0))
+
+
+def rpc_concurrent_measure(handle: Any, threads: int, duration: float = 3.0) -> dict[str, Any]:
+    stop = threading.Event()
+    gate = threading.Barrier(threads + 1)
+
+    def worker() -> list[float]:
+        samples = []
+        gate.wait()
+        while not stop.is_set():
+            started = time.perf_counter()
+            if handle.ping() != "pong":
+                raise RuntimeError("RPC benchmark returned an unexpected result")
+            samples.append(time.perf_counter() - started)
+        return samples
+
+    before = tinyray._tinyray.rpc_debug_state()
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=threads) as workers:
+        futures = [workers.submit(worker) for _ in range(threads)]
+        gate.wait()
+        try:
+            time.sleep(duration)
+        finally:
+            stop.set()
+        samples = [
+            sample
+            for future in futures
+            for sample in future.result(timeout=max(35, int(duration) + 30))
+        ]
+    elapsed = time.perf_counter() - t0
+    after = tinyray._tinyray.rpc_debug_state()
+    connections = after["connections"]
+    return percentiles(samples) | {
+        "calls": len(samples),
+        "calls_per_s": round(len(samples) / elapsed),
+        "connections": connections,
+        "connection_reduction": round(1 - connections / threads, 6),
+        "connections_opened": after["connections_opened"] - before["connections_opened"],
+        "in_flight_after": after["in_flight"],
+    }
 
 
 def bench_rpc_payload() -> dict[str, Any]:
@@ -369,9 +425,11 @@ def bench_idle_beat_rate() -> dict[str, Any]:
             tinyray.pool("quiet")
             time.sleep(1.0)
             before = me.stats()
+            before_transport = me._c.debug_registry_transport()
             t0 = time.perf_counter()
             time.sleep(6.0)
             after = me.stats()
+            after_transport = me._c.debug_registry_transport()
             elapsed = time.perf_counter() - t0
             sent = (after.get("beats_ok", 0) - before.get("beats_ok", 0)) + (
                 after.get("beats_failed", 0) - before.get("beats_failed", 0)
@@ -379,7 +437,80 @@ def bench_idle_beat_rate() -> dict[str, Any]:
             return {
                 "beats_per_s": round(sent / elapsed, 2),
                 "interval_ms": before.get("interval_ms"),
+                "connections_opened": (
+                    after_transport["connections"] - before_transport["connections"]
+                ),
+                "connections_total": after_transport["connections"],
+                "reuses": after_transport["reuses"] - before_transport["reuses"],
             }
+        finally:
+            leave_members()
+
+
+def bench_idle_waiters() -> dict[str, Any]:
+    """A quiet heartbeat must not fan out across local discovery waiters."""
+    if not hasattr(tinyray._tinyray.Client, "debug_beat_revision"):
+        raise UnsupportedScenario("this build cannot distinguish heartbeat and cache revisions")
+
+    with Registry():
+        me = joined("idle-waiter-observer", "churn")
+        me.ready()
+        settle(me)
+        tinyray.pool("idle-waiters").snapshot()
+
+        async def measure() -> dict[str, Any]:
+            count = 1000
+            pool = tinyray.apool("idle-waiters")
+            watches = [pool.achanges(timeout=20) for _ in range(count)]
+            tasks: list[asyncio.Task[Any]] = []
+            calls = 0
+            original = tinyray._Watching._step
+
+            def counted(watch):
+                nonlocal calls
+                calls += 1
+                return original(watch)
+
+            tinyray._Watching._step = counted
+            try:
+                tasks = [asyncio.create_task(anext(watch)) for watch in watches]
+                bell = tinyray._loop_bell(me._c)
+                while len(bell._waiters) < count:
+                    await asyncio.sleep(0)
+                calls = 0
+                before_wakeups = me.stats()["watch_wakeups"]
+                before_beats = me.stats()["beats_ok"]
+                target = before_beats + 4
+                cpu_started = time.process_time()
+
+                def wait_for_beats() -> None:
+                    deadline = time.monotonic() + 5
+                    while me.stats()["beats_ok"] < target:
+                        revision = me._c.debug_beat_revision()
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            raise RuntimeError("idle heartbeat benchmark timed out")
+                        me._c.debug_wait_beat_revision(revision, int(left * 1000) + 1)
+
+                await asyncio.to_thread(wait_for_beats)
+                cpu_ms = (time.process_time() - cpu_started) * 1000
+                await asyncio.sleep(0)
+                return {
+                    "waiters": count,
+                    "beats": me.stats()["beats_ok"] - before_beats,
+                    "rechecks": calls,
+                    "watch_wakeups": me.stats()["watch_wakeups"] - before_wakeups,
+                    "cpu_ms": round(cpu_ms, 3),
+                }
+            finally:
+                for watch in watches:
+                    watch.close()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                tinyray._Watching._step = original
+
+        try:
+            return asyncio.run(measure())
         finally:
             leave_members()
 
@@ -480,11 +611,98 @@ class Crowd:
                 self.proc.wait(timeout=5)
 
 
+def _loadgen_connections(reconnect_every_beat: bool) -> dict[str, Any]:
+    binary = loadgen_binary()
+    if binary is None:
+        raise RuntimeError("no loadgen built; run cargo build --release --bin loadgen")
+    with Registry() as reg:
+        before = registry_health(reg.endpoint)
+        command = [
+            binary,
+            "--endpoint",
+            reg.endpoint,
+            "--members",
+            "1000",
+            "--seconds",
+            "3",
+            "--interval-ms",
+            "500",
+            "--watchers",
+            "0",
+        ]
+        if reconnect_every_beat:
+            command.append("--reconnect-every-beat")
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        if completed.returncode:
+            raise RuntimeError(completed.stderr[-500:])
+        result = json.loads(completed.stdout)
+        after = registry_health(reg.endpoint)
+        # The second health call counts its own one-shot connection/frame.
+        result["server_accepts"] = (
+            after["connections_accepted"] - before["connections_accepted"] - 1
+        )
+        result["server_frames"] = after["frames_received"] - before["frames_received"] - 1
+        result["live_members"] = (
+            registry_debug_pools(reg.endpoint).get("load", {}).get("members", 0)
+        )
+        return result
+
+
+def bench_registry_connections() -> dict[str, Any]:
+    """A thousand members: persistent sockets versus reconnecting every beat."""
+    persistent = _loadgen_connections(False)
+    reconnecting = _loadgen_connections(True)
+    for mode, result in (("persistent", persistent), ("reconnecting", reconnecting)):
+        if result["beats_failed"]:
+            raise RuntimeError(f"{mode} mode lost {result['beats_failed']} beat(s)")
+        if result["live_members"] != result["members"]:
+            raise RuntimeError(
+                f"{mode} mode kept {result['live_members']} of {result['members']} leases alive"
+            )
+    saved = reconnecting["connections"] - persistent["connections"]
+    return {
+        "members": persistent["members"],
+        "persistent_beats": persistent["beats_ok"],
+        "persistent_failures": persistent["beats_failed"],
+        "persistent_live_members": persistent["live_members"],
+        "persistent_connections": persistent["connections"],
+        "persistent_server_accepts": persistent["server_accepts"],
+        "persistent_server_frames": persistent["server_frames"],
+        "persistent_reuses": persistent["reuses"],
+        "persistent_p50_us": persistent["p50_us"],
+        "persistent_p99_us": persistent["p99_us"],
+        "persistent_max_us": persistent["max_us"],
+        "reconnecting_beats": reconnecting["beats_ok"],
+        "reconnecting_failures": reconnecting["beats_failed"],
+        "reconnecting_live_members": reconnecting["live_members"],
+        "reconnecting_connections": reconnecting["connections"],
+        "reconnecting_server_accepts": reconnecting["server_accepts"],
+        "reconnecting_server_frames": reconnecting["server_frames"],
+        "reconnecting_p50_us": reconnecting["p50_us"],
+        "reconnecting_p99_us": reconnecting["p99_us"],
+        "reconnecting_max_us": reconnecting["max_us"],
+        "connections_saved": saved,
+        "accept_reduction": round(saved / reconnecting["connections"], 6),
+        "persistent_p50_ratio": round(persistent["p50_us"] / max(reconnecting["p50_us"], 1), 6),
+        "persistent_p99_ratio": round(persistent["p99_us"] / max(reconnecting["p99_us"], 1), 6),
+    }
+
+
 def timed(fn: Callable[[], Any], rounds: int = 200) -> float:
     for _ in range(5):
         fn()
     samples = []
     for _ in range(rounds):
+        t0 = time.perf_counter()
+        fn()
+        samples.append(time.perf_counter() - t0)
+    return round(statistics.median(samples) * 1000, 6)
+
+
+def timed_cold(clear: Callable[[], Any], fn: Callable[[], Any], rounds: int = 50) -> float:
+    samples = []
+    for _ in range(rounds):
+        clear()
         t0 = time.perf_counter()
         fn()
         samples.append(time.perf_counter() - t0)
@@ -511,19 +729,56 @@ def bench_lookup_scaling() -> dict[str, Any]:
     if loadgen_binary() is None:
         raise RuntimeError("no loadgen built; run cargo build --release --bin loadgen")
     out: dict[str, Any] = {}
-    for size in (10, 100, 1000):
+    for size in (100, 1000, 5000):
         with Registry() as reg, Crowd(reg.endpoint, size):
             try:
                 me = joined("watch", "churn")
                 me.ready()
                 pool = tinyray.pool("load")
                 pool.wait(count=size, timeout=90)
+                snapshot = pool.snapshot()
+                cached_all = pool.all()
+                _ = [handle.state for handle in cached_all]
+                cached_snapshot = pool.snapshot()
+                cached_snapshot_members = cached_snapshot.members
+                _ = [handle.state for handle in cached_snapshot_members]
+                identity = pool.pick().identity
+                shard_filter = msgspec.msgpack.encode({"shard": 3})
                 row: dict[str, Any] = {
                     "all_ms": timed(lambda p=pool: p.all()),
+                    "all_state_ms": timed(
+                        lambda p=pool: [handle.state for handle in p.all()], rounds=50
+                    ),
                     "all_filtered_ms": timed(lambda p=pool: p.all(shard=3)),
                     "pick_ms": timed(lambda p=pool: p.pick()),
                     "pick_filtered_ms": timed(lambda p=pool: p.pick(shard=3)),
                     "snapshot_ms": timed(lambda p=pool: p.snapshot()),
+                    "snapshot_materialize_ms": timed(
+                        lambda p=pool: p.snapshot().members, rounds=50
+                    ),
+                    "snapshot_state_ms": timed(
+                        lambda p=pool: tuple(handle.state for handle in p.snapshot().members),
+                        rounds=50,
+                    ),
+                    "cached_all_state_ms": timed(
+                        lambda handles=cached_all: [handle.state for handle in handles],
+                        rounds=50,
+                    ),
+                    "cached_snapshot_state_ms": timed(
+                        lambda handles=cached_snapshot_members: tuple(
+                            handle.state for handle in handles
+                        ),
+                        rounds=50,
+                    ),
+                    "snapshot_len_ms": timed(lambda s=snapshot: len(s)),
+                    "snapshot_get_ms": timed(lambda s=snapshot, key=identity: s.get(key)),
+                    "pool_len_ms": timed(lambda p=pool: len(p)),
+                    "count_filtered_ms": timed(
+                        lambda c=pool._c, raw=shard_filter: c.count("load", raw, True)
+                    ),
+                    "wait_count_ms": timed(
+                        lambda p=pool: p.wait(count=1, timeout=30, shard=3), rounds=50
+                    ),
                 }
                 digest = getattr(tinyray._client, "field_digest", None)
                 if callable(digest):
@@ -786,6 +1041,272 @@ class RemoteService:
         self.stop()
 
 
+def rust_service_binary() -> str | None:
+    env = os.environ.get("TINYRAY_RUST_SERVICE")
+    if env:
+        return env if Path(env).exists() else None
+    binary = Path(__file__).resolve().parent / "target/release/examples/rust_service"
+    return str(binary) if binary.exists() else None
+
+
+def rust_bench_client_binary() -> str | None:
+    env = os.environ.get("TINYRAY_RUST_BENCH_CLIENT")
+    if env:
+        return env if Path(env).exists() else None
+    binary = Path(__file__).resolve().parent / "target/release/examples/rust_bench_client"
+    return str(binary) if binary.exists() else None
+
+
+def rust_blob_bench_binary() -> str | None:
+    env = os.environ.get("TINYRAY_RUST_BLOB_BENCH")
+    if env:
+        return env if Path(env).exists() else None
+    binary = Path(__file__).resolve().parent / "target/release/examples/rust_blob_bench"
+    return str(binary) if binary.exists() else None
+
+
+def rust_discovery_bench_binary() -> str | None:
+    env = os.environ.get("TINYRAY_RUST_DISCOVERY_BENCH")
+    if env:
+        return env if Path(env).exists() else None
+    binary = Path(__file__).resolve().parent / "target/release/examples/rust_discovery_bench"
+    return str(binary) if binary.exists() else None
+
+
+def rpc_copy_bench_binary() -> str | None:
+    env = os.environ.get("TINYRAY_RPC_COPY_BENCH")
+    if env:
+        return env if Path(env).exists() else None
+    binary = Path(__file__).resolve().parent / "target/release/examples/rpc_copy_bench"
+    return str(binary) if binary.exists() else None
+
+
+def rust_runtime_bench_binary() -> str | None:
+    env = os.environ.get("TINYRAY_RUST_RUNTIME_BENCH")
+    if env:
+        return env if Path(env).exists() else None
+    binary = Path(__file__).resolve().parent / "target/release/examples/rust_runtime_bench"
+    return str(binary) if binary.exists() else None
+
+
+class RustRemoteService:
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+        self.proc: subprocess.Popen | None = None
+
+    def __enter__(self) -> Any:
+        binary = rust_service_binary()
+        if binary is None:
+            raise UnsupportedScenario(
+                "no Rust SDK example built; run cargo build --release "
+                "-p tinyray --example rust_service"
+            )
+        with ExitStack() as cleanup:
+            self.proc = subprocess.Popen(
+                [binary, self.endpoint, "rust-remote", "0", "1"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            cleanup.callback(self.stop)
+            if self.proc.stdout is None or not self.proc.stdout.readline().startswith("READY "):
+                error = self.proc.stderr.read()[-500:] if self.proc.stderr else ""
+                raise RuntimeError(f"Rust SDK benchmark callee did not start: {error}")
+            me = joined("rust-bench-caller")
+            me.ready()
+            settle(me)
+            handle = tinyray.pool("rust-remote").wait(count=1, timeout=20)[0]
+            cleanup.pop_all()
+            return handle
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            try:
+                self.proc.communicate("\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.communicate(timeout=5)
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+
+def _handler_metrics(handle: Any) -> dict[str, Any]:
+    for _ in range(100):
+        handle.ping()
+    no_op = []
+    for _ in range(1000):
+        started = time.perf_counter()
+        if handle.ping() != "pong":
+            raise RuntimeError("handler benchmark returned an unexpected ping")
+        no_op.append(time.perf_counter() - started)
+
+    blob = "x" * (64 << 10)
+    payload = []
+    for _ in range(200):
+        started = time.perf_counter()
+        if handle.echo(blob) != blob:
+            raise RuntimeError("handler benchmark returned an unexpected payload")
+        payload.append(time.perf_counter() - started)
+
+    job = {"task_id": "rollout", "step": 7, "scores": [0.25, 0.5, 0.75]}
+    typed = []
+    for _ in range(500):
+        started = time.perf_counter()
+        if handle.job(job) != job:
+            raise RuntimeError("handler benchmark returned an unexpected typed payload")
+        typed.append(time.perf_counter() - started)
+
+    calls = [tinyray.Call("ping") for _ in range(32)]
+    batch_ms = timed(lambda: tinyray.batch(handle, calls), rounds=40)
+    concurrency = {
+        str(callers): rpc_concurrent_measure(handle, callers, duration=2)
+        for callers in (1, 8, 32, 128)
+    }
+    return {
+        "no_op": percentiles(no_op),
+        "payload_64k": percentiles(payload),
+        "typed": percentiles(typed),
+        "batch_32_ms": batch_ms,
+        "concurrency": concurrency,
+    }
+
+
+def _rust_client_handler_metrics(handle: Any) -> dict[str, Any]:
+    binary = rust_bench_client_binary()
+    if binary is None:
+        raise UnsupportedScenario(
+            "no Rust benchmark client built; run cargo build --release -p tinyray "
+            "--example rust_bench_client"
+        )
+    completed = subprocess.run(
+        [binary, handle.url, handle.identity],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if completed.returncode:
+        raise RuntimeError(completed.stderr[-800:])
+    result = json.loads(completed.stdout)
+    if not isinstance(result, dict):
+        raise RuntimeError("Rust benchmark client returned no result object")
+    return result
+
+
+def bench_rust_service() -> dict[str, Any]:
+    """Same native transport with Python/GIL and direct Rust handlers."""
+    with Registry() as registry:
+        try:
+            with RemoteService() as python_handle:
+                tinyray._tinyray.rpc_debug_clear_pools()
+                python = _rust_client_handler_metrics(python_handle)
+            leave_members()
+            with RustRemoteService(registry.endpoint) as rust_handle:
+                tinyray._tinyray.rpc_debug_clear_pools()
+                rust = _rust_client_handler_metrics(rust_handle)
+            return {
+                "python": python,
+                "rust": rust,
+                "no_op_speedup": round(
+                    python["no_op"]["p50_ms"] / max(rust["no_op"]["p50_ms"], 1e-9), 6
+                ),
+                "throughput_8_speedup": round(
+                    rust["concurrency"]["8"]["calls_per_s"]
+                    / max(python["concurrency"]["8"]["calls_per_s"], 1),
+                    6,
+                ),
+            }
+        finally:
+            leave_members()
+
+
+def _python_blob_metrics(handle: Any) -> dict[str, Any]:
+    out = {}
+    for size in (64 << 10, 1 << 20, 16 << 20):
+        data = b"x" * size
+        creation_rounds = 5 if size >= 16 << 20 else 20
+        creation_samples = []
+        for _ in range(creation_rounds):
+            started = time.perf_counter()
+            made = tinyray.blob(data)
+            creation_samples.append(time.perf_counter() - started)
+            made.close()
+        blob = tinyray.blob(data)
+        ordinary_rounds = 5 if size >= 16 << 20 else 30
+        blob_rounds = 50 if size >= 16 << 20 else 100
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", tinyray.OversizeWarning)
+            ordinary_ms = timed(
+                lambda h=handle, value=data: h.bytes_len(value),
+                rounds=ordinary_rounds,
+            )
+        blob_ms = timed(
+            lambda h=handle, value=blob: h.blob_len(value),
+            rounds=blob_rounds,
+        )
+        view = blob.view()
+        access_ms = timed(lambda value=view: value[0], rounds=500)
+        view.release()
+        out[str(size)] = {
+            "creation_ms": round(statistics.median(creation_samples) * 1000, 6),
+            "ordinary_call_ms": ordinary_ms,
+            "blob_call_ms": blob_ms,
+            "access_ms": access_ms,
+            "ordinary_wire_bytes": len(_msgpack.dumps({"args": [data], "kwargs": {}})),
+            "blob_wire_bytes": len(_msgpack.dumps({"args": [blob], "kwargs": {}})),
+        }
+        blob.close()
+    return out
+
+
+def bench_blobref() -> dict[str, Any]:
+    """Explicit same-host memfd transport versus ordinary MessagePack bytes."""
+    if sys.platform != "linux":
+        raise UnsupportedScenario("BlobRef requires Linux memfd and /proc")
+    rust_bench = rust_blob_bench_binary()
+    if rust_bench is None:
+        raise UnsupportedScenario(
+            "no Rust BlobRef benchmark built; run cargo build --release -p tinyray "
+            "--example rust_blob_bench"
+        )
+    with Registry() as registry:
+        try:
+            local = serving_member("blob-local")
+            local.ready()
+            settle(local)
+            python_same = _python_blob_metrics(
+                tinyray.pool("blob-local").wait(count=1, timeout=20)[0]
+            )
+            leave_members()
+
+            with RemoteService() as python_handle:
+                python_separate = _python_blob_metrics(python_handle)
+            leave_members()
+
+            with RustRemoteService(registry.endpoint) as rust_handle:
+                rust_separate = _python_blob_metrics(rust_handle)
+            leave_members()
+
+            completed = subprocess.run(
+                [rust_bench],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if completed.returncode:
+                raise RuntimeError(completed.stderr[-800:])
+            rust_same = json.loads(completed.stdout)
+            return {
+                "python_same": python_same,
+                "python_separate": python_separate,
+                "rust_separate": rust_separate,
+                "rust_same": rust_same,
+            }
+        finally:
+            leave_members()
+
+
 def bench_rpc_separate() -> dict[str, Any]:
     with Registry(), RemoteService() as handle:
         for _ in range(200):
@@ -804,10 +1325,17 @@ def bench_rpc_separate() -> dict[str, Any]:
 
 def bench_rpc_concurrency() -> dict[str, Any]:
     with Registry(), RemoteService() as handle:
+        tinyray._tinyray.rpc_debug_clear_pools()
+        before = tinyray._tinyray.rpc_debug_state()
         handle.ping()
+        warm = tinyray._tinyray.rpc_debug_state()
         return {
             "topology": "separate_processes",
-            "calls_per_s": {str(n): rpc_rate(handle, n, duration=3) for n in (1, 4, 8)},
+            "connections": warm["connections"],
+            "connections_opened": warm["connections_opened"] - before["connections_opened"],
+            "callers": {
+                str(n): rpc_concurrent_measure(handle, n, duration=3) for n in (1, 4, 8, 32, 128)
+            },
         }
 
 
@@ -840,14 +1368,11 @@ def bench_rpc_batch() -> dict[str, Any]:
 
 
 def bench_rpc_models() -> dict[str, Any]:
-    """Typed models, including both codec cost and a full RPC round trip."""
-    try:
-        from pydantic import BaseModel, ConfigDict, Field
-        from tinyray import _json
-    except ImportError as exc:
-        raise UnsupportedScenario("Pydantic is not installed") from exc
-    if not hasattr(_json, "convert"):
-        raise UnsupportedScenario("this build cannot encode typed RPC models")
+    """Dataclasses and typed containers, including codec and RPC costs."""
+    from tinyray import _msgpack
+
+    if not hasattr(_msgpack, "convert_msgpack"):
+        raise UnsupportedScenario("this build cannot directly materialize typed MessagePack")
 
     @dataclass(frozen=True)
     class Data:
@@ -856,13 +1381,26 @@ def bench_rpc_models() -> dict[str, Any]:
         scores: tuple[float, float]
         created_at: datetime
 
-    class Model(BaseModel):
-        model_config = ConfigDict(populate_by_name=True)
+    class TaskKey(NamedTuple):
+        task_id: str
+        attempt: int
 
-        task_id: str = Field(alias="taskId")
+    class TypedPayload(TypedDict):
+        data: Data
+        key: TaskKey
+        tags: tuple[str, str]
+
+    @dataclass(frozen=True)
+    class DataBatch:
+        items: list[Data]
         step: int
-        scores: tuple[float, float]
-        created_at: datetime
+
+    TypedPayload.__annotations__ = {
+        "data": Data,
+        "key": TaskKey,
+        "tags": tuple[str, str],
+    }
+    DataBatch.__annotations__ = {"items": list[Data], "step": int}
 
     class Models:
         def raw(self, value):
@@ -871,41 +1409,84 @@ def bench_rpc_models() -> dict[str, Any]:
         def data(self, value):
             return value
 
-        def model(self, value):
+        def typed(self, value):
             return value
 
         def data_manual(self, value):
             restored = msgspec.convert(value, Data, strict=False)
             return msgspec.to_builtins(restored)
 
-        def model_manual(self, value):
-            restored = Model.model_validate(value)
-            return restored.model_dump(mode="json", by_alias=True)
+        def typed_manual(self, value):
+            restored = msgspec.convert(value, TypedPayload, strict=False)
+            return msgspec.to_builtins(restored)
+
+        def bulk(self, value):
+            return value
+
+        def bulk_manual(self, value):
+            restored = msgspec.convert(value, DataBatch, strict=False)
+            return msgspec.to_builtins(restored)
 
     Models.data.__annotations__ = {"value": Data, "return": Data}
-    Models.model.__annotations__ = {"value": Model, "return": Model}
+    Models.typed.__annotations__ = {"value": TypedPayload, "return": TypedPayload}
+    Models.bulk.__annotations__ = {"value": DataBatch, "return": DataBatch}
 
     created_at = datetime(2026, 9, 17, 16, 0, tzinfo=timezone.utc)
     data = Data("task-7", 3, (0.25, 0.75), created_at)
-    model = Model(task_id="task-7", step=3, scores=(0.25, 0.75), created_at=created_at)
     raw_data = {
         "task_id": "task-7",
         "step": 3,
         "scores": [0.25, 0.75],
-        "created_at": "2026-09-17T16:00:00Z",
+        "created_at": created_at,
     }
-    raw_model = raw_data | {"taskId": raw_data["task_id"]}
-    del raw_model["task_id"]
+    typed: TypedPayload = {
+        "data": data,
+        "key": TaskKey("task-7", 2),
+        "tags": ("train", "gpu"),
+    }
+    raw_typed = {
+        "data": raw_data,
+        "key": ["task-7", 2],
+        "tags": ["train", "gpu"],
+    }
+    bulk = DataBatch(
+        [
+            Data(
+                task_id=f"task-{index}",
+                step=index,
+                scores=(0.25, 0.75),
+                created_at=created_at,
+            )
+            for index in range(100)
+        ],
+        7,
+    )
+    raw_bulk = msgspec.to_builtins(bulk)
+    raw_data_messagepack = _msgpack.dumps(raw_data)
+    raw_typed_messagepack = _msgpack.dumps(raw_typed)
+    raw_bulk_messagepack = _msgpack.dumps(raw_bulk)
 
     def codec_us(fn: Callable[[], Any]) -> float:
         return round(timed(fn, rounds=2000) * 1000, 3)
 
     codec = {
-        "encode_plain_us": codec_us(lambda: _json.dumps({"args": [raw_data], "kwargs": {}})),
-        "encode_dataclass_us": codec_us(lambda: _json.dumps({"args": [data], "kwargs": {}})),
-        "encode_pydantic_us": codec_us(lambda: _json.dumps({"args": [model], "kwargs": {}})),
-        "restore_dataclass_us": codec_us(lambda: _json.convert(raw_data, Data)),
-        "restore_pydantic_us": codec_us(lambda: _json.convert(raw_model, Model)),
+        "encode_plain_us": codec_us(lambda: _msgpack.dumps({"args": [raw_data], "kwargs": {}})),
+        "encode_dataclass_us": codec_us(lambda: _msgpack.dumps({"args": [data], "kwargs": {}})),
+        "encode_typed_container_us": codec_us(
+            lambda: _msgpack.dumps({"args": [typed], "kwargs": {}})
+        ),
+        "restore_dataclass_us": codec_us(
+            lambda: _msgpack.convert_msgpack(raw_data_messagepack, Data)
+        ),
+        "restore_typed_container_us": codec_us(
+            lambda: _msgpack.convert_msgpack(raw_typed_messagepack, TypedPayload)
+        ),
+        "restore_bulk_us": codec_us(
+            lambda: _msgpack.convert_msgpack(raw_bulk_messagepack, DataBatch)
+        ),
+        "wire_plain_bytes": len(raw_data_messagepack),
+        "wire_typed_container_bytes": len(raw_typed_messagepack),
+        "wire_bulk_100_bytes": len(raw_bulk_messagepack),
     }
 
     with Registry():
@@ -918,16 +1499,20 @@ def bench_rpc_models() -> dict[str, Any]:
             raw = handle.data_manual(msgspec.to_builtins(value))
             return msgspec.convert(raw, Data, strict=False)
 
-        def manual_model(value: Model) -> Model:
-            raw = handle.model_manual(value.model_dump(mode="json", by_alias=True))
-            return Model.model_validate(raw)
+        def manual_typed(value: TypedPayload) -> TypedPayload:
+            raw = handle.typed_manual(msgspec.to_builtins(value))
+            return msgspec.convert(raw, TypedPayload, strict=False)
+
+        def manual_bulk(value: DataBatch) -> DataBatch:
+            raw = handle.bulk_manual(msgspec.to_builtins(value))
+            return msgspec.convert(raw, DataBatch, strict=False)
 
         calls = [
             ("plain", handle.raw, raw_data, raw_data),
             ("dataclass", handle.data.returns(Data), data, data),
             ("dataclass_manual", manual_data, data, data),
-            ("pydantic", handle.model.returns(Model), model, model),
-            ("pydantic_manual", manual_model, model, model),
+            ("typed_container", handle.typed.returns(TypedPayload), typed, typed),
+            ("typed_container_manual", manual_typed, typed, typed),
         ]
         samples: dict[str, list[float]] = {name: [] for name, *_ in calls}
         for _ in range(100):
@@ -942,9 +1527,29 @@ def bench_rpc_models() -> dict[str, Any]:
                 samples[name].append(time.perf_counter() - start)
                 if result != expected:
                     raise RuntimeError("typed RPC benchmark returned an unexpected result")
+        bulk_calls = [
+            ("automatic", handle.bulk.returns(DataBatch), bulk, bulk),
+            ("manual", manual_bulk, bulk, bulk),
+        ]
+        bulk_samples: dict[str, list[float]] = {name: [] for name, *_ in bulk_calls}
+        for _ in range(20):
+            for _, call, value, expected in bulk_calls:
+                if call(value) != expected:
+                    raise RuntimeError("bulk model RPC benchmark returned an unexpected result")
+        for round_index in range(200):
+            for offset in range(len(bulk_calls)):
+                name, call, value, expected = bulk_calls[(round_index + offset) % len(bulk_calls)]
+                start = time.perf_counter()
+                result = call(value)
+                bulk_samples[name].append(time.perf_counter() - start)
+                if result != expected:
+                    raise RuntimeError("bulk model RPC benchmark returned an unexpected result")
         return {
             "codec": codec,
             "round_trip": {name: percentiles(values) for name, values in samples.items()},
+            "bulk_round_trip": {name: percentiles(values) for name, values in bulk_samples.items()},
+            "bulk_items": 100,
+            "bulk_calls_per_kind": 200,
             "calls_per_kind": 1000,
             "topology": "same_process",
         }
@@ -957,37 +1562,205 @@ def bench_point_lookup() -> dict[str, Any]:
         with Registry(ttl_ms=120_000) as reg:
             # Synthetic members do not renew: keep their lease outside the
             # measurement window without concurrent load-generator traffic.
-            with httpx.Client(base_url=f"http://{reg.endpoint}", trust_env=False) as client:
-                for index in range(size):
-                    response = client.post(
-                        "/v1/beat",
-                        json={
-                            "pool": "points",
-                            "id": index,
-                            "slot": index,
-                            "size": size,
-                            "incarnation": 1,
-                            "policy": "stateful",
-                            "ready": True,
-                            "state": {"idx": index, "shard": index % 8},
-                        },
-                    )
-                    response.raise_for_status()
-                    if not response.json()["accepted"]:
-                        raise RuntimeError("registry refused the benchmark roster")
+            for index in range(size):
+                response = registry_beat(
+                    reg.endpoint,
+                    {
+                        "pool": "points",
+                        "id": index,
+                        "slot": index,
+                        "size": size,
+                        "incarnation": 1,
+                        "policy": "stateful",
+                        "ready": True,
+                        "state": {"idx": index, "shard": index % 8},
+                    },
+                )
+                if not response["accepted"]:
+                    raise RuntimeError("registry refused the benchmark roster")
             me = joined("point_observer")
             me.ready()
             settle(me)
             pool = tinyray.pool("points")
             pool.wait(count=size, timeout=20)
+            middle = size // 2
+            snapshot = pool.snapshot()
+            cached_all = pool.all()
+            _ = [handle.state for handle in cached_all]
+            cached_snapshot = pool.snapshot()
+            cached_snapshot_members = cached_snapshot.members
+            _ = [handle.state for handle in cached_snapshot_members]
+            identity = pool.slot(middle).identity
+            member_filter = msgspec.msgpack.encode({"idx": middle})
             out[str(size)] = {
-                "slot_ms": timed(lambda p=pool, k=size // 2: p.slot(k)),
+                "slot_ms": timed(lambda p=pool, k=middle: p.slot(k)),
                 "pick_ms": timed(pool.pick),
                 "pick_filtered_ms": timed(lambda p=pool: p.pick(shard=3)),
                 "all_ms": timed(pool.all, rounds=50),
+                "all_state_ms": timed(
+                    lambda p=pool: [handle.state for handle in p.all()], rounds=50
+                ),
                 "snapshot_ms": timed(pool.snapshot, rounds=50),
+                "snapshot_materialize_ms": timed(lambda p=pool: p.snapshot().members, rounds=50),
+                "snapshot_state_ms": timed(
+                    lambda p=pool: tuple(handle.state for handle in p.snapshot().members),
+                    rounds=50,
+                ),
+                "cached_all_state_ms": timed(
+                    lambda handles=cached_all: [handle.state for handle in handles],
+                    rounds=50,
+                ),
+                "cached_snapshot_state_ms": timed(
+                    lambda handles=cached_snapshot_members: tuple(
+                        handle.state for handle in handles
+                    ),
+                    rounds=50,
+                ),
+                "snapshot_len_ms": timed(lambda s=snapshot: len(s)),
+                "snapshot_slot_ms": timed(lambda s=snapshot, k=middle: s.slot(k)),
+                "snapshot_get_ms": timed(lambda s=snapshot, key=identity: s.get(key)),
+                "pool_len_ms": timed(lambda p=pool: len(p)),
+                "count_filtered_ms": timed(
+                    lambda c=pool._c, raw=member_filter: c.count("points", raw, True)
+                ),
+                "wait_count_ms": timed(
+                    lambda p=pool, k=middle: p.wait(count=1, timeout=20, idx=k),
+                    rounds=50,
+                ),
+                "epoch_ms": timed(lambda p=pool, n=size: p.epoch(min=n, timeout=20), rounds=50),
+                "epoch_materialize_ms": timed(
+                    lambda p=pool, n=size: p.epoch(min=n, timeout=20).members,
+                    rounds=50,
+                ),
             }
     return out
+
+
+def bench_filter_index() -> dict[str, Any]:
+    """Cold construction and warm reuse of one common scalar equality filter."""
+    out = {}
+    for size in (100, 1000, 5000):
+        with Registry(ttl_ms=120_000) as reg:
+            for index in range(size):
+                response = registry_beat(
+                    reg.endpoint,
+                    {
+                        "pool": "filter-index",
+                        "id": index,
+                        "incarnation": 1,
+                        "policy": "churn",
+                        "ready": True,
+                        "state": {
+                            "idx": index,
+                            "shard": index % 8,
+                            "active": index % 3 == 0,
+                        },
+                    },
+                )
+                if not response["accepted"]:
+                    raise RuntimeError("registry refused the filter-index benchmark roster")
+            me = joined("filter_index_observer")
+            me.ready()
+            settle(me)
+            pool = tinyray.pool("filter-index")
+            pool.wait(count=size, timeout=20)
+            native = pool._c
+            raw = msgspec.msgpack.encode({"shard": 3})
+
+            def clear(native=native, name=pool._name):
+                native.debug_filter_index_clear(name)
+
+            def count(native=native, name=pool._name, raw=raw):
+                return native.count(name, raw, True)
+
+            def pick(pool=pool):
+                return pool.pick(shard=3)
+
+            def all_matches(pool=pool):
+                return pool.all(shard=3)
+
+            def wait(pool=pool):
+                return pool.wait(count=1, timeout=20, shard=3)
+
+            row = {
+                "matches": size // 8 + int(size % 8 > 3),
+                "count_cold_ms": timed_cold(clear, count, rounds=50),
+                "count_warm_ms": timed(count),
+                "pick_cold_ms": timed_cold(clear, pick, rounds=50),
+                "pick_warm_ms": timed(pick),
+                "all_cold_ms": timed_cold(clear, all_matches, rounds=30),
+                "all_warm_ms": timed(all_matches, rounds=50),
+                "wait_cold_ms": timed_cold(clear, wait, rounds=30),
+                "wait_warm_ms": timed(wait, rounds=50),
+            }
+            clear()
+            count()
+            pick()
+            all_matches()
+            wait()
+            stats = native.debug_filter_index_stats(pool._name)
+            row.update({f"index_{key}": value for key, value in stats.items()})
+            out[str(size)] = row
+    return out
+
+
+def bench_rust_discovery() -> dict[str, Any]:
+    """Public Rust SDK Arc-backed views versus cloning complete members."""
+    binary = rust_discovery_bench_binary()
+    if binary is None:
+        raise UnsupportedScenario(
+            "no Rust discovery benchmark built; run cargo build --release -p tinyray "
+            "--example rust_discovery_bench"
+        )
+    if loadgen_binary() is None:
+        raise UnsupportedScenario("no loadgen built; run cargo build --release --bin loadgen")
+    out: dict[str, Any] = {}
+    for size in (100, 1000, 5000):
+        with Registry() as registry, Crowd(registry.endpoint, size):
+            completed = subprocess.run(
+                [binary, registry.endpoint, str(size)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if completed.returncode:
+                raise RuntimeError(completed.stderr[-1000:])
+            out[str(size)] = json.loads(completed.stdout)
+    return out
+
+
+def bench_rpc_copy_profile() -> dict[str, Any]:
+    """Separate payload cloning from MessagePack envelope encode/decode."""
+    binary = rpc_copy_bench_binary()
+    if binary is None:
+        raise UnsupportedScenario(
+            "no RPC copy benchmark built; run cargo build --release -p tinyray "
+            "--example rpc_copy_bench"
+        )
+    completed = subprocess.run([binary], capture_output=True, text=True, timeout=120)
+    if completed.returncode:
+        raise RuntimeError(completed.stderr[-1000:])
+    return json.loads(completed.stdout)
+
+
+def bench_rust_runtime() -> dict[str, Any]:
+    """A serving Rust Member shares one RPC worker pool between client/server."""
+    binary = rust_runtime_bench_binary()
+    if binary is None:
+        raise UnsupportedScenario(
+            "no Rust runtime benchmark built; run cargo build --release -p tinyray "
+            "--example rust_runtime_bench"
+        )
+    with Registry() as registry:
+        completed = subprocess.run(
+            [binary, registry.endpoint],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr[-1000:])
+        return json.loads(completed.stdout)
 
 
 SCENARIOS: dict[str, Callable[[], dict[str, Any]]] = {
@@ -998,15 +1771,23 @@ SCENARIOS: dict[str, Callable[[], dict[str, Any]]] = {
     "async_call": bench_async_call,
     "publish": bench_publish,
     "lookup_scaling": bench_lookup_scaling,
+    "filter_index": bench_filter_index,
     "watch_wakeup": bench_watch_wakeup,
     "discovery": bench_discovery,
     "idle_beat_rate": bench_idle_beat_rate,
+    "idle_waiters": bench_idle_waiters,
+    "registry_connections": bench_registry_connections,
     "join_cold_start": bench_join,
     "rpc_latency_separate": bench_rpc_separate,
     "rpc_concurrency": bench_rpc_concurrency,
+    "rust_service": bench_rust_service,
+    "blobref": bench_blobref,
     "rpc_batch": bench_rpc_batch,
     "rpc_models": bench_rpc_models,
+    "rpc_copy_profile": bench_rpc_copy_profile,
     "point_lookup": bench_point_lookup,
+    "rust_discovery": bench_rust_discovery,
+    "rust_runtime": bench_rust_runtime,
     "discovery_spaced": lambda: bench_discovery(pause=0.15),
 }
 
@@ -1039,6 +1820,14 @@ WATCHED: dict[str, float] = {
     "rpc_error.raising_p50_ms": 0.05,
     "async_call.p50_ms": 0.1,
     "publish.flush_p50_ms": 0.1,
+    "idle_beat_rate.connections_opened": 1.0,
+    "idle_waiters.rechecks": 1.0,
+    "idle_waiters.watch_wakeups": 1.0,
+    "registry_connections.persistent_connections": 100.0,
+    "registry_connections.persistent_failures": 1.0,
+    "registry_connections.persistent_live_members": 1.0,
+    "registry_connections.persistent_p50_ratio": 0.25,
+    "registry_connections.accept_reduction": 0.05,
     "lookup_scaling.100.all_ms": 0.002,
     "lookup_scaling.100.snapshot_ms": 0.002,
     "lookup_scaling.1000.all_ms": 0.1,
@@ -1051,8 +1840,59 @@ WATCHED: dict[str, float] = {
     "point_lookup.5000.slot_ms": 0.0001,
     "point_lookup.5000.pick_ms": 0.0001,
     "point_lookup.5000.all_ms": 0.1,
+    "point_lookup.5000.all_state_ms": 0.3,
+    "point_lookup.5000.cached_all_state_ms": 0.02,
+    "point_lookup.5000.snapshot_ms": 0.001,
+    "point_lookup.5000.snapshot_materialize_ms": 0.2,
+    "point_lookup.5000.snapshot_state_ms": 0.3,
+    "point_lookup.5000.cached_snapshot_state_ms": 0.03,
+    "point_lookup.5000.snapshot_len_ms": 0.0002,
+    "point_lookup.5000.snapshot_slot_ms": 0.0002,
+    "point_lookup.5000.snapshot_get_ms": 0.0002,
+    "point_lookup.5000.wait_count_ms": 0.1,
+    "point_lookup.5000.epoch_ms": 0.001,
+    "filter_index.5000.count_warm_ms": 0.002,
+    "filter_index.5000.pick_warm_ms": 0.002,
+    "filter_index.5000.all_warm_ms": 0.02,
+    "filter_index.5000.wait_warm_ms": 0.02,
+    "filter_index.5000.index_bytes": 4096.0,
+    "blobref.python_same.65536.ordinary_call_ms": 0.1,
+    "blobref.python_same.16777216.blob_call_ms": 0.05,
+    "blobref.python_separate.16777216.blob_call_ms": 0.05,
+    "blobref.rust_same.16777216.blob_call_ms": 0.05,
+    "blobref.rust_separate.16777216.blob_call_ms": 0.05,
+    "blobref.rust_same.16777216.blob_wire_bytes": 32.0,
+    "rpc_models.round_trip.dataclass.p50_ms": 0.05,
+    "rpc_models.round_trip.typed_container.p50_ms": 0.05,
+    "rpc_models.bulk_round_trip.automatic.p50_ms": 0.1,
+    "rpc_models.codec.encode_plain_us": 0.2,
+    "rpc_models.codec.encode_dataclass_us": 0.2,
+    "rpc_models.codec.encode_typed_container_us": 0.2,
+    "rpc_models.codec.restore_dataclass_us": 0.2,
+    "rpc_models.codec.restore_typed_container_us": 0.25,
     "rpc_latency_separate.p50_ms": 0.05,
     "rpc_batch.batch_total_ms": 0.1,
+    "rpc_concurrency.callers.8.calls_per_s": 500.0,
+    "rpc_concurrency.callers.8.p50_ms": 0.2,
+    # Shared-host p99 varied from 1.73 to 2.73ms across the accepted
+    # three-run calibration. With the 1.833ms median baseline, 0.94ms makes
+    # the absolute gate the independently requested ~2.77ms ceiling.
+    "rpc_concurrency.callers.8.p99_ms": 0.94,
+    "rpc_concurrency.callers.128.connection_reduction": 0.05,
+    "rpc_concurrency.connections": 1.0,
+    "rpc_copy_profile.65536.borrowed_decode_us": 0.5,
+    "rpc_copy_profile.65536.decode_speedup": 5.0,
+    "rpc_copy_profile.1048576.borrowed_decode_us": 10.0,
+    "rust_service.python.no_op.p50_ms": 0.02,
+    "rust_service.rust.no_op.p50_ms": 0.01,
+    "rust_service.rust.concurrency.8.calls_per_s": 5_000.0,
+    "rust_service.rust.concurrency.128.connections": 1.0,
+    "rust_service.throughput_8_speedup": 0.5,
+    "rust_discovery.5000.refs_ms": 0.02,
+    "rust_discovery.5000.owned_ms": 0.5,
+    "rust_discovery.5000.clone_speedup": 5.0,
+    "rust_runtime.rpc_workers": 1.0,
+    "rust_runtime.total_native_workers": 1.0,
     "discovery_spaced.p50_ms": 0.1,
     "discovery.p50_ms": 5.0,
     "watch_wakeup.wakeup.p50_ms": 5.0,
@@ -1065,7 +1905,16 @@ WATCHED: dict[str, float] = {
     # to let a real regression through, and a baseline that cries wolf gets
     # ignored, so it is worse than none.
 }
-BIGGER_IS_BETTER: set[str] = set()
+BIGGER_IS_BETTER: set[str] = {
+    "registry_connections.accept_reduction",
+    "registry_connections.persistent_live_members",
+    "rpc_concurrency.callers.8.calls_per_s",
+    "rpc_concurrency.callers.128.connection_reduction",
+    "rpc_copy_profile.65536.decode_speedup",
+    "rust_service.rust.concurrency.8.calls_per_s",
+    "rust_service.throughput_8_speedup",
+    "rust_discovery.5000.clone_speedup",
+}
 TOLERANCE = 0.20
 
 
@@ -1116,10 +1965,6 @@ def compare(baseline: dict[str, Any], now: dict[str, Any]) -> tuple[list[str], l
 
 def provenance() -> dict[str, Any]:
     root = Path(__file__).resolve().parent
-    try:
-        pydantic_version = importlib.metadata.version("pydantic")
-    except importlib.metadata.PackageNotFoundError:
-        pydantic_version = None
     revision = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=root,
@@ -1171,9 +2016,7 @@ def provenance() -> dict[str, Any]:
             "cpu": cpu,
             "logical_cpus": os.cpu_count(),
             "load_average": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
-            "httpx": httpx.__version__,
             "msgspec": msgspec.__version__,
-            "pydantic": pydantic_version,
             "python_optimization": sys.flags.optimize,
         },
     }

@@ -61,7 +61,7 @@ def run_client(_: list[str]) -> None:
                 "id": 0,
                 "slot": 0,
                 "incarnation": svc.incarnation,
-                "url": "http://127.0.0.1:1",
+                "url": "127.0.0.1:1",
                 "ready": True,
             },
             ("ok",),

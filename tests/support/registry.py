@@ -6,9 +6,9 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+from tests.support.registry_wire import RegistryWireError, health
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,10 +44,9 @@ class RegistryProc:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(f"http://{self.endpoint}/health", timeout=0.5) as r:
-                    if r.status == 200:
-                        return
-            except (urllib.error.URLError, ConnectionError, OSError):
+                if health(self.endpoint, timeout=0.5)["status"] == "ok":
+                    return
+            except (RegistryWireError, ConnectionError, EOFError, OSError, TimeoutError):
                 time.sleep(0.02)
         raise RuntimeError("registry did not become healthy")
 

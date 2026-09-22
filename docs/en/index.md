@@ -41,7 +41,9 @@ tinyray --listen 127.0.0.1:8760
 - **Roll call together** -- freeze one round's roster so every rank is handed
   the same list.
 
-Underneath it is ordinary HTTP, so nothing is lost for debugging with `curl`.
+From 0.18, method calls and registry traffic both use native length-prefixed
+MessagePack over TCP. Method endpoints are bare `host:port`, connections are
+persistent, and neither transport has an HTTP/JSON compatibility listener.
 
 ## What it deliberately does not do
 
@@ -57,8 +59,10 @@ safe to run twice.
 
 ## Status
 
-**0.16.0 is out** ([PyPI](https://pypi.org/project/tinyray/)), around 2,900
-lines. Wheels for py3.10-3.13 on Linux x86_64 / aarch64 and macOS universal2.
+**0.18.0 is out** ([PyPI](https://pypi.org/project/tinyray/)). The native
+transport keeps standard dataclass and typed-container RPC values while
+intentionally removing Pydantic integration. Wheels target py3.10-3.13 on
+Linux x86_64 / aarch64 and macOS universal2.
 
 Multi-host and scale are both measured: three containers across network
 namespaces discovered and called each other with matching fingerprints;

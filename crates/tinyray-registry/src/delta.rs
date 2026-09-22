@@ -11,7 +11,8 @@ pub(crate) const CACHE_BYTES: usize = 2 << 20;
 
 pub(crate) type SharedPools = HashMap<String, Arc<PoolDelta>>;
 
-/// The HTTP path shares snapshots without changing the public wire structs.
+/// The framed MessagePack path shares snapshots without changing the public
+/// state structs.
 #[derive(Serialize)]
 pub(crate) struct SharedBeatAck {
     pub epoch: u64,
@@ -168,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_ack_has_the_same_json_as_the_public_owned_ack() {
+    fn shared_ack_has_the_same_messagepack_as_the_public_owned_ack() {
         for refused in [None, Some("shape mismatch".to_string())] {
             let ack = SharedBeatAck {
                 epoch: 1,
@@ -179,10 +180,13 @@ mod tests {
                 refused,
                 pools: HashMap::from([("p".into(), delta())]),
             };
-            let shared = serde_json::to_value(&ack).unwrap();
+            let shared: serde_json::Value =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&ack).unwrap()).unwrap();
             let owned = ack.into_owned();
-            assert_eq!(shared, serde_json::to_value(&owned).unwrap());
-            let decoded: BeatAck = serde_json::from_value(shared).unwrap();
+            let owned_wire = rmp_serde::to_vec_named(&owned).unwrap();
+            let owned_value: serde_json::Value = rmp_serde::from_slice(&owned_wire).unwrap();
+            assert_eq!(shared, owned_value);
+            let decoded: BeatAck = rmp_serde::from_slice(&owned_wire).unwrap();
             assert_eq!(decoded.pools["p"].removed, vec![3]);
             assert_eq!(decoded.accepted, owned.accepted);
         }

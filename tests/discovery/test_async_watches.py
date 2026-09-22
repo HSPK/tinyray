@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 import tinyray
@@ -84,7 +85,7 @@ def test_first_async_subscription_cannot_miss_fencing(registry, monkeypatch, fla
         me.ready().flush()
         pool = tinyray.apool(me.pool)
         replacement = Client(
-            endpoint=f"http://{registry.endpoint}",
+            endpoint=registry.endpoint,
             pool=me.pool,
             id=0,
             incarnation=me.incarnation + 1,
@@ -117,3 +118,47 @@ def test_first_async_subscription_cannot_miss_fencing(registry, monkeypatch, fla
             assert registered
         finally:
             replacement.leave()
+
+
+def test_idle_heartbeats_do_not_wake_async_watchers(registry, monkeypatch):
+    with tinyray.join("quiet-async-bell", coalesce_ms=0) as me:
+        me.ready(step=0).flush()
+        pool = tinyray.apool(me.pool)
+        tinyray.pool(me.pool).snapshot()
+        calls = 0
+        original = tinyray._Watching._step
+
+        def counted(watch):
+            nonlocal calls
+            calls += 1
+            return original(watch)
+
+        monkeypatch.setattr(tinyray._Watching, "_step", counted)
+
+        async def run():
+            nonlocal calls
+            watch = pool.achanges(timeout=20)
+            task = asyncio.create_task(anext(watch))
+            bell = tinyray._loop_bell(me._c)
+            while not bell._waiters:
+                await asyncio.sleep(0)
+            calls = 0
+            target = me.stats()["beats_ok"] + 4
+
+            def wait_for_beats():
+                deadline = time.monotonic() + 5
+                while me.stats()["beats_ok"] < target:
+                    revision = me._c.debug_beat_revision()
+                    left = deadline - time.monotonic()
+                    assert left > 0
+                    me._c.debug_wait_beat_revision(revision, int(left * 1000) + 1)
+
+            await asyncio.to_thread(wait_for_beats)
+            await asyncio.sleep(0)
+            assert calls == 0
+            assert not task.done()
+            watch.close()
+            with pytest.raises(StopAsyncIteration):
+                await task
+
+        asyncio.run(run())

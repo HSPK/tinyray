@@ -7,6 +7,7 @@ pub mod state;
 
 use std::sync::Arc;
 use std::time::Duration;
+use tinyray_proto::wire::bind_tcp_listener;
 
 /// Clients beat at ttl/4 and cannot go below 50ms, so a lease shorter than
 /// this expires between beats. Measured at 40ms: a healthy member was visible
@@ -45,7 +46,7 @@ pub fn run(listen: &str, ttl_ms: u64, on_ready: impl FnOnce(String)) -> std::io:
             }
         });
 
-        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let listener = tokio::net::TcpListener::from_std(bind_tcp_listener(listen)?)?;
         on_ready(listener.local_addr()?.to_string());
         server::serve(listener, reg).await;
         Ok(())

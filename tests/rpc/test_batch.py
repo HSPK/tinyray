@@ -1,23 +1,26 @@
-"""Opt-in batches share a transport request, not a transaction or a retry policy."""
+"""Batches share one framed request, not a transaction or retry policy."""
 
 from __future__ import annotations
 
 import asyncio
-import http.client
 import inspect
-import json
 import socket
+import struct
 import threading
 import time
 import warnings
+from types import SimpleNamespace
 
-import httpx
 import pytest
 import tinyray
-from tinyray import _rpc, _serve
+from tinyray import _rpc
 from tinyray._errors import BatchError, Fenced, NotDelivered, OutcomeUnknown, RemoteError
+from tinyray._msgpack import dumps, loads
 from tinyray._rpc import MAX_BATCH, Call, abatch, batch
 from tinyray._serve import CallContext, MethodServer
+
+from tests.support.rpc_wire import frame, recv_reply
+from tests.support.rpc_wire import request as wire_request
 
 
 class Service:
@@ -85,7 +88,13 @@ def served(monkeypatch):
     server.still_ours = lambda: service.owned
     handle = tinyray.Handle(
         "batch",
-        {"id": 0, "slot": 0, "incarnation": 1, "url": server.url("127.0.0.1"), "ready": True},
+        {
+            "id": 0,
+            "slot": 0,
+            "incarnation": 1,
+            "url": server.url("127.0.0.1"),
+            "ready": True,
+        },
         server.methods,
     )
     monkeypatch.setattr(_rpc, "_identity", "caller/7#42")
@@ -117,22 +126,25 @@ def _item(method="record", args=None, kwargs=None):
     return {"method": method, "args": [1] if args is None else args, "kwargs": kwargs or {}}
 
 
-def _raw(server, body, *, extra=b"", length=None, shutdown=False):
-    length = str(len(body)).encode() if length is None else length
-    head = (
-        b"POST /_batch HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
-        + length
-        + b"\r\n"
-        + extra
-        + b"\r\n"
+def _connect(endpoint: str) -> socket.socket:
+    host, port = endpoint.rsplit(":", 1)
+    return socket.create_connection((host, int(port)), timeout=5)
+
+
+def _wire_batch(handle, payload, *, batch_len=None, request_id="wire-batch"):
+    if batch_len is None:
+        calls = payload.get("calls") if isinstance(payload, dict) else None
+        batch_len = len(calls) if isinstance(calls, list) else 1
+    envelope = wire_request(
+        request_id=request_id,
+        target=handle.identity,
+        method=None,
+        batch_len=batch_len,
+        body=dumps(payload),
     )
-    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as connection:
-        connection.sendall(head + body)
-        if shutdown:
-            connection.shutdown(socket.SHUT_WR)
-        response = http.client.HTTPResponse(connection)
-        response.begin()
-        return response.status, response.read()
+    with _connect(handle.url) as connection:
+        connection.sendall(frame(envelope))
+        return recv_reply(connection)
 
 
 def test_public_exports_exist():
@@ -182,7 +194,7 @@ def test_first_failure_stops_execution_with_completed_results(
         assert error.cause.type == "ValueError"
         assert "expected business failure" in error.cause.traceback
     if call.method in ("unserializable", "cycle"):
-        assert "cannot be sent as JSON" in str(error.cause)
+        assert "cannot be sent as MessagePack" in str(error.cause)
     stats = _settled(server)
     assert stats["calls"] == stats["failed"] == 1
     assert handle.echo("still usable") == "still usable"
@@ -441,172 +453,132 @@ def test_the_batch_limit_is_inclusive_and_empty_batches_are_local(served, send_b
 )
 def test_malformed_envelopes_refuse_before_any_item(served, payload):
     service, server, handle = served
-    status, raw = _raw(server, json.dumps(payload).encode())
-    assert status == 400
-    with pytest.raises(NotDelivered):
-        _rpc._decode_batch(status, raw, handle.identity, 2)
+    reply = _wire_batch(handle, payload)
+    assert reply["status"] == "caller_fault"
     assert service.events == []
     stats = _settled(server)
     assert stats["calls"] == stats["failed"] == 1
     assert handle.echo("next") == "next"
 
 
-@pytest.mark.parametrize("body", [b"not json", b'{"calls":[', b'{"calls":"\xff"}'])
-def test_malformed_json_is_not_delivered(served, body):
-    service, server, _ = served
-    assert _raw(server, body)[0] == 400
+@pytest.mark.parametrize("body", [b"\xc1", b"\x81\xa5calls", b"\x92\x01"])
+def test_malformed_messagepack_batch_is_a_caller_fault(served, body):
+    service, server, handle = served
+    envelope = wire_request(
+        request_id="bad-body",
+        target=handle.identity,
+        method=None,
+        batch_len=1,
+        body=body,
+    )
+    with _connect(handle.url) as connection:
+        connection.sendall(frame(envelope))
+        reply = recv_reply(connection)
+    assert reply["status"] == "caller_fault"
     assert service.events == []
     assert _settled(server)["failed"] == 1
 
 
-def test_wire_batch_limit_and_wire_empty_batch(served):
+def test_wire_batch_metadata_limit_and_empty_batch(served):
     service, server, handle = served
-    status, raw = _raw(server, json.dumps({"calls": [_item()] * (MAX_BATCH + 1)}).encode())
-    assert status == 413
-    with pytest.raises(ValueError, match=str(MAX_BATCH)):
-        _rpc._decode_batch(status, raw, handle.identity, MAX_BATCH + 1)
+    reply = _wire_batch(
+        handle,
+        {"calls": [_item()] * (MAX_BATCH + 1)},
+        batch_len=MAX_BATCH + 1,
+    )
+    assert reply["status"] == "malformed_protocol"
     assert service.events == []
-    status, raw = _raw(server, b'{"calls":[]}')
-    assert status == 200
-    assert json.loads(raw) == {"items": []}
+    assert server.counters.snapshot()["calls"] == 0
+
+    reply = _wire_batch(handle, {"calls": []}, batch_len=0, request_id="empty")
+    assert reply["status"] == "success"
+    assert loads(reply["body"]) == []
     stats = _settled(server)
-    assert stats["calls"] == 2
-    assert stats["failed"] == 1
+    assert stats["calls"] == 1
+    assert stats["failed"] == 0
 
 
-@pytest.mark.parametrize(
-    "extra,length,status",
-    [
-        (b"Transfer-Encoding: chunked\r\n", b"2", 411),
-        (b"", b"abc", 400),
-        (b"", b"-1", 400),
-    ],
-)
-def test_bad_framing_never_dispatches_a_batch(served, extra, length, status):
+def test_truncated_batch_frame_never_dispatches(served):
     service, server, handle = served
-    got, raw = _raw(server, b"{}", extra=extra, length=length)
-    assert got == status
-    with pytest.raises(NotDelivered):
-        _rpc._decode_batch(got, raw, handle.identity, 1)
+    with _connect(handle.url) as connection:
+        connection.sendall(struct.pack(">I", 100) + b"\x80")
+        connection.shutdown(socket.SHUT_WR)
+        assert recv_reply(connection)["status"] == "malformed_protocol"
     assert service.events == []
     assert server.counters.snapshot()["calls"] == 0
 
 
-def test_short_body_is_refused_even_if_its_prefix_is_valid_json(served):
-    service, server, _ = served
-    body = json.dumps({"calls": [_item()]}).encode()
-    assert _raw(server, body, length=str(len(body) + 10).encode(), shutdown=True)[0] == 400
-    assert service.events == []
+def test_legacy_batch_endpoint_is_refused_without_single_call_replay(send_batch):
+    handle = tinyray.Handle(
+        "legacy",
+        {"id": 0, "incarnation": 1, "url": "http://legacy:80", "ready": True},
+        ("record",),
+    )
+    with pytest.raises(NotDelivered, match="hard cutover"):
+        send_batch(handle, [Call("record", (1,))])
 
 
-def test_stalled_batch_body_is_refused_and_releases_its_connection(served, monkeypatch):
-    service, server, handle = served
-    monkeypatch.setattr(_serve, "BODY_TIMEOUT", 0.05)
-    status, raw = _raw(server, b"{", length=b"100")
-    assert status == 408
+def test_transport_failure_applies_to_the_entire_batch(send_batch):
+    handle = tinyray.Handle(
+        "gone",
+        {"id": 0, "incarnation": 1, "url": "127.0.0.1:1", "ready": True},
+        ("record",),
+    )
     with pytest.raises(NotDelivered):
-        _rpc._decode_batch(status, raw, handle.identity, 1)
-    assert service.events == []
-    assert handle.echo("next") == "next"
-
-
-@pytest.mark.parametrize("status", [404, 405, 501])
-def test_legacy_peers_fail_explicitly_without_single_call_replay(
-    served, send_batch, monkeypatch, status
-):
-    service, _, handle = served
-    original = _serve._Handler.do_POST
-    attempts = []
-
-    def legacy(handler):
-        attempts.append(handler.path)
-        if handler.path == "/_batch":
-            handler.close_connection = True
-            handler._send(status, {})
-        else:
-            original(handler)
-
-    monkeypatch.setattr(_serve._Handler, "do_POST", legacy)
-    with pytest.raises(NotDelivered, match="does not support RPC batching"):
-        send_batch(handle, [Call("record", (1,)), Call("record", (2,))])
-    assert attempts == ["/_batch"]
-    assert service.events == []
-    assert handle.record(3) == 3
+        send_batch(handle, [Call("record", (1,))])
 
 
 @pytest.mark.parametrize(
-    "exception,expected",
-    [(httpx.ConnectError("refused"), NotDelivered), (httpx.ReadError("reset"), OutcomeUnknown)],
-)
-def test_batch_transport_errors_cover_the_entire_request(
-    served, send_batch, monkeypatch, exception, expected
-):
-    service, _, handle = served
-    attempts = []
-
-    def fail(request):
-        attempts.append(request.url.path)
-        raise exception
-
-    transport = httpx.MockTransport(fail)
-    with httpx.Client(transport=transport) as sync:
-        asynchronous = httpx.AsyncClient(transport=transport)
-        monkeypatch.setattr(_rpc, "_sync_client", lambda: sync)
-        monkeypatch.setattr(_rpc, "_async_client", lambda: asynchronous)
-        try:
-            with pytest.raises(expected):
-                send_batch(handle, [Call("record", (1,))])
-        finally:
-            asyncio.run(asynchronous.aclose())
-    assert attempts == ["/_batch"]
-    assert service.events == []
-
-
-@pytest.mark.parametrize(
-    "payload",
+    "outcome",
     [
-        None,
-        {"result": 1},
-        {"items": []},
-        {"items": [{"status": True, "body": {"result": 1}}]},
-        {"items": [{"status": 200, "body": {"error": "broken"}}]},
-        {"items": [{"status": 200, "body": {"result": 1}}]},
-        {"items": [{"status": 500, "body": {"error": "broken"}}]},
-        {
-            "items": [
-                {"status": 404, "body": {"error": "no method"}},
-                {"status": 200, "body": {"result": 1}},
-            ]
-        },
+        SimpleNamespace(
+            kind=tinyray._tinyray.RPC_OUTCOME_REPLY,
+            status=tinyray._tinyray.RPC_STATUS_SUCCESS,
+            payload=b"\x01",
+            batch_index=None,
+            completed=None,
+            message="",
+            error_type="",
+            traceback="",
+        ),
+        SimpleNamespace(
+            kind=tinyray._tinyray.RPC_OUTCOME_REPLY,
+            status=tinyray._tinyray.RPC_STATUS_REMOTE_ERROR,
+            payload=dumps([1]),
+            batch_index=0,
+            completed=1,
+            message="broken",
+            error_type="ValueError",
+            traceback="",
+        ),
     ],
 )
-def test_malformed_responses_never_claim_a_known_batch_outcome(payload):
+def test_malformed_responses_never_claim_a_known_batch_outcome(outcome):
     with pytest.raises(OutcomeUnknown):
-        _rpc._decode_batch(200, json.dumps(payload).encode(), "peer/0#1", 2)
+        _rpc._decode_batch(outcome, "peer/0#1", 2)
 
 
-def test_reply_write_failure_still_releases_the_admission_slot(served, monkeypatch):
+def test_reply_write_failure_still_releases_the_admission_slot(served):
     service, server, handle = served
-    original = _serve._Handler._send_raw
-    broken = False
-
-    def fail_once(handler, code, raw):
-        nonlocal broken
-        if handler.path == "/_batch" and not broken:
-            broken = True
-            raise OSError("simulated failed response write")
-        original(handler, code, raw)
-
-    monkeypatch.setattr(_serve._Handler, "_send_raw", fail_once)
-    responses = []
-    with httpx.Client(event_hooks={"response": [responses.append]}) as client:
-        monkeypatch.setattr(_rpc, "_sync_client", lambda: client)
-        with pytest.raises(OutcomeUnknown):
-            batch(handle, [Call("record", (1,))])
-        assert responses[0].headers["connection"] == "close"
-        assert service.events == [1]
-        assert _settled(server)["calls"] == 1
-        assert handle.record(2) == 2
+    envelope = wire_request(
+        request_id="drop-reply",
+        target=handle.identity,
+        method=None,
+        batch_len=1,
+        body=dumps({"calls": [_item("hold", [1])]}),
+    )
+    connection = _connect(handle.url)
+    connection.sendall(frame(envelope))
+    assert service.entered.wait(5)
+    connection.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_LINGER,
+        struct.pack("ii", 1, 0),
+    )
+    connection.close()
+    service.release.set()
+    assert _settled(server)["calls"] == 1
+    assert handle.record(2) == 2
 
 
 def test_batch_oversize_warnings_retain_application_attribution(served, send_batch, monkeypatch):

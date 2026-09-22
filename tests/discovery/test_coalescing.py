@@ -27,7 +27,7 @@ def test_coalescing_rejects_invalid_values_before_starting_a_client(monkeypatch,
 
 def test_python_and_native_coalescing_defaults_remain_fifty_milliseconds():
     assert inspect.signature(tinyray.join).parameters["coalesce_ms"].default == 50
-    client = Client("http://127.0.0.1:1", "default", 1, 1, "churn")
+    client = Client("127.0.0.1:1", "default", 1, 1, "churn")
     assert client.stats()["coalesce_ms"] == 50
     assert client.stats()["effective_coalesce_ms"] == 50
 
@@ -63,9 +63,9 @@ def test_large_coalescing_cannot_expire_a_short_healthy_lease(requested):
             target = native.stats()["beats_ok"] + 4
             deadline = time.monotonic() + 3
             while native.stats()["beats_ok"] < target:
-                revision = native.cache_revision()
+                revision = native.debug_beat_revision()
                 assert time.monotonic() < deadline, "idle renewal stopped behind coalescing"
-                native.wait_revision(revision, 100)
+                native.debug_wait_beat_revision(revision, 3000)
             assert native.accepted
             assert pool.pick().identity == identity
     finally:

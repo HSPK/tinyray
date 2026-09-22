@@ -2,33 +2,28 @@
 
 from __future__ import annotations
 
-import json
 import time
-import urllib.request
 
 import pytest
 import tinyray
 
 from tests.support.ordering_proxy import OrderingProxy
 from tests.support.registry import RegistryProc
+from tests.support.registry_wire import beat
 
 
 def _member(registry: RegistryProc, pool: str) -> dict:
-    request = urllib.request.Request(
-        f"http://{registry.endpoint}/v1/beat",
-        data=json.dumps(
-            {
-                "pool": "__native_review_observer",
-                "id": 999,
-                "incarnation": 1,
-                "policy": "churn",
-                "watch": [pool],
-            }
-        ).encode(),
-        headers={"Content-Type": "application/json"},
+    ack = beat(
+        registry.endpoint,
+        {
+            "pool": "__native_review_observer",
+            "id": 999,
+            "incarnation": 1,
+            "policy": "churn",
+            "watch": [pool],
+        },
+        timeout=2,
     )
-    with urllib.request.urlopen(request, timeout=2) as response:
-        ack = json.load(response)
     return ack["pools"][pool]["changed"][0]
 
 
@@ -77,9 +72,9 @@ def test_canceled_startup_cannot_undo_a_flushed_publication(registry):
 def test_url_changes_advance_the_publication_sequence(registry):
     with tinyray.join("url_sequence") as me:
         before = me._c.publish_versions()[0]
-        me._c.set_url("http://127.0.0.1:12345")
+        me._c.set_url("127.0.0.1:12345")
         me.flush(timeout=2)
         assert me._c.publish_versions() == (before + 1, before + 1)
-        assert _member(registry, me.pool)["url"] == "http://127.0.0.1:12345"
-        me._c.set_url("http://127.0.0.1:12345")
+        assert _member(registry, me.pool)["url"] == "127.0.0.1:12345"
+        me._c.set_url("127.0.0.1:12345")
         assert me._c.publish_versions() == (before + 1, before + 1)

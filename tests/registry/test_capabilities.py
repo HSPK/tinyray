@@ -2,7 +2,7 @@
 
 猜不出来：老注册中心对长轮询请求的回答**又快又对**，只是不挂起而已，所以
 "挂起了但什么都没发生"和"根本不会挂起"从客户端看一模一样。实测对着 v0.6.1：
-每秒 14.5 次请求，而当前版本 0.12 次 —— 一百倍，`/health` 只说 `{"status":"ok"}`，
+每秒 14.5 次请求，而当前版本 0.12 次 —— 一百倍，旧健康探针只说 "ok"，
 客户端也没有任何入口能问。
 
 包版本 (`tinyray.__version__`) 说的是本地这一侧能做什么。注册中心是另一个进程，
@@ -11,21 +11,23 @@
 
 from __future__ import annotations
 
-import json
-import urllib.request
 import warnings
 
 import pytest
 import tinyray
 
+from tests.support.registry_wire import health
+
 
 def test_health_names_the_registry(registry):
     """不加入也要能看出版本，部署检查用得上。"""
-    with urllib.request.urlopen(f"http://{registry.endpoint}/health", timeout=2) as r:
-        body = json.loads(r.read())
+    body = health(registry.endpoint, timeout=2)
     assert body["status"] == "ok"
     assert body["version"] == tinyray.__version__
-    assert body["protocol"] >= 2
+    assert body["protocol"] >= 3
+    assert body["connections_accepted"] >= 1
+    assert body["connections_active"] >= 1
+    assert body["frames_received"] >= 1
 
 
 def test_a_member_can_ask_what_the_registry_can_do(registry):
@@ -33,9 +35,10 @@ def test_a_member_can_ask_what_the_registry_can_do(registry):
         m.ready()
         info = m.registry
         assert info.version == tinyray.__version__
-        assert info.protocol >= 2
+        assert info.protocol >= 3
         assert info.supports("long_poll") is True
         assert info.supports("publication_ordering") is True
+        assert info.supports("native_registry") is True
 
 
 def test_an_unknown_feature_is_an_error_not_a_false(registry):
@@ -53,9 +56,10 @@ def test_a_registry_too_old_to_say_reads_as_zero():
     assert tinyray.RegistryInfo(1, "0.8.1").supports("long_poll") is True
     assert tinyray.RegistryInfo(1, "0.14.0").supports("publication_ordering") is False
     assert tinyray.RegistryInfo(2, "").supports("publication_ordering") is True
+    assert tinyray.RegistryInfo(2, "").supports("native_registry") is False
 
 
-@pytest.mark.parametrize("feature", ["long_poll", "publication_ordering"])
+@pytest.mark.parametrize("feature", ["long_poll", "publication_ordering", "native_registry"])
 def test_wanting_more_than_the_registry_has_says_so_instead_of_degrading_quietly(
     registry, monkeypatch, feature
 ):

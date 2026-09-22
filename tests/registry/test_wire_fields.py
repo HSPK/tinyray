@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import textwrap
 import time
-import urllib.request
 
 import pytest
 import tinyray
+
+from tests.support.registry_wire import beat as registry_beat
 
 
 def beat(endpoint: str, **kw) -> dict:
@@ -29,14 +29,7 @@ def beat(endpoint: str, **kw) -> dict:
         "seen": {},
     }
     body.update(kw)
-    req = urllib.request.Request(
-        f"http://{endpoint}/v1/beat",
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    return registry_beat(endpoint, body)
 
 
 # ---- Beat ----------------------------------------------------------------
@@ -69,10 +62,10 @@ def test_policy_and_size_are_pool_wide(registry):
 
 
 def test_url_and_state_and_ready_travel_to_peers(registry):
-    beat(registry.endpoint, pool="u", id=1, url="http://h:1", state={"v": 7}, ready=False)
+    beat(registry.endpoint, pool="u", id=1, url="h:1", state={"v": 7}, ready=False)
     m = beat(registry.endpoint, pool="u", id=2, watch=["u"])["pools"]["u"]["changed"]
     mine = [x for x in m if x["id"] == 1][0]
-    assert mine["url"] == "http://h:1" and mine["state"] == {"v": 7}
+    assert mine["url"] == "h:1" and mine["state"] == {"v": 7}
     assert mine["ready"] is False
 
 

@@ -1,23 +1,26 @@
 """What to look at when something is wrong.
 
-Everything here is either a plain HTTP endpoint or a number the client already
-tracks. There is no dashboard and no event stream, because a phone book that
-needed its own observability stack would be the wrong size.
+Everything here is either a native registry probe, a native RPC endpoint, or a
+number the client already tracks. There is no dashboard and no event stream,
+because a phone book that needed its own observability stack would be the
+wrong size.
 
     python examples/18_observability.py
 """
 
 from __future__ import annotations
 
-import json
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 import tinyray  # noqa: E402
 from _harness import Fleet, role_main  # noqa: E402
+
+from tests.support.registry_wire import debug_pools  # noqa: E402
 
 
 def run_engine(argv: list[str]) -> None:
@@ -57,9 +60,8 @@ def run_inspector(argv: list[str]) -> None:
             )
 
         print("--- and from outside, with no client at all ---", flush=True)
-        with urllib.request.urlopen(f"http://{registry}/v1/pools", timeout=5) as r:
-            for name, info in sorted(json.loads(r.read()).items()):
-                print(f"  {name:<12} {info}", flush=True)
+        for name, info in sorted(debug_pools(registry).items()):
+            print(f"  {name:<12} {info}", flush=True)
 
         print("--- the two numbers, and why there are two ---", flush=True)
         before_v, before_r, _, _ = engines._c.pool_info("engine")

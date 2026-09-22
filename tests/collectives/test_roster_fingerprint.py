@@ -6,24 +6,24 @@
 
 from __future__ import annotations
 
-import json
 import random
 import subprocess
 import sys
 import textwrap
 import time
 
-import httpx
+import msgspec
 import pytest
 import tinyray
+
+from tests.support.registry_wire import beat as registry_beat
 
 
 class _Wire:
     """直接说协议，因为要固定任期号 —— SDK 每次 join 都会生成新的。"""
 
     def __init__(self, endpoint: str):
-        self.url = f"http://{endpoint}/v1/beat"
-        self.cli = httpx.Client(timeout=30)
+        self.endpoint = endpoint
         self.seen: dict[str, int] = {}
         # 没有变化的池子根本不出现在 ack 里，所以"没提到"就是"和上次一样"。
         self.last: dict = {}
@@ -45,11 +45,7 @@ class _Wire:
             state={},
         )
         body.update(kw)
-        j = self.cli.post(
-            self.url,
-            content=json.dumps(body).encode(),
-            headers={"content-type": "application/json"},
-        ).json()
+        j = registry_beat(self.endpoint, body, timeout=30)
         d = j.get("pools", {}).get("t")
         if d:
             self.seen["t"] = d["version"]
@@ -59,9 +55,7 @@ class _Wire:
 
 @pytest.fixture
 def wire(registry):
-    w = _Wire(registry.endpoint)
-    yield w
-    w.cli.close()
+    yield _Wire(registry.endpoint)
 
 
 def _observer(registry) -> _Wire:
@@ -101,7 +95,7 @@ def test_occupancy_changes_do_move_the_roster(registry, wire):
         again = obs.beat(pool="obs", id=9999, incarnation=base + 7)["roster"]
         assert again != after, "有人以新任期回来，名单指纹却没动"
     finally:
-        obs.cli.close()
+        pass
 
 
 def test_readiness_does_not_move_the_roster(registry, wire):
@@ -152,7 +146,7 @@ def test_the_maintained_fingerprint_matches_a_fresh_one(registry, wire):
         d = obs.beat(pool="obs", id=8888, incarnation=base + 50)
         assert d["roster"] == expected(ids[:2]), "有人离开后指纹与重算的不一致"
     finally:
-        obs.cli.close()
+        pass
 
 
 CHURNER = textwrap.dedent(
@@ -238,7 +232,7 @@ def test_the_clients_own_fingerprint_agrees_with_the_registrys(registry):
                     checks += 1
                     assert ours == whole, (
                         f"第 {i} 轮 version={version}：客户端算出 {ours}，"
-                        f"注册表说 {whole}，缓存里 {len(json.loads(raw))} 个成员"
+                        f"注册表说 {whole}，缓存里 {len(msgspec.msgpack.decode(raw))} 个成员"
                     )
                 time.sleep(0.02)
         assert checks >= 50, f"只对上了 {checks} 次账，这条测试没测到东西"

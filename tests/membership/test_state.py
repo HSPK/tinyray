@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 
-import httpx
 import pytest
 import tinyray
+
+from tests.support.registry_wire import RegistryWireError
+from tests.support.registry_wire import beat as registry_beat
 
 
 def _beat(registry, **kw):
@@ -24,27 +26,23 @@ def _beat(registry, **kw):
         state={},
     )
     body.update(kw)
-    return httpx.post(
-        f"http://{registry.endpoint}/v1/beat",
-        content=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-        timeout=30,
-    )
+    return registry_beat(registry.endpoint, body, timeout=30)
 
 
 def test_the_registry_refuses_to_carry_a_large_state(registry):
     """实测：一个成员 6MB 的 state 在 0.9s 内变成推给 20 个订阅者的 120MB。"""
-    assert _beat(registry, state={"blob": "z" * (6 << 20)}).status_code == 413
-    assert _beat(registry, id=2, state={"blob": "z" * (17 << 10)}).json()["accepted"] is False
-    assert _beat(registry, id=3, state={"blob": "z" * (8 << 10)}).json()["accepted"] is True
+    with pytest.raises(RegistryWireError, match="frame_too_large"):
+        _beat(registry, state={"blob": "z" * (6 << 20)})
+    assert _beat(registry, id=2, state={"blob": "z" * (17 << 10)})["accepted"] is False
+    assert _beat(registry, id=3, state={"blob": "z" * (8 << 10)})["accepted"] is True
 
 
 def test_the_registry_refuses_oversized_urls_and_method_lists(registry):
     """url 和 methods 同样是照抄给每个订阅者的。"""
-    assert _beat(registry, id=4, url="http://" + "x" * 600).json()["accepted"] is False
-    assert _beat(registry, id=5, methods=[f"m{i}" for i in range(300)]).json()["accepted"] is False
-    assert _beat(registry, id=6, methods=["z" * 600]).json()["accepted"] is False
-    assert _beat(registry, id=7, url="http://10.0.0.1:9000", methods=["ok"]).json()["accepted"]
+    assert _beat(registry, id=4, url="x" * 600 + ":1")["accepted"] is False
+    assert _beat(registry, id=5, methods=[f"m{i}" for i in range(300)])["accepted"] is False
+    assert _beat(registry, id=6, methods=["z" * 600])["accepted"] is False
+    assert _beat(registry, id=7, url="10.0.0.1:9000", methods=["ok"])["accepted"]
 
 
 def test_an_oversized_state_fails_at_the_call_that_did_it(registry):

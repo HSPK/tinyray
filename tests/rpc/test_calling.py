@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 import sys
 import textwrap
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -17,6 +15,10 @@ from uuid import UUID
 
 import pytest
 import tinyray
+from tinyray._msgpack import dumps, loads
+
+from tests.support.rpc_wire import exchange
+from tests.support.rpc_wire import request as wire_request
 
 SERVER = textwrap.dedent(
     """
@@ -150,6 +152,24 @@ def test_business_failures_stay_business_failures(peer):
     assert "rubric failed" in e.value.traceback
     # Not Unreachable: it arrived. Retrying it is the application's call.
     assert not isinstance(e.value, tinyray.Unreachable)
+    with pytest.raises(tinyray.RemoteError, match="rubric failed"):
+        peer.boom.returns(dict)()
+
+
+def test_native_reply_marks_remote_errors_without_wrapping_success(peer):
+    response = exchange(
+        peer.url,
+        wire_request(
+            request_id="raw-boom",
+            target=peer.identity,
+            method="boom",
+            body=dumps({"args": [], "kwargs": {}}),
+        ),
+    )
+
+    assert response["status"] == "remote_error"
+    assert response["error"]["message"] == "rubric failed"
+    assert peer.echo.returns(dict)({"result": 7}) == {"result": 7}
 
 
 def test_a_dead_callee_is_unreachable_not_a_remote_error(peer, registry):
@@ -288,7 +308,7 @@ def test_returns_and_timeout_compose_in_either_order(peer):
     assert peer.echo(raw) == raw
 
 
-def test_returns_names_the_call_and_json_path_when_the_shape_is_wrong(peer):
+def test_returns_names_the_call_and_messagepack_path_when_the_shape_is_wrong(peer):
     raw = {
         "jobs": [[[[["task"], 0], 0], "http://proxy"]],
         "by_attempt": {"not-an-int": [[[["task"], 0], 0], "http://proxy"]},
@@ -323,20 +343,20 @@ def test_returns_restores_the_async_result_too(peer):
     )
 
 
-def test_it_is_still_plain_http(peer):
-    req = urllib.request.Request(
-        f"{peer.url}/call/add",
-        data=json.dumps({"a": 4, "b": 5}).encode(),
-        headers={"content-type": "application/json"},
-        method="POST",
+def test_it_is_native_framed_messagepack(peer):
+    response = exchange(
+        peer.url,
+        wire_request(
+            request_id="raw-add",
+            target=peer.identity,
+            method="add",
+            body=dumps({"args": [4, 5], "kwargs": {}}),
+        ),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        assert json.loads(r.read())["result"] == 9
 
-    with urllib.request.urlopen(f"{peer.url}/_methods", timeout=5) as r:
-        body = json.loads(r.read())
-    assert "assign" in body["methods"]
-    assert "_private" not in body["methods"]
+    assert "://" not in peer.url
+    assert response["status"] == "success"
+    assert loads(response["body"]) == 9
 
 
 def test_a_member_without_serves_advertises_nothing(registry):

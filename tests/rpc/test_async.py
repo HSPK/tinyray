@@ -104,7 +104,7 @@ def test_async_timeout_is_bounded(async_peer):
                 "id": 0,
                 "slot": 0,
                 "incarnation": h.incarnation,
-                "url": "http://127.0.0.1:1",
+                "url": "127.0.0.1:1",
                 "ready": True,
             },
             ("assign",),
@@ -116,24 +116,9 @@ def test_async_timeout_is_bounded(async_peer):
 
 
 def test_repeated_event_loops_do_not_accumulate_clients(async_peer):
-    """One httpx client per loop is right; one per loop *forever* is not.
-
-    The cache was keyed by id(loop), and an id is an address. Nothing ever
-    removed an entry, so a program that calls asyncio.run() per step -- a
-    synchronous training loop driving an async fleet, which is the shape this
-    library exists for -- accumulated one client and one socket per call.
-    Measured before the fix: 100 calls, 100 entries, 100 file descriptors,
-    against a default limit of 1024.
-
-    The same key was also unsound. An address freed by one loop is handed to
-    the next, so a later asyncio.run() could be given a pool belonging to a
-    loop that is already closed. Measured separately: 2 of 5 consecutive
-    asyncio.run() calls landed on an id that had already been used.
-    """
+    """The native pool belongs to the process, not to short-lived Python loops."""
     import gc
     import os
-
-    from tinyray import _rpc
 
     def open_fds() -> int:
         return len(os.listdir(f"/proc/{os.getpid()}/fd"))
@@ -145,23 +130,33 @@ def test_repeated_event_loops_do_not_accumulate_clients(async_peer):
     # ones are entitled to keep, so it is not part of what must stay flat.
     assert asyncio.run(one(0))["took"] == "t0"
     gc.collect()
-    before_fds, before_entries = open_fds(), len(_rpc._loops)
+    before_fds = open_fds()
 
     for i in range(1, 40):
         assert asyncio.run(one(i))["took"] == f"t{i}"
 
-    assert len(_rpc._loops) - before_entries <= 2, (
-        f"39 more event loops left {len(_rpc._loops)} cached clients "
-        f"(was {before_entries}); nothing is retiring them"
-    )
-    # Retired clients close their sockets when they are collected, and some of
-    # that is cyclic, so the collector has to run before counting. Measured
-    # across 300 loops: bounded, oscillating between 11 and 22 descriptors and
-    # returning to exactly the starting count once collected -- against 110
-    # after only 100 loops before the fix.
     gc.collect()
     leaked = open_fds() - before_fds
-    assert leaked <= 5, f"39 more event loops leaked {leaked} file descriptors"
+    assert leaked <= 3, f"39 more event loops leaked {leaked} file descriptors"
+
+
+def test_async_calls_do_not_use_asyncio_threads_or_the_default_executor(async_peer, monkeypatch):
+    async def forbidden(*args, **kwargs):
+        pytest.fail("native async RPC must not use asyncio.to_thread")
+
+    monkeypatch.setattr(asyncio, "to_thread", forbidden)
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+
+        def forbidden_executor(*args, **kwargs):
+            pytest.fail("native async RPC must not use run_in_executor")
+
+        monkeypatch.setattr(loop, "run_in_executor", forbidden_executor)
+        h = tinyray.apool("acollector").slot(0)
+        assert (await h.assign("native"))["took"] == "native"
+
+    asyncio.run(drive())
 
 
 STOPPED_LOOP_SERVER = textwrap.dedent(
@@ -242,8 +237,7 @@ ASYNC_PEER = textwrap.dedent(
 
 
 def test_async_calls_reuse_one_connection(registry):
-    """The sync path was fixed first; the async path kept sending
-    `connection: close` and burned a socket per call."""
+    """Two hundred awaited calls reuse the process-global native TCP pool."""
     me = tinyray.join("driver", "churn")
     me.ready()
     proc = subprocess.Popen(

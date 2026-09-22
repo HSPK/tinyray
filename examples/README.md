@@ -8,13 +8,22 @@ maturin develop --release      # the registry ships in the wheel
 python examples/01_hello_world.py
 ```
 
+The Rust-only embedded service/client example uses the same registry and
+method wire protocol:
+
+```bash
+cargo run --release -p tinyray --example rust_service -- \
+  127.0.0.1:8760 rust-workers 0 1
+```
+
 ## Start here
 
 | | What it shows |
 |---|---|
 | [01_hello_world](01_hello_world.py) | The smallest thing that works: one process serves a method, another finds it and calls it |
 | [09_error_taxonomy](09_error_taxonomy.py) | Six different failures told apart, and the retry rule for each |
-| [15_plain_http](15_plain_http.py) | It is still HTTP, so `curl` still works — methods, calls, pools, health |
+| [15_native_rpc](15_native_rpc.py) | Inspect method and registry frames directly with sockets and MessagePack |
+| [21_blobref](21_blobref.py) | Explicit same-host 16 MiB memfd payload, read-only mapping, and retention after sender close |
 
 ## The four kinds of member
 

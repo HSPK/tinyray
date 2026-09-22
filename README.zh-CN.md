@@ -34,12 +34,18 @@ tinyray.pool("collector").slot(0).assign("task-7")
 await tinyray.apool("collector").slot(0).assign("task-7")
 ```
 
-底下就是普通 HTTP，所以 `curl` 排障能力一点没丢：
+从 0.18 起，方法调用和注册中心都走原生持久 TCP。端点写成裸 `host:port`；
+每条消息都是 `u32` 大端长度加 MessagePack，不再提供 HTTP/JSON 兼容监听。
 
-```bash
-curl -X POST http://host:port/call/assign -d '{"task":"t"}'
-curl http://host:port/_methods
+```text
+call  = {v: 1, id, from, to, op: "call", method, body: <MessagePack bytes>}
+reply = {v: 1, id, status, body: <MessagePack bytes>, error?, batch_index?, completed?}
 ```
+
+Rust 负责 framing、持久连接池、请求关联和准入；Python 负责标准 dataclass 与
+类型化容器转换。原始 socket 排障示例见
+[`examples/15_native_rpc.py`](examples/15_native_rpc.py)。
+方法 frame 在分配前受 32 MiB 硬上限及 global/per-server 连接与字节预算约束。
 
 座位、任期与冻结名单：
 
@@ -97,7 +103,7 @@ Python 测试按子系统组织：
 | `tests/discovery/` | 缓存查询、筛选、订阅和等待 |
 | `tests/collectives/` | Epoch 和名单指纹 |
 | `tests/registry/` | 协议、准入、租约、发布顺序和网络恢复 |
-| `tests/rpc/` | 调用、校验、HTTP、载荷、并发和调用统计 |
+| `tests/rpc/` | 调用、校验、framed transport、载荷、并发和调用统计 |
 | `tests/examples/` | 示例程序及其领域逻辑 |
 | `tests/project/` | 公开 API、文档和 CI 契约 |
 
@@ -107,8 +113,17 @@ Python 测试按子系统组织：
 
 ## 它是怎么搭的
 
-约 2,900 行：Rust 写的注册中心和客户端（`crates/`），外面是 Python API
-（`python/tinyray/`），用 pyo3 和 maturin 缝在一起。
+Rust workspace 分成 fork-safe runtime 基础件（`tinyray-core`）、共享 wire 类型
+（`tinyray-proto`）、原生 membership/cache 核心（`tinyray-membership`）、
+注册中心（`tinyray-registry`）、公开 Rust SDK（`tinyray`）和一层很薄的 PyO3
+适配器（`tinyray-client`）。易用的 Python API 与 Python 特有的类型语义放在
+`python/tinyray/`。
+
+Rust 应用也可以直接嵌入公开 `tinyray` crate。`MemberBuilder`、`DiscoveryPool`、
+`Snapshot`、`Epoch`、`Router`、`Service`、`Client`、`Target` 使用同一注册中心、
+Arc-backed discovery cache、事件驱动等待与多路复用 MessagePack 传输，不依赖
+Python/PyO3；见
+[`crates/tinyray/examples/rust_service.rs`](crates/tinyray/examples/rust_service.rs)。
 
 这里每一条行为都是先量后改的，而且每一条都在 `mutation_check.py` 里有条目 ——
 把 bug 放回去，某条指名的测试就会变红。**一条不可能失败的测试不是测试。**

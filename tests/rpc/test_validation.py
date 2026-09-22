@@ -191,15 +191,7 @@ def test_a_proxy_that_answers_through_getattr_still_works(registry):
     ["http://10.0.0.5", "10.0.0.5:8080", "10.0.0.5/", "host name", "https://node7/x"],
 )
 def test_an_advertise_value_that_is_not_a_bare_host_is_refused(monkeypatch, value):
-    """登记一个没人能到达的地址，和登记 127.0.0.1 是同一种错：**静默错路由**。
-
-    这里只有主机名的位置，scheme 和端口是围着它拼上去的。写别的东西会被整个
-    粘进去：实测 `http://10.0.0.5` 变成 `http://http://10.0.0.5:33097`，
-    `10.0.0.5:8080` 变成 `http://10.0.0.5:8080:33097` —— 而进程照常注册成功，
-    要等到有人来调用才炸，那时现场已经离出错的地方很远了。
-
-    文档把它叫"对外地址"，本来就在引诱人写 `http://`。
-    """
+    """This setting is a host that the native listener's chosen port is added to."""
     monkeypatch.setenv("TINYRAY_ADVERTISE", value)
     with pytest.raises(ValueError, match="bare host"):
         tinyray._advertise()
@@ -213,16 +205,15 @@ def test_a_bare_host_is_taken_as_given(monkeypatch, value):
     assert tinyray._advertise() == value.strip()
 
 
+@pytest.mark.parametrize("value", ["http://127.0.0.1:7", "tcp://node:7", "node", ""])
+def test_old_or_incomplete_method_endpoints_are_rejected_at_join(registry, value):
+    with pytest.raises(ValueError, match="method endpoint"):
+        tinyray.join("bad-endpoint", url=value)
+
+
 @pytest.mark.parametrize("bad", ["有中文", "a/b", "a?b", "a b", "a-b"])
-def test_a_method_name_that_cannot_be_a_url_is_refused(bad):
-    """方法名会进每一次调用的 URL 路径，所以必须扛得住放进去。
-
-    `def 处理(self)` 是合法 Python，登记也完全正常 —— 然后调用发过去问的是
-    `%E5%A4%84%E7%90%86`，被回以"没有这个方法"。空格一样。
-
-    斜杠和问号今天**侥幸能用**，理由还是错的：服务端把路径原样读回来了。
-    两端之间任何一个会规范化 URL 的东西一出现，它们就会停。所以一并拒绝。
-    """
+def test_a_method_name_that_cannot_be_protocol_metadata_is_refused(bad):
+    """Method metadata is one public ASCII identifier on every implementation."""
 
     class Served:
         def fine(self) -> int:

@@ -69,8 +69,9 @@ tinyray.join(
   较小值降低突发变化的通知延迟，但会增加请求数；0 关闭这项间隔限制。只接受
   非负整数，实际间隔不超过租约的四分之一，避免大值阻碍续租。
   本地发布可提前唤醒正在休息的客户端。
-- **`url=`** —— 手工指定对外地址。默认由路由表探出来；多网卡机器上可以用
-  `TINYRAY_ADVERTISE` 指定。
+- **`url=`** —— 手工指定原生方法端点（`host:port`）。默认由路由表探出 host，
+  再加上 native listener 选出的端口；多网卡机器上可以用 `TINYRAY_ADVERTISE`
+  指定 host。
 - **`registry_url=`** —— 去哪个注册中心报到，压过 `TINYRAY_REGISTRY`。
   **别和上面的 `url=` 搞混**：那个是"别人怎么找到我"，这个是"我去找谁"。
   环境变量仍是常规通道（launcher 一次给所有 rank 设好）；这个参数是给用不了
@@ -79,12 +80,10 @@ tinyray.join(
   它选一个注册中心，不是加一个：一个进程一个成员一个注册中心，`pool()` /
   `apool()` 跟着 `join()` 走。给一串地址会被**当场拒绝**。
 
-    !!! warning "只写主机名，不要写 scheme 或端口"
-        `http://` 和端口是围着它拼上去的，所以 `TINYRAY_ADVERTISE=http://10.0.0.5`
-        会拼成 `http://http://10.0.0.5:33097`。这类写法现在**当场拒绝**并说明
-        原因 —— 以前会登记成功，等到有人来调用才炸。
-
-        要登记完全不同的地址（比如在反向代理后面），用 `join(url=...)`。
+    !!! warning "TINYRAY_ADVERTISE 只写主机名"
+        listener 的端口会自动加上。scheme、路径和端口都会被拒绝。要登记另一条
+        原生 TCP 端点，用 `join(url="host:port")`。旧 `http://...` 方法地址会
+        被明确拒绝，没有兼容 fallback。
 
 ---
 
@@ -240,9 +239,21 @@ len(pool)                                      # ready 的人数
 `shard=3` 的人），布尔严格（`free=1` 不匹配 `free=True`）。
 大整数不会先舍入成浮点数再判断相等。
 
+只含顶层标量字段（`null`、布尔、字符串、整数、有限浮点数）的重复过滤会使用
+有界原生结果索引。嵌套对象、数组、超限键和其他不支持形状仍走同一条扫描路径，
+结果语义不变。每个 pool 最多保留 32 个过滤、每个过滤最多 8 个字段和 4 KiB
+键数据、每项最多 8,192 个匹配 ID，总估算内存不超过 1 MiB。成员 state/readiness
+变化、移除、full resync 或注册中心重启都会使相关结果失效。索引只存 wire ID，
+不存 Handle，也不复制 state。
+
 `slot()` 使用原生座位索引，`pick()` 在序列化之前选出一个匹配者，不再为了返回
-一个句柄构造整份 Python 名单。重复的批量查询复用有界的原生快照缓存，但返回
-句柄的 state 仍是各自独立解码的，不会因修改一个句柄而污染下一次查询。
+一个句柄构造整份 Python 名单。`all()`、`snapshot()`、`epoch()` 和内置等待则直接
+拿 Rust 的不可变名单视图，不再把整份 roster 编成 MessagePack、交给 Python 解码。
+每个 pool 最多缓存 all/ready 两份视图，里面只有 `Arc<Member>` 和索引，不复制
+可能很大的 state。整份名单第一次读取 state 时，Rust 只编码一份有界
+MessagePack state 数组，Python 也只解码一次，再按索引把互相独立的对象交给各
+Handle；小于 1 MiB 的编码结果随不可变名单视图缓存，成员变化会连同视图一起失效。
+修改一个句柄仍不会污染下一次查询或另一份快照。
 
 数字这条规则一路走到底：`cfg={"shard": 6/2}` 同样找得到发布
 `cfg={"shard": 3}` 的人，数组里也一样。形状仍然精确 —— 嵌套对象要键完全
@@ -281,15 +292,10 @@ apool.achanges(fields=["role", "ready"])
 给了 `fields` 之后，只有这些字段（或成员进出、座位换人）真的动了才产出快照。
 `ready` 和 `url` 是成员自己的一部分，也能点名；其余名字在 state 里找。
 
-比较发生在 **Rust 缓存里**，在任何东西被序列化之前。实测 5,000 成员：
-
-| | |
-|---|---|
-| `pool.snapshot()` | 8.78 ms |
-| `field_digest(["role", "ready"])` | **0.40 ms** |
-
-放在 Python 层做 predicate 是省不下来的 —— 它要拿到 `Snapshot` 才能判断，而那
-时候钱已经花完了。
+比较发生在 **Rust 缓存里**，在任何东西被序列化之前。`snapshot()` 本身现在也只
+创建一个共享原生视图；只有访问 `members` 或开始迭代时才批量创建 Python
+`Handle`。所以 `len(snapshot)`、repr、`slot()`、`get()` 和字段摘要都不再付整份
+名单的物化成本。
 
 **身份永远算数。** 座位换人即使新任期发布的字段和前任一模一样，也会产出 ——
 否则你会继续对着一个已经死掉的 incarnation 说话。
@@ -315,8 +321,9 @@ w.close()                          # 也可以从另一个线程/任务关掉
 让进程再也退不出去。
 
 !!! note "异步侧不占用线程"
-    `achanges()` 等在一个心跳会写入的管道上，由事件循环 select，**不借用
-    executor 线程**。所以取消是即时的，取消多少个都不会影响别处。
+    `achanges()` 等在一个 cache/lifecycle 变化才会写入的管道上，由事件循环
+    select，**不借用 executor 线程**。空 heartbeat ack 不写管道，所以安静池不会
+    按心跳频率反复唤醒。取消是即时的，取消多少个都不会影响别处。
 
     早先的实现用 `asyncio.to_thread`：取消 awaitable 并不会停掉底下那个线程。
     24 核机器上取消 40 个 watcher 之后，紧接着一次 `asyncio.to_thread` 要等
@@ -342,8 +349,15 @@ revision 无缝交接过去、被 `close()` 时停下、`Fenced` 放出去而不
 满足"。第二件做错最难发现 —— 池子在"先看一眼"和"开始订阅"之间动了，等待就会为
 一个立刻成立的条件白等满整个超时。
 
-下面几个都是它的特例。`pool.wait()` 也是 —— 它从前自己写循环，于是成了全库唯一
-一个被顶替后不抛 `Fenced` 而是白等满超时、再回头怪池子空的等待。
+任意 Python predicate 仍走这条通用路径；predicate 不能搬进 Rust。下面几个内置
+条件不再是它的 Python 特例：`wait()`、`wait_departure()`、
+`wait_replacement()` 和 `epoch()` 把计数、身份、指纹与超时交给 Rust，在同一把
+revision/condvar 上无缝检查并等待。异步版本复用事件循环管道，不借 executor
+线程，也没有 sleep/poll 循环。
+
+heartbeat、publication ACK 与 discovery revision 使用独立通知域：续租成功但名单
+没动时只唤醒注册/发布等待，不触碰任何 discovery waiter。首次注册同样直接等到
+绝对 deadline，不再每 100 ms 醒来检查一次。
 
 ### 等成员就绪（异步）
 
@@ -415,6 +429,10 @@ pool.epoch(min=None, timeout=60.0) -> Epoch
 | `get(identity)` | 精确到任期的那一个，不在返回 `None` |
 | `len()` / 迭代 | 按成员数 |
 
+`members` 仍是不可变 tuple，但它是懒的：创建快照不会创建任何 `Handle`；第一次
+访问 `members` 或迭代时才物化一次并缓存。`ready()` 只物化 ready 的成员。
+快照持有旧 `Arc<Member>`，所以后续发布、离场或注册中心重启都不会改写它。
+
 `get()` 放在快照上而不是池子上是有意的：「那个 incarnation 还在吗」问的是**一个
 时刻**，对着活池子问两次可能问到两个时刻。
 
@@ -430,23 +448,59 @@ pool.epoch(min=None, timeout=60.0) -> Epoch
 | `label` | 给人看的短形式 |
 | `pool` / `id` / `slot` / `incarnation` / `url` / `state` / `ready` | 记录本身 |
 
+从 Pool/Snapshot/Epoch 返回的 Handle 内部持有 `Arc<Member>` 的原生引用。构造几千个
+Handle 时不会复制 state；`pool`、身份、座位、任期、URL、ready、identity、label
+和方法代理都直接读原生引用。第一次访问 `state` 才创建一份独立 Python dict，并
+安装到真实 slot；同一名单中的 Handle 共享一次批量 decode，后续读取不再经过
+property 或 native 调用。修改它不会污染其他 Handle、缓存或冻结快照。手工
+`Handle(pool, raw, methods)` 的兼容构造方式和字段可写语义不变。
+
 ```python
 h.assign("task")                    # 调用
 h.assign.timeout(5.0)("task")       # 单次调用的超时，默认 30 秒
-h.pull_job.returns(AgentJob)()      # 把 JSON 结果恢复成 AgentJob
+h.pull_job.returns(AgentJob)()      # 把 MessagePack 结果恢复成 AgentJob
 ```
 
-标准 dataclass 可以直接作为参数和返回值；Pydantic 2 是可选集成：
+`url` 是裸 `host:port`。方法连接持久并可多路复用：每条连接只有一条串行 frame
+写路径和一个 reply reader，最多同时承载 128 个按 request ID 相关的调用，回复可
+乱序到达。每端点最多 256 个本地在途调用、4 条连接；每进程最多 512 个在途调用、
+256 条客户端连接，并只保留 64 条 idle 连接。选择时取当前负载最小的连接；所有
+现有连接都已有两个预留调用时，就继续开连接直到端点的 4 条上限。这样普通并发下
+writer/reader 队列保持很浅，又不会退回一调用一 socket。每帧都是 `u32` 大端长度
+加一张 MessagePack map：
 
-```bash
-pip install "tinyray[pydantic]"
+Python 与嵌入式 Rust 调用共用这一套公开 `tinyray::Client` 实现。PyO3 层只适配
+Python 值、completion 投递和取消，不再维护第二份连接池、socket reader/writer
+或 reply routing 状态机。
+
+```text
+call  = {v: 1, id, from, to, op: "call", method, body: bytes}
+batch = {v: 1, id, from, to, op: "batch", batch: count, body: bytes}
+reply = {v: 1, id, status, body: bytes, error?, batch_index?, completed?}
 ```
+
+`body` 对 Rust 是 opaque bytes，里面是一份单独编码的 application value。reply
+status 是 `success`、`method_not_found`、`fenced`、`caller_fault`、
+`concurrency_refused`、`remote_error`、`malformed_protocol`、`internal`。
+畸形、截断、超限、重复或未知 reply ID 会毒掉连接，并按各请求的 frame 是否完整
+写出给所有剩余调用分类。完整写出后超时或取消只移除自己的 waiter；已知 request ID
+的迟到回复会被丢弃，不会毒掉别的调用。没有 HTTP/JSON listener 或兼容 fallback。
+方法 frame 的硬上限是 32 MiB，长度前缀会在分配 body 之前检查；连接数、在途
+frame 数及大小 frame 的字节数同时受 process-global 和 per-server 准入预算限制，
+小于等于 1 MiB 的控制消息使用独立预算，不会被少数最大 frame 挤掉。
+`max_concurrency` 仍在进入 Python 方法前逐请求限流；batch 只占一个槽，内部仍串行。
+
+客户端池里的连接最多空闲复用 10 秒。服务端只在没有活跃调用时按 15 秒 idle
+关闭连接；一旦 frame 开始，prefix/body 共用一份绝对 15 秒截止时间。这个 5 秒
+余量让客户端先丢弃过期池项，服务端也不会为永远沉默的 peer 永久保留 task。
+
+标准 dataclass 可以直接作为参数和返回值：
 
 ```python
 from dataclasses import dataclass
-from pydantic import BaseModel
 
-class Request(BaseModel):
+@dataclass(frozen=True)
+class Request:
     prompt: str
     max_tokens: int
 
@@ -462,18 +516,31 @@ class Worker:
 reply = h.infer.returns(Reply)(Request(prompt="hello", max_tokens=32))
 ```
 
-调用端模型先变成 JSON；服务端再按方法参数注解恢复。方法返回 dataclass 或
-Pydantic model 时会自动编码；调用端不写 `.returns(T)` 得到普通 dict/list，
-写了就恢复成本地声明的类型。两种模型可以互相嵌套，也可以放进
-`list[T]`、`dict[K, V]`、Optional/Union、tuple 和 set。
+调用端 dataclass 先变成 MessagePack map；服务端按方法参数注解直接恢复。方法返回
+dataclass 时会自动编码；调用端不写 `.returns(T)` 得到普通 dict/list，写了就恢复
+成本地声明的类型。dataclass 可以嵌套，也可以放进 `list[T]`、`dict[K, V]`、
+Optional/Union、tuple 和 set。`NamedTuple`、`TypedDict`、Enum、datetime、
+date/time/timedelta、UUID、Decimal 和这些容器同样递归恢复。
 
-Pydantic 编码使用 `model_dump(mode="json", by_alias=True)`，解码使用
-`model_validate()` 或缓存的 `TypeAdapter`，所以 alias、validator、JSON serializer
-都生效。TinyRay 不在启动时导入 Pydantic；应用已经安装并使用它时才启用适配。
+0.18 **刻意移除了 Pydantic 集成**：没有 `tinyray[pydantic]` extra，没有
+`BaseModel`/Pydantic dataclass 的特殊编码，也没有 alias、validator、serializer
+或 strict marker。把 Pydantic 对象直接作为参数会在发送前抛 `TypeError`；
+`.returns(PydanticType)` 也会在调用前明确拒绝。需要它时，应用先显式转换成标准
+dataclass、TypedDict 或普通 MessagePack 值。
 
-JSON 本身不保存 Python 类型：`NamedTuple` 过线后是 list，dataclass/Pydantic
-过线后是 object。`.returns(T)` 在调用端声明要恢复成什么，也递归处理
-`NamedTuple`、`TypedDict`、Enum、datetime、UUID 和上述容器：
+每个成功的 native reply 已经把结果放在 opaque application payload 里；没有
+`/_result/` 路径、HTTP status 或 fallback 请求。能直接恢复的模型参数从
+`msgspec.Raw` MessagePack 子片段构造，避免先建通用 dict/list 对象图。
+
+MessagePack array 不保留普通输入原本是 list、tuple 还是 set。`.returns(T)`
+在调用端声明要恢复成什么：
+
+未声明类型的值遵循 `msgspec.msgpack`：bytes 与 datetime 原样保留；UUID 和 Enum
+变成各自的 wire value；tuple/set 变成 array；整数和 tuple map key 保留；
+NaN/Infinity 仍是 float。超出 MessagePack 64-bit 有符号/无符号范围的 Python int
+使用保留 ext code 121；122、123、125、126 保留大整数 map/set 与复合
+tuple/frozenset key。这些 code 不携带 Python 类名；应用不要直接使用这些 code 的
+`msgspec.msgpack.Ext`。
 
 ```python
 class AgentJob(NamedTuple):
@@ -484,10 +551,9 @@ job = h.pull_job.returns(AgentJob)()
 jobs = await ah.pull_jobs.returns(list[AgentJob])()
 ```
 
-转换失败抛本地 `TypeError`，消息带远端身份、方法名和出错的 JSON 路径；远端方法
-此时已经成功运行，失败只发生在结果恢复阶段。协议仍是普通 JSON，不会在线上传
-Python 类名。只有标准 dataclass 和 Pydantic model 是明确支持的模型边界；其他
-任意 Python 对象仍会像 `json.dumps` 一样被拒绝。
+转换失败抛本地 `TypeError`，消息带远端身份、方法名和出错路径；远端方法此时已经
+成功运行，失败只发生在结果恢复阶段。协议不会在线上传 Python 类名。只有标准
+dataclass 和上述类型化容器是明确支持的模型边界；其他任意 Python 对象会被拒绝。
 
 `.returns()` 和 `.timeout()` 都是单次调用的修饰符，可以任意顺序组合：
 
@@ -516,6 +582,9 @@ h.pull_job.returns(AgentJob).timeout(5)()
 | `valid` | 占用者一变就是 `False` |
 | `slot(k)` | 这一轮里的第 k 号 |
 
+和 `Snapshot` 一样，`members` 是懒物化并缓存的不可变 tuple；`len()`、`slot()`、
+`valid` 和 repr 直接读原生冻结视图。
+
 `valid` 在训练循环里查是没用的：卡住的 rank 根本到不了那一行。用后台线程 ——
 NCCL 阻塞时会放开 GIL。
 
@@ -532,27 +601,33 @@ me.registry.protocol   # 只增不减的整数；老到不报的读作 0
 me.registry.version    # 对面的版本号，用来写进日志
 me.registry.supports("long_poll") -> bool
 me.registry.supports("publication_ordering") -> bool
+me.registry.supports("native_registry") -> bool
 ```
 
 `RegistryInfo.FEATURES` 是功能名到所需 protocol 的对照表，放在依赖它的这一侧，
 所以老客户端不需要认识将来的功能。功能名写错会抛 `ValueError` 而不是返回
 `False` —— 后者会让一个笔误安静地走进降级分支。
 
-不加入也能看：
+不加入也能看：部署探针连到 `host:port`，发一帧 `health` 操作。每帧都是
+`u32` 大端长度加一张 MessagePack map：
 
-```console
-$ curl -s http://registry:7000/health
-{"status":"ok","version":"0.17.0","protocol":2}
+```text
+request  = {request_id: 7, operation: "health", payload: nil}
+response = {request_id: 7, operation: "health_ack",
+            payload: {status: "ok", version: "0.18.0", protocol: 3}}
 ```
+
+这不是 HTTP 端点，也没有 curl 兼容层。
 
 | protocol | 含义 |
 |---|---|
 | 0 | 长轮询之前（0.7.0 以前） |
 | 1 | 认 `hold_ms`：没话说时挂起应答，被订阅的池子一动就立刻回 |
 | 2 | 认 `publication`：旧请求不能覆盖新的 state、就绪位和 URL |
+| 3 | 注册中心改用原生长度前缀 MessagePack 传输 |
 
-老客户端仍可连接，但发布顺序保证需要两端都支持序号。新客户端遇到不支持的
-注册中心会告警。
+0.18 对两条传输都是硬切换：注册中心和方法 RPC 都不再监听 HTTP/JSON，客户端
+也不会回退到旧 wire。
 
 !!! warning "缺失功能会影响性能或一致性"
     老注册中心对长轮询请求的回答**又快又对**，只是不挂起 —— 所以"挂起了但什么
@@ -588,7 +663,9 @@ Context 可以是普通参数、位置专用参数或关键字专用参数。其
 **自称的身份，不是认证。** 这个系统里任期号本来也是成员自己生成的。它买到的是
 "调用方不会忘了传、也不会传错"，仅此而已。
 
-`request_id` 默认每次调用都不同，两侧的日志因此能指着同一次尝试说话。
+`request_id` 默认每次调用都不同，两侧的日志因此能指着同一次尝试说话。调用方
+identity 太长时会保留可读前缀、加入 identity 的 SHA-256 和精确序号，始终不超过
+200 字节；显式 `request_id()` 仍按原规则拒绝超长值。
 
 要让**重试共用一个名字**（幂等场景需要），把重试循环整个包起来：
 
@@ -625,7 +702,7 @@ results = await tinyray.abatch(handle, calls)
 ```
 
 每批最多 128 项，全部发给同一个成员，顺序执行，第一项失败就停止。空批次是本地
-空操作。它把多项操作合在一次 HTTP 往返里，**不是事务，也不回滚**。
+空操作。它把多项操作合在一次 framed TCP 往返里，**不是事务，也不回滚**。
 
 `BatchError` 包含从 0 开始的 `failed_index`、之前成功项的 `completed_results`
 以及 `cause`（`RemoteError`、`TypeError`、`AttributeError` 或 `Fenced`）。
@@ -634,13 +711,91 @@ results = await tinyray.abatch(handle, calls)
 
 传输超时针对整个批次交换，不是每项各享一份。`OutcomeUnknown` 表示不知道执行了
 哪一段，也可能整批都执行了；异步取消只停止等待，不撤销远端执行。库不会自动重试，
-也不会把不支持 `/_batch` 的老服务悄悄降级成逐项调用，而是返回 `NotDelivered`。
+也不会把旧 HTTP 服务悄悄降级成逐项调用；旧 URL 会被明确拒绝为不兼容端点。
 
 每项的 `CallContext.request_id` 从批次 ID 和下标稳定派生。短 ID 形如
 `<batch-id>:<index>`；长 ID 带确定性哈希，保持在 200 字符内。应用需要核对重试
 结果时，用 `request_id()` 固定批次 ID；去重仍由应用负责。
 
 一批占一个并发槽，`calls` 按一次请求计数；任一项失败则整次请求计入 `failed`。
+
+## Rust SDK
+
+公开 workspace crate `tinyray` 不依赖 Python/PyO3，主要类型：
+
+- `MemberBuilder` / `Member`：join、发布 state/readiness、watch、flush、leave。
+- `DiscoveryPool` / `Snapshot` / `MemberRef` / `Epoch`：直接读取 Arc-backed roster，
+  提供 filter/count/pick/slot/get、冻结视图、有效性检查，以及同步/异步
+  count/departure/replacement wait，不复制成员 state。
+- `Service` / `Router`：发布具名方法并分派 opaque MessagePack payload。
+- `CallContext`：caller identity、request ID、fencing target，以及连接/服务关闭时
+  触发的 cancellation token。
+- `Client` / `Target`：raw 与 serde typed 的同步/异步调用；request ID 和重试策略
+  完全由调用方控制。
+- `RpcRuntime`：让多个 `Client` / `Server` 共用一套 Tokio worker；高层
+  `MemberBuilder` 默认把 client/server 放在同一个 4-worker runtime。
+- `ReceivedRawReply` / `ReceivedRpcReply`：持有 response 的 BlobRef ACK guard；
+  用 `decode<T>()` 完成映射，或在不再需要 raw bytes 时 drop。
+- `Server` / `ServerConfig`：独立 listener 生命周期、准入上限、计数和显式关闭。
+
+`Router::raw` 不反序列化应用 payload；`typed` 显式解整个 payload，
+`typed_arg` / `typed_no_args` 使用与 Python 兼容的参数 envelope。batch 仍只占一个
+准入槽，内部逐项串行执行，第一次失败即停止，并返回 `batch_index`、`completed`
+和已成功前缀。
+
+通用 listener 与 Python 共用。Rust `Service` future 直接在 Tokio 上运行，不拿 GIL，
+也不进 `spawn_blocking`；Python `serves=` 在同一 listener 上安装
+`PythonService` adapter，只有 adapter 会进 `spawn_blocking` 并获取 GIL。
+
+## BlobRef
+
+```python
+with tinyray.blob(data) as blob:
+    result = handle.consume(blob)
+    view = blob.view()       # 只读 memoryview，不复制 payload
+    copied = bytes(blob)     # 显式复制
+```
+
+`BlobRef` 是显式的同机传输，不是跨机器 fallback。Linux 创建端只把输入复制一次到
+`memfd`，设置 0600/CLOEXEC，并封住 write/grow/shrink/继续修改 seals，随后只读
+映射。`MAX_BLOB_BYTES` 是 Python 默认的 256 MiB 创建/接收上限；Rust 对应
+`DEFAULT_MAX_BLOB_BYTES`，两端都可以按操作指定更小上限。MessagePack extension
+**124** 只携带有界 descriptor。每个解码消息最多包含
+`MAX_BLOB_REFS_PER_MESSAGE`（64）个 BlobRef 和
+`MAX_BLOB_MAPPED_BYTES_PER_MESSAGE`（512 MiB）不重复映射；相同 descriptor
+在消息内共享同一映射。原生兜底准入还把直接 serde/
+`from_descriptor` 的存活 handle 限为 128、映射限为 64、总映射字节限为
+512 MiB。descriptor 包含协议版本、Linux boot fingerprint、owner pid/fd、payload
+大小、device/inode，以及由 Linux `getrandom` 产生并同时写在 sealed header 里的
+随机 token。
+
+接收端先检查默认 256 MiB 大小上限、boot identity 和数值 pid/fd，然后只按代码
+构造并只读打开 `/proc/<pid>/fd/<fd>`；映射前核对 device、inode、文件总长、全部
+必需 seals、header magic、token 和 size。过期、fd 复用、跨 boot、未封口、超限
+或畸形 descriptor 都在调用方法前抛 `BlobError`。未知 MessagePack extension 仍是
+普通 `msgspec.msgpack.Ext`，不能伪造 BlobRef。
+
+调用参数的 owner 会移入原生 pending 状态；完整写出后即使 timeout/cancel，也要等
+迟到 reply 或连接关闭才释放。服务端 response owner 则一直保留到调用方完成解码并
+回送相关的 BlobRef acknowledgement。每个 reply 最多 64 个不重复 owner、512 MiB；
+未确认 reply 还受 connection（128/512 MiB）、server（512/1 GiB）和 process
+（2,048/2 GiB）总预算限制，重复 owner 只计一次，连接关闭会释放全部占用。raw
+reply guard 存活时，两端不会触发通常的 10/15 秒 idle 回收；未确认 response
+仍有 60 秒 server 硬截止时间。
+
+每次公开序列化都写当前进程 PID 和本地 fd，因此 fork 子进程中仍有效的映射不会发送
+父进程 descriptor。映射成功后，即使发送方 close、正常退出或 SIGKILL，接收方的
+`BlobRef` 仍有效。最后一个 fd/mapping 关闭后匿名对象由内核自动删除。已有
+memoryview 时普通 close 会被拒绝；fork 子进程会在遗忘继承 runtime 前关闭所有原生
+登记 BlobRef 和仅由 pending/abandoned RPC 持有的 owner。
+
+`BlobRef.from_descriptor(...)` 为显式协议集成与测试保留，但不接受路径，也不能绕过
+identity、seal、完整 MessagePack 消费、size、count 或 mapped-byte 准入。Rust
+`BlobRef::from_file` 使用位置读取，不改变调用方文件游标，并拒绝读取期间的截断或
+增长。
+
+非 Linux、没有 `/proc`、权限不符或跨机器时绝不悄悄退回普通 bytes。原有 bytes
+编码与传输完全不变。
 
 ## 异常
 
@@ -715,10 +870,22 @@ tinyray --listen 127.0.0.1:8760 --ttl-ms 20000
 自己发布状态不受影响，一直是即时的（实测 0.6 毫秒）—— 有东西要发时，在途的挂起
 请求会被取消掉重发。
 
-不要求挂起的调用方（包括任何早于这个字段的客户端）照旧立刻得到答复。
+不要求挂起的调用方照旧立刻得到答复。
 
-| 端点 | 用途 |
-|---|---|
-| `GET /health` | 存活探针 |
-| `GET /v1/pools` | 每个池子的 version / roster / 人数 |
-| `POST /v1/beat` | 心跳（客户端用） |
+生产心跳连接持久复用，但严格串行：一条连接同一时刻只有一个 `beat` 在途，收到
+完整且 request ID 匹配的 `beat_ack` 之后才能发下一项。发布取消长轮询、timeout、
+EOF、坏帧、错 request ID、注册中心重启或拒绝都会丢弃连接，下一拍再懒连接，所以
+迟到的回复不可能被下一拍读走。静默 35 秒的连接由服务端关闭。`health` /
+`debug_pools` 探针仍是一问一答。
+
+请求上限 512 KiB，回复上限 64 MiB，长度在分配 body 之前检查。所有回复都回显
+`request_id`。health 还报告累计 accept、当前连接和已收 frame，供压测与排障。
+
+| operation | reply | 用途 |
+|---|---|---|
+| `health` | `health_ack` | 存活、版本和 protocol 探针 |
+| `debug_pools` | `debug_pools_ack` | 每个池子的 version / roster / 人数 |
+| `beat` | `beat_ack` | 心跳、长轮询和 `leaving=true` 告别 |
+
+未知操作和坏帧返回 `operation="error"` 的结构化错误；座位或池形状拒绝仍是正常
+`beat_ack`，只是 `accepted=false`。

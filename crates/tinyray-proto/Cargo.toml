@@ -5,4 +5,8 @@ edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
+rmp-serde.workspace = true
+socket2.workspace = true
+tokio.workspace = true

@@ -1,17 +1,14 @@
-"""Calling: an attribute on a handle is a method on the far side.
-
-A convention over plain HTTP, not a new protocol, so curl still works.
-"""
+"""Calling: an attribute on a handle is a native framed MessagePack RPC."""
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import contextvars
 import hashlib
-import inspect
 import itertools
-import json
+import math
 import sys
 import threading
 import warnings
@@ -20,9 +17,9 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-import httpx
 import msgspec
 
+from . import _tinyray as _native
 from ._errors import (
     BatchError,
     Fenced,
@@ -32,36 +29,16 @@ from ._errors import (
     RemoteError,
     Unreachable,
 )
-from ._json import convert, dumps, loads
-
-# Past this a call is warned about, not refused. The control plane carries
-# facts about where things are, not the things -- but a call is point to point,
-# so going over is slow for the two ends and nothing else, and refusing at a
-# threshold would turn a payload that grew from 900 KB to 1.1 MB into an
-# outage. There is deliberately no ceiling above it.
-# Nothing got onto the wire, or nothing reached the far side: the method did
-# not run, whatever else happened. Everything else that httpx raises leaves the
-# question open -- a read that timed out or a connection that broke mid-exchange
-# may well have been acted on -- and "may have run" is the case that needs a
-# request id, so the two must not share a class.
-_NEVER_LEFT = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.PoolTimeout,
-    httpx.ProxyError,
-    httpx.UnsupportedProtocol,
-    httpx.LocalProtocolError,
-)
+from ._msgpack import convert, convert_msgpack, dumps_with_blob_refs, loads, validate_type
 
 SOFT_BODY = 1 << 20
-DEFAULT_TIMEOUT = 30.0  # the measured control-plane band is 2-30s
+DEFAULT_TIMEOUT = 30.0
 MAX_BATCH = 128
 _MAX_REQUEST_ID = 200
 
-# Set at join() time. Travels on every call so the far side can bind a lease to
-# the tenure that asked for it, instead of trusting an argument the caller had
-# to remember to fill in correctly.
 _identity = ""
+_T = TypeVar("_T")
+_RAW_RETURN = object()
 
 
 def set_identity(who: str) -> None:
@@ -69,37 +46,6 @@ def set_identity(who: str) -> None:
     _identity = who
 
 
-_LIMITS = httpx.Limits(max_keepalive_connections=64, keepalive_expiry=60.0)
-_sync: httpx.Client | None = None
-# A client belongs to one loop, so it is cached per loop -- but held weakly and
-# under a liveness check, because an id() is an address. Nothing retired an
-# entry, so a program calling asyncio.run() per step (a synchronous training
-# loop driving an async fleet, which is the shape this exists for) accumulated
-# one client and one socket per call: measured at 100 calls, 100 entries, 100
-# file descriptors, against a default limit of 1024. And the address a freed
-# loop leaves behind is handed to the next one, so a later run could be given a
-# pool belonging to a loop that is already closed -- 2 of 5 consecutive
-# asyncio.run() calls landed on an id that had already been used.
-_loops: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], httpx.AsyncClient]] = {}
-
-_T = TypeVar("_T")
-_RAW_RETURN = object()
-
-
-def _sync_client() -> httpx.Client:
-    # Reused: a fresh socket per call drains the ephemeral port range in
-    # seconds and the server sits at 0% CPU while everything fails.
-    global _sync
-    if _sync is None:
-        _sync = httpx.Client(limits=_LIMITS)
-    return _sync
-
-
-# Eviction runs from whichever thread asks next, so two loops in two threads
-# reach it together. The lock is not decoration: without it, eight threads each
-# running asyncio.run() had four die on the first round with EBADF, because two
-# of them evicted the same entry and closed its descriptors twice -- and a
-# number freed by the first close goes straight to whoever asks next.
 _per_loop_lock = threading.Lock()
 
 
@@ -109,15 +55,7 @@ def per_loop(
     drop: Callable[[_T], None] = lambda _: None,
     reuse: Callable[[_T], bool] = lambda _: True,
 ) -> _T:
-    """The one `_T` belonging to the running loop, made on first ask.
-
-    Anything held per loop -- a transport pool, a wakeup pipe -- has the same
-    two problems. It must be dropped once its loop closes, or the process
-    accumulates descriptors against a limit of 1024. And it cannot be found by
-    id() alone, because a freed loop's address is handed to the next one: 2 of
-    5 consecutive asyncio.run() calls landed on an id already used. So the
-    weak reference is checked as well as the number.
-    """
+    """Return the cached value belonging to the current live event loop."""
     loop = asyncio.get_running_loop()
     with _per_loop_lock:
         for key, (ref, held) in list(cache.items()):
@@ -138,53 +76,21 @@ def per_loop(
 
 
 def reset_after_fork() -> None:
-    """Give the child a lock nobody holds.
-
-    A fork can land while another thread is inside per_loop, and the child
-    inherits the lock held with no thread left to release it -- the child then
-    hangs on its first watch, in native code with no Python frame to say why.
-    """
-    global _per_loop_lock, _sync
+    """Drop inherited loop locks, runtimes, pools, listeners, and sockets."""
+    global _per_loop_lock
     _per_loop_lock = threading.Lock()
-    # The shared one goes the same way, and it is the one that bites: two
-    # processes taking turns on one keep-alive connection had a call come back
-    # with the *other* process's answer -- no exception, no warning, just the
-    # wrong value. Measured at 300 calls each from parent and child.
-    _sync = None
-    # The transports belong to the parent's loops and speak over the parent's
-    # sockets. Dropped rather than closed: the parent still owns those
-    # descriptors. Left in place, both processes write down the same
-    # connection -- measured over 300 calls each from parent and child, every
-    # run had a request arrive garbled as HTTP 400 (an OutcomeUnknown, so the
-    # call may well have run) or the loop refuse the socket with
-    # FileExistsError, against no failure at all once these are dropped.
-    _loops.clear()
+    _native.rpc_reset_after_fork()
 
 
-def _async_client() -> httpx.AsyncClient:
-    # Dropping the reference is what closes the sockets: the pool cannot be
-    # awaited shut once its loop is closed, so this is the only lever left.
-    return per_loop(_loops, lambda _: httpx.AsyncClient(limits=_LIMITS))
+def _shutdown() -> None:
+    with contextlib.suppress(Exception):
+        _native.rpc_shutdown()
+
+
+atexit.register(_shutdown)
 
 
 def _app_stacklevel() -> int:
-    """How far up the first application frame is.
-
-    A fixed number cannot be right for both directions. Synchronously the
-    frames are `_nudge`, `invoke`, `BoundMethod.__call__`, then the
-    application -- four. On an event loop `__call__` has already returned by
-    the time the coroutine runs, so the same four lands in asyncio's
-    internals: measured pointing at `asyncio/events.py:84` instead of the line
-    that made the call, which also collapses every async nudge into one
-    suppressed duplicate.
-
-    asyncio.run(abatch(...)) has no application coroutine frame: the first one
-    outside tinyray is the loop's task runner. Skip that machinery too, so the
-    warning points at the application driving the loop, not asyncio internals.
-
-    Counting is cheap here because nothing reaches this unless something was
-    already over a megabyte.
-    """
     level = 1
     frame: Any = sys._getframe(1)
     while frame is not None and frame.f_globals.get("__name__", "").startswith(
@@ -196,11 +102,8 @@ def _app_stacklevel() -> int:
 
 
 def _nudge(what: str, size: int, where: str | None) -> None:
-    """Oversize is worth saying and never worth refusing."""
     if size <= SOFT_BODY:
         return
-    # The default filter collapses repeats, so a hot loop nudges once rather
-    # than screaming -- which only works if the location is the caller's.
     warnings.warn(
         f"{what} {size} bytes, past the {SOFT_BODY} the control plane is meant "
         f"for. It goes through -- a nudge, not a limit -- but consider passing a "
@@ -210,26 +113,33 @@ def _nudge(what: str, size: int, where: str | None) -> None:
     )
 
 
-def _prepare(
-    handle: Any, name: str, payload: Any, *, batching: bool = False
-) -> tuple[str, bytes, dict[str, str]]:
-    if handle.url is None:
+def _endpoint(handle: Any) -> str:
+    endpoint = handle.url
+    if endpoint is None:
         raise NotDelivered(f"{handle} advertises no address; it joined without serves=")
-    body = dumps(payload)
-    headers = {
-        "content-type": "application/json",
-        # Plain str: a header value has to be ASCII, which is why the names
-        # that end up here are refused at the point they are chosen.
-        "x-tinyray-target": handle.identity,
-        "x-tinyray-caller": _identity,
-        # Names this attempt, so the two sides can talk about the same call.
-        # Deliberately just the name: deduplicating on it would mean the
-        # callee deciding what is safe to replay, and only the caller knows
-        # that. OutcomeUnknown is where that decision belongs.
-        "x-tinyray-request": _request_id(),
-    }
-    path = "/_batch" if batching else f"/call/{name}"
-    return f"{handle.url}{path}", body, headers
+    if "://" in endpoint:
+        raise NotDelivered(
+            f"{handle.identity} advertises legacy URL {endpoint!r}; method RPC is a hard "
+            "cutover to native framed MessagePack and requires host:port"
+        )
+    if not endpoint or endpoint.strip() != endpoint or ":" not in endpoint:
+        raise NotDelivered(
+            f"{handle.identity} advertises invalid native method endpoint {endpoint!r}; "
+            "expected host:port"
+        )
+    return endpoint
+
+
+def _prepare(
+    handle: Any,
+    name: str,
+    payload: Any,
+    *,
+    batching: bool = False,
+) -> tuple[str, bytes, str, tuple[Any, ...]]:
+    endpoint = _endpoint(handle)
+    body, keepalive = dumps_with_blob_refs(payload)
+    return endpoint, body, _request_id(), keepalive
 
 
 _seq = itertools.count(1)
@@ -240,49 +150,35 @@ _pinned: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 def _request_id() -> str:
     fixed = _pinned.get()
-    return fixed if fixed is not None else f"{_identity or 'anon'}-{next(_seq)}"
+    return fixed if fixed is not None else _generated_request_id(_identity or "anon", next(_seq))
+
+
+def _generated_request_id(identity: str, sequence: int) -> str:
+    suffix = f"-{sequence}"
+    direct = identity + suffix
+    if len(direct) <= _MAX_REQUEST_ID:
+        return direct
+    identity_digest = hashlib.sha256(identity.encode("ascii")).hexdigest()
+    fixed = f"~{identity_digest}{suffix}"
+    if len(fixed) <= _MAX_REQUEST_ID:
+        return identity[: _MAX_REQUEST_ID - len(fixed)] + fixed
+    return hashlib.sha256(f"{identity}\0{sequence}".encode("ascii")).hexdigest()
 
 
 @contextlib.contextmanager
 def request_id(value: str) -> Iterator[str]:
-    """Name every call made inside this block, so retries share one name.
-
-    The generated id changes per attempt, which is right for tracing and wrong
-    for idempotency: a callee that wants to recognise a repeat needs the same
-    name each time, and without this the key had to travel as an ordinary
-    argument -- where it is one more thing to thread through, and one more
-    thing to forget on the retry path.
-
-        with tinyray.request_id(f"commit-{batch}"):
-            for attempt in range(3):
-                try:
-                    return h.commit(rows)
-                except tinyray.NotDelivered:
-                    continue
-
-    A block rather than a per-call argument, because that is the shape retries
-    already have, and because a keyword would collide with the callee's own
-    parameter names. Deduplication is still nobody's job here: tinyray only
-    carries the name, since only the caller knows what is safe to replay.
-
-    A ContextVar, so it follows an await into the tasks that block starts and
-    does not leak into a neighbouring one.
-    """
-    # Checked here, where the mistake is. A name that cannot be a header value
-    # fails inside httpx otherwise, and the caller is told the peer could not
-    # be reached -- which sends them to look at the network.
+    """Pin the protocol request id for retries and application reconciliation."""
     if not value:
         raise ValueError("a request id has to be something; empty names nothing")
     if not value.isascii() or any(c < " " or c == "\x7f" for c in value):
         raise ValueError(
             f"a request id has to be printable ASCII; got {value!r}. It travels "
-            f"as a header, where anything else cannot be encoded and a newline "
-            f"would end the header."
+            "in every native RPC envelope."
         )
     if len(value.encode()) > _MAX_REQUEST_ID:
         raise ValueError(
             f"a request id of {len(value.encode())} bytes is too long; keep it "
-            f"under 200. It is sent on every attempt, and servers cap headers."
+            "under 200. It is sent on every attempt."
         )
     token = _pinned.set(value)
     try:
@@ -300,149 +196,235 @@ def _batch_request_id(root: str, index: int) -> str:
     return f"{prefix}~{digest}{suffix}"
 
 
-def _transport_error(handle: Any, name: str, exc: Exception) -> Unreachable:
-    at = f"{handle.identity} at {handle.url}: {exc}"
-    if isinstance(exc, _NEVER_LEFT):
+def _timeout_ms(timeout: float) -> int:
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"RPC timeout has to be a finite non-negative number, got {timeout!r}"
+        ) from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"RPC timeout has to be a finite non-negative number, got {timeout!r}")
+    return min(math.ceil(seconds * 1000), (1 << 64) - 1)
+
+
+def _transport_error(handle: Any, name: str, outcome: Any) -> Unreachable:
+    at = f"{handle.identity} at {handle.url}: {outcome.message}"
+    if outcome.kind == _native.RPC_OUTCOME_NOT_DELIVERED:
         return NotDelivered(f"{name}() never reached {at}")
     return OutcomeUnknown(f"{name}() may or may not have run on {at}")
 
 
-def _check_status(status: int, raw: bytes, target: str) -> None:
-    if status == 409:
+def _raise_reply(outcome: Any, target: str) -> None:
+    status = outcome.status
+    message = outcome.message
+    if status == _native.RPC_STATUS_METHOD_NOT_FOUND:
+        raise AttributeError(message or "no such method")
+    if status == _native.RPC_STATUS_FENCED:
         raise Fenced(f"{target} is held by a later tenure now; look it up again")
-    if status == 503:
-        # Refused before dispatch, so nothing ran: retry here or elsewhere.
+    if status == _native.RPC_STATUS_CALLER_FAULT:
+        raise TypeError(message or "argument does not match the signature")
+    if status == _native.RPC_STATUS_CONCURRENCY_REFUSED:
         raise NotDelivered(f"{target} is at its concurrency limit")
-    if status in (400, 408, 411):
-        # Every way the far side gives up before the method runs. 400 is a
-        # length it cannot read or a body it cannot parse, 408 a body that
-        # stopped arriving part way, 411 framing it will not take at all.
-        # Measured against a real callee: a body cut short was answered 408
-        # after the body timeout and a content-length of "abc" answered 400 at
-        # once, and in both the method was called zero times.
-        #
-        # 400 and 408 used to fall through to OutcomeUnknown, which tells the
-        # caller the opposite of the truth -- that it may have run, so a
-        # non-idempotent call cannot simply be sent again. A stalled upload is
-        # an ordinary thing for a large payload on a busy link.
-        raise NotDelivered(f"{target} would not take the request: HTTP {status} {raw[:120]!r}")
-    if status >= 500:
-        # The handler was already running when it came apart.
-        raise OutcomeUnknown(f"{target} answered HTTP {status} partway through")
+    if status == _native.RPC_STATUS_REMOTE_ERROR:
+        raise RemoteError(outcome.error_type or "Exception", message, outcome.traceback)
+    if status == _native.RPC_STATUS_MALFORMED_PROTOCOL:
+        raise NotDelivered(f"{target} refused the malformed native RPC request: {message}")
+    if status == _native.RPC_STATUS_INTERNAL:
+        raise OutcomeUnknown(f"{target} failed inside the native RPC listener: {message}")
+    raise OutcomeUnknown(f"{target} returned unknown native RPC status {status!r}")
 
 
-def _decode_result(status: int, body: Any, target: str) -> Any:
-    if status == 409:
-        raise Fenced(f"{target} is held by a later tenure now; look it up again")
-    if status == 404:
-        raise AttributeError(body.get("error", "no such method"))
-    if status == 422:
-        raise TypeError(body.get("error", "argument does not match the signature"))
-    if status == 413:
-        raise ValueError(body.get("error", "payload too large"))
-    if status != 200:
-        raise OutcomeUnknown(f"{target} returned HTTP {status}")
-    err = body.get("error")
-    if err:
-        raise RemoteError(err["type"], err["message"], err.get("traceback", ""))
-    return body.get("result")
+def _reply_payload(outcome: Any, target: str, raw: bytes | None = None) -> bytes:
+    if outcome.kind != _native.RPC_OUTCOME_REPLY:
+        raise AssertionError("transport outcomes are handled before reply decoding")
+    if outcome.status != _native.RPC_STATUS_SUCCESS:
+        _raise_reply(outcome, target)
+    return bytes(outcome.payload) if raw is None else raw
 
 
-def _decode(status: int, raw: bytes, target: str) -> Any:
-    _check_status(status, raw, target)
+def _decode(outcome: Any, target: str, raw: bytes | None = None) -> Any:
+    raw = _reply_payload(outcome, target, raw)
     try:
-        body = loads(raw or b"{}")
-    except json.JSONDecodeError as e:
-        raise OutcomeUnknown(f"{target} answered with a body that will not parse: {e}") from e
-    return _decode_result(status, body, target)
+        return loads(raw)
+    except (msgspec.DecodeError, UnicodeError, ValueError, RecursionError) as exc:
+        raise OutcomeUnknown(f"{target} answered with malformed MessagePack: {exc}") from exc
 
 
-def _decode_batch(status: int, raw: bytes, target: str, expected: int) -> list[Any]:
-    if status in (404, 405, 501):
-        raise NotDelivered(
-            f"{target} does not support RPC batching (HTTP {status}); no calls were replayed"
-        )
-    _check_status(status, raw, target)
-    if status != 200:
-        return _decode(status, raw, target)
+def _decode_typed(outcome: Any, target: str, name: str, want: Any, raw: bytes | None = None) -> Any:
+    raw = _reply_payload(outcome, target, raw)
+    call = f"{target}.{name}()"
     try:
-        body = loads(raw)
-    except (ValueError, RecursionError) as exc:
-        raise OutcomeUnknown(f"{target} answered with an invalid batch response") from exc
-    invalid = f"{target} answered with an invalid batch response; item outcomes are unknown"
-    if not isinstance(body, dict) or set(body) != {"items"}:
-        raise OutcomeUnknown(invalid)
-    items = body["items"]
-    if not isinstance(items, list) or not 0 < len(items) <= expected:
-        raise OutcomeUnknown(invalid)
-    results: list[Any] = []
-    for index, item in enumerate(items):
-        if not isinstance(item, dict) or set(item) != {"status", "body"}:
-            raise OutcomeUnknown(invalid)
-        code, reply = item["status"], item["body"]
-        if type(code) is not int or code not in (200, 404, 409, 422):
-            raise OutcomeUnknown(invalid)
-        if not isinstance(reply, dict):
-            raise OutcomeUnknown(invalid)
-        if code == 200 and set(reply) == {"result"}:
-            results.append(reply["result"])
-            continue
-        error = reply.get("error")
-        if code == 200:
-            if (
-                set(reply) != {"error"}
-                or not isinstance(error, dict)
-                or not isinstance(error.get("type"), str)
-                or not isinstance(error.get("message"), str)
-                or not isinstance(error.get("traceback", ""), str)
-            ):
-                raise OutcomeUnknown(invalid)
-        elif not isinstance(error, str):
-            raise OutcomeUnknown(invalid)
-        # A failure terminates the response; accepting trailing items would
-        # falsely promise they did not run.
-        if index != len(items) - 1:
-            raise OutcomeUnknown(invalid)
+        return convert_msgpack(raw, want)
+    except msgspec.ValidationError as exc:
+        label = getattr(want, "__qualname__", repr(want))
+        raise TypeError(f"{call} returned MessagePack that does not match {label}: {exc}") from exc
+    except TypeError as exc:
+        label = getattr(want, "__qualname__", repr(want))
+        raise TypeError(f"{call} returned MessagePack that does not match {label}: {exc}") from exc
+    except (msgspec.DecodeError, UnicodeError, ValueError, RecursionError) as exc:
+        raise OutcomeUnknown(f"{call} answered with malformed MessagePack: {exc}") from exc
+
+
+def _decode_batch(outcome: Any, target: str, expected: int, raw: bytes | None = None) -> list[Any]:
+    if outcome.kind != _native.RPC_OUTCOME_REPLY:
+        raise AssertionError("transport outcomes are handled before batch decoding")
+    if outcome.status == _native.RPC_STATUS_SUCCESS:
         try:
-            _decode_result(code, reply, target)
-        except (AttributeError, TypeError, Fenced, RemoteError) as exc:
-            raise BatchError(index, results, exc) from exc
+            results = loads(bytes(outcome.payload) if raw is None else raw)
+        except (msgspec.DecodeError, UnicodeError, ValueError, RecursionError) as exc:
+            raise OutcomeUnknown(
+                f"{target} answered with an invalid batch response; item outcomes are unknown"
+            ) from exc
+        if not isinstance(results, list) or len(results) != expected:
+            raise OutcomeUnknown(
+                f"{target} answered with an invalid batch response; item outcomes are unknown"
+            )
+        return results
+
+    index = outcome.batch_index
+    completed = outcome.completed
+    if index is None and completed is None:
+        _raise_reply(outcome, target)
+    invalid = f"{target} answered with an invalid batch response; item outcomes are unknown"
+    if (
+        type(index) is not int
+        or type(completed) is not int
+        or index != completed
+        or not 0 <= index < expected
+    ):
         raise OutcomeUnknown(invalid)
-    if len(results) != expected:
+    try:
+        results = loads(bytes(outcome.payload) if raw is None else raw)
+    except (msgspec.DecodeError, UnicodeError, ValueError, RecursionError) as exc:
+        raise OutcomeUnknown(invalid) from exc
+    if not isinstance(results, list) or len(results) != completed:
         raise OutcomeUnknown(invalid)
-    return results
+    try:
+        _raise_reply(outcome, target)
+    except (AttributeError, TypeError, Fenced, RemoteError) as exc:
+        raise BatchError(index, results, exc) from exc
+    raise OutcomeUnknown(invalid)
+
+
+def _native_sync(
+    handle: Any,
+    name: str,
+    body: bytes,
+    request: str,
+    timeout: float,
+    batch_size: int | None,
+    blob_owners: tuple[Any, ...] = (),
+) -> Any:
+    endpoint = _endpoint(handle)
+    outcome = _native.rpc_call_sync(
+        endpoint,
+        request,
+        _identity,
+        handle.identity,
+        body,
+        _timeout_ms(timeout),
+        method=None if batch_size is not None else name,
+        batch_len=batch_size,
+        blob_owners=blob_owners,
+    )
+    if outcome.kind != _native.RPC_OUTCOME_REPLY:
+        raise _transport_error(handle, name, outcome)
+    return outcome
 
 
 def invoke(
-    handle: Any, name: str, payload: Any, timeout: float, *, _batch_size: int | None = None
+    handle: Any,
+    name: str,
+    payload: Any,
+    timeout: float,
+    *,
+    _batch_size: int | None = None,
+    _return_type: Any = _RAW_RETURN,
 ) -> Any:
-    url, body, headers = _prepare(handle, name, payload, batching=_batch_size is not None)
-    _nudge(f"{name}() is sending", len(body), handle.url)
-    try:
-        r = _sync_client().post(url, content=body, headers=headers, timeout=timeout)
-    except httpx.HTTPError as e:
-        raise _transport_error(handle, name, e) from e
-    # Nudged here rather than on the far side: a served process routinely has
-    # its output sent to /dev/null, so a warning there is one nobody reads.
-    _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
+    endpoint, body, request, _keepalive = _prepare(
+        handle, name, payload, batching=_batch_size is not None
+    )
+    del payload
+    _nudge(f"{name}() is sending", len(body), endpoint)
+    outcome = _native_sync(handle, name, body, request, timeout, _batch_size, _keepalive)
+    raw = bytes(outcome.payload)
+    _nudge(f"{handle.identity}.{name}() returned", len(raw), endpoint)
     if _batch_size is not None:
-        return _decode_batch(r.status_code, r.content, handle.identity, _batch_size)
-    return _decode(r.status_code, r.content, handle.identity)
+        return _decode_batch(outcome, handle.identity, _batch_size, raw)
+    if _return_type is not _RAW_RETURN:
+        return _decode_typed(outcome, handle.identity, name, _return_type, raw)
+    return _decode(outcome, handle.identity, raw)
+
+
+async def _await_native(
+    handle: Any,
+    name: str,
+    body: bytes,
+    request: str,
+    timeout: float,
+    batch_size: int | None,
+    blob_owners: tuple[Any, ...] = (),
+) -> Any:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def complete(completion: Any) -> None:
+        if future.done():
+            completion.resolve(False)
+            return
+        try:
+            outcome = completion.resolve(True)
+        except Exception as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(outcome)
+
+    ticket = _native.rpc_call_async(
+        loop,
+        complete,
+        _endpoint(handle),
+        request,
+        _identity,
+        handle.identity,
+        body,
+        _timeout_ms(timeout),
+        method=None if batch_size is not None else name,
+        batch_len=batch_size,
+        blob_owners=blob_owners,
+    )
+    try:
+        outcome = await future
+    except asyncio.CancelledError:
+        ticket.cancel()
+        raise
+    if outcome.kind != _native.RPC_OUTCOME_REPLY:
+        raise _transport_error(handle, name, outcome)
+    return outcome
 
 
 async def ainvoke(
-    handle: Any, name: str, payload: Any, timeout: float, *, _batch_size: int | None = None
+    handle: Any,
+    name: str,
+    payload: Any,
+    timeout: float,
+    *,
+    _batch_size: int | None = None,
+    _return_type: Any = _RAW_RETURN,
 ) -> Any:
-    url, body, headers = _prepare(handle, name, payload, batching=_batch_size is not None)
-    _nudge(f"{name}() is sending", len(body), handle.url)
-    try:
-        r = await _async_client().post(url, content=body, headers=headers, timeout=timeout)
-    except httpx.HTTPError as e:
-        raise _transport_error(handle, name, e) from e
-    _nudge(f"{handle.identity}.{name}() returned", len(r.content), handle.url)
+    endpoint, body, request, _keepalive = _prepare(
+        handle, name, payload, batching=_batch_size is not None
+    )
+    del payload
+    _nudge(f"{name}() is sending", len(body), endpoint)
+    outcome = await _await_native(handle, name, body, request, timeout, _batch_size, _keepalive)
+    raw = bytes(outcome.payload)
+    _nudge(f"{handle.identity}.{name}() returned", len(raw), endpoint)
     if _batch_size is not None:
-        return _decode_batch(r.status_code, r.content, handle.identity, _batch_size)
-    return _decode(r.status_code, r.content, handle.identity)
+        return _decode_batch(outcome, handle.identity, _batch_size, raw)
+    if _return_type is not _RAW_RETURN:
+        return _decode_typed(outcome, handle.identity, name, _return_type, raw)
+    return _decode(outcome, handle.identity, raw)
 
 
 @dataclass(frozen=True)
@@ -484,16 +466,7 @@ def _batch_payload(calls: Iterable[Call]) -> list[dict[str, Any]]:
 
 
 def batch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TIMEOUT) -> list[Any]:
-    """Run up to 128 calls in order, stopping at the first failure. Not atomic.
-
-    BatchError identifies a failed item and carries earlier results. Transport
-    failures apply to the entire batch and are never retried. Each item gets
-    CallContext.request_id ``<batch request id>:<zero-based index>``; pin the
-    batch id with request_id() when reconciling application side effects.
-    Long roots are truncated and SHA-256 suffixed to keep item ids within the
-    same 200-character limit, so they can themselves be pinned or forwarded.
-    An empty batch is a local no-op. Older peers are refused without replay.
-    """
+    """Run up to 128 calls in order, stopping at the first failure. Not atomic."""
     items = _batch_payload(calls)
     if not items:
         return []
@@ -501,12 +474,7 @@ def batch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TIMEOUT) 
 
 
 async def abatch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TIMEOUT) -> list[Any]:
-    """Await batch(); cancellation stops waiting, not remote execution.
-
-    As with ordinary async calls, CancelledError propagates. Reconcile using
-    item request ids before resubmitting; cancellation may leave any prefix
-    (or the whole batch) executed.
-    """
+    """Await a native batch; cancellation stops waiting, not remote execution."""
     items = _batch_payload(calls)
     if not items:
         return []
@@ -516,21 +484,15 @@ async def abatch(handle: Any, calls: Iterable[Call], timeout: float = DEFAULT_TI
 def _restore_return(value: Any, want: Any, target: str) -> Any:
     try:
         return convert(value, want)
-    except (msgspec.ValidationError, TypeError) as e:
+    except (msgspec.ValidationError, TypeError) as exc:
         label = getattr(want, "__qualname__", repr(want))
-        raise TypeError(f"{target} returned JSON that does not match {label}: {e}") from e
-
-
-async def _restore_awaited(result: Any, want: Any, target: str) -> Any:
-    return _restore_return(await result, want, target)
+        raise TypeError(
+            f"{target} returned MessagePack that does not match {label}: {exc}"
+        ) from exc
 
 
 class BoundMethod:
-    """Callable, and carries its own modifiers.
-
-    Timeout is a modifier rather than a keyword argument so it cannot collide
-    with a parameter of the same name on the far side.
-    """
+    """Callable, and carries its own timeout and return-type modifiers."""
 
     __slots__ = ("_handle", "_name", "_timeout", "_send", "_return_type")
 
@@ -549,36 +511,27 @@ class BoundMethod:
         return BoundMethod(self._handle, self._name, seconds, self._send, self._return_type)
 
     def returns(self, return_type: Any) -> BoundMethod:
-        """Restore a JSON result as `return_type` for this call.
-
-        Supports the types `msgspec.convert` understands, including nested
-        NamedTuples, dataclasses, TypedDicts, unions and typed containers.
-        """
+        """Restore the MessagePack result as ``return_type`` for this call."""
+        validate_type(return_type)
         return BoundMethod(self._handle, self._name, self._timeout, self._send, return_type)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        # Explicit args/kwargs: a bare object cannot tell f({"a": 1}) from f(a=1).
         payload = {"args": list(args), "kwargs": kwargs}
-        result = self._send(self._handle, self._name, payload, self._timeout)
         if self._return_type is _RAW_RETURN:
-            return result
-        target = f"{self._handle.identity}.{self._name}()"
-        if inspect.isawaitable(result):
-            return _restore_awaited(result, self._return_type, target)
-        return _restore_return(result, self._return_type, target)
+            return self._send(self._handle, self._name, payload, self._timeout)
+        return self._send(
+            self._handle,
+            self._name,
+            payload,
+            self._timeout,
+            _return_type=self._return_type,
+        )
 
     def __repr__(self) -> str:
         return f"<BoundMethod {self._handle!r}.{self._name}>"
 
 
 class AsyncHandleMixin:
-    """Same handle, awaitable methods.
-
-    The whole difference is which of the two senders a bound method carries,
-    so that is the whole class. The lookup itself -- what counts as a served
-    name, and what the AttributeError says when it is not -- lives once on
-    `Handle`; it used to live here as well, word for word, which is one place
-    for an improved message to be made and the other to be forgotten in.
-    """
+    """Same handle, with an async-native Tokio completion path."""
 
     _send = staticmethod(ainvoke)

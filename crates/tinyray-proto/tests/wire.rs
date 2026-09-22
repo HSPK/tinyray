@@ -5,8 +5,14 @@
 //! Both were previously only observable through a running registry, which
 //! meant a break showed up as "the roll call never froze" several layers away.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use tinyray_proto::{Beat, BeatAck, Member};
+
+fn wire_value(value: &impl Serialize) -> Value {
+    let raw = rmp_serde::to_vec_named(value).unwrap();
+    rmp_serde::from_slice(&raw).unwrap()
+}
 
 fn member(id: u64, incarnation: u64) -> Member {
     Member {
@@ -163,14 +169,11 @@ fn publication_sequence_distinguishes_zero_from_a_legacy_beat() {
     let raw = json!({"pool": "p", "id": 1, "incarnation": 1, "policy": "churn"});
     let mut beat: Beat = serde_json::from_value(raw.clone()).unwrap();
     assert_eq!(beat.publication, None);
-    assert!(serde_json::to_value(&beat)
-        .unwrap()
-        .get("publication")
-        .is_none());
+    assert!(wire_value(&beat).get("publication").is_none());
     beat.publication = Some(0);
-    let wire = serde_json::to_value(&beat).unwrap();
+    let wire = wire_value(&beat);
     assert_eq!(wire["publication"], json!(0));
-    let back: Beat = serde_json::from_value(wire).unwrap();
+    let back: Beat = rmp_serde::from_slice(&rmp_serde::to_vec_named(&beat).unwrap()).unwrap();
     assert_eq!(back.publication, Some(0));
     let mut null = raw;
     null["publication"] = Value::Null;
@@ -250,7 +253,7 @@ fn a_member_on_the_wire_carries_no_lease_and_no_empty_optionals() {
     // expires_at is registry-internal. If it ever crossed the wire every
     // heartbeat would count as a change, every pool version would move, and
     // every subscriber would get a full roster on every beat.
-    let wire = serde_json::to_value(member(7, 3)).unwrap();
+    let wire = wire_value(&member(7, 3));
     let keys: Vec<&str> = wire
         .as_object()
         .unwrap()
@@ -283,7 +286,7 @@ fn an_ack_omits_a_refusal_it_does_not_have() {
         refused: None,
         pools: Default::default(),
     };
-    let wire = serde_json::to_value(&ack).unwrap();
+    let wire = wire_value(&ack);
     assert!(wire.get("refused").is_none(), "got {wire}");
 }
 
@@ -293,8 +296,14 @@ fn an_ack_omits_a_refusal_it_does_not_have() {
 /// which is worse than the silent degradation it is meant to replace.
 #[test]
 fn an_ack_without_a_protocol_reads_as_protocol_zero() {
-    let raw = r#"{"epoch":7,"ttl_ms":2000,"accepted":true,"pools":{}}"#;
-    let ack: tinyray_proto::BeatAck = serde_json::from_str(raw).unwrap();
+    let raw = rmp_serde::to_vec_named(&json!({
+        "epoch": 7,
+        "ttl_ms": 2000,
+        "accepted": true,
+        "pools": {}
+    }))
+    .unwrap();
+    let ack: tinyray_proto::BeatAck = rmp_serde::from_slice(&raw).unwrap();
     assert_eq!(ack.protocol, 0);
     assert_eq!(ack.version, "");
     assert_eq!(ack.epoch, 7);
@@ -314,12 +323,10 @@ fn a_current_ack_carries_the_protocol_and_the_version() {
         refused: None,
         pools: Default::default(),
     };
-    let raw = serde_json::to_string(&ack).unwrap();
-    assert!(
-        raw.contains(&format!("\"protocol\":{}", tinyray_proto::PROTOCOL)),
-        "{raw}"
-    );
-    assert!(raw.contains("\"version\":\"9.9.9\""), "{raw}");
-    let back: tinyray_proto::BeatAck = serde_json::from_str(&raw).unwrap();
+    let raw = rmp_serde::to_vec_named(&ack).unwrap();
+    let wire: Value = rmp_serde::from_slice(&raw).unwrap();
+    assert_eq!(wire["protocol"], json!(tinyray_proto::PROTOCOL));
+    assert_eq!(wire["version"], json!("9.9.9"));
+    let back: tinyray_proto::BeatAck = rmp_serde::from_slice(&raw).unwrap();
     assert_eq!(back.protocol, tinyray_proto::PROTOCOL);
 }

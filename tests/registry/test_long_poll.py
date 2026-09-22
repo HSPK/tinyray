@@ -16,15 +16,15 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import subprocess
 import sys
 import textwrap
 import threading
 import time
-import urllib.request
 
 import tinyray
+
+from tests.support.registry_wire import beat, debug_pools
 
 PUBLISHER = textwrap.dedent(
     """
@@ -52,8 +52,7 @@ def _stop(p: subprocess.Popen) -> None:
 
 
 def _server_version(endpoint: str, pool: str) -> int:
-    with urllib.request.urlopen(f"http://{endpoint}/v1/pools", timeout=5) as r:
-        got = json.loads(r.read()).get(pool)
+    got = debug_pools(endpoint).get(pool)
     return 0 if got is None else got["version"]
 
 
@@ -181,14 +180,8 @@ def test_a_client_that_asks_for_no_hold_is_answered_at_once(registry):
         "seen": {},
         "state": {},
     }
-    req = urllib.request.Request(
-        f"http://{registry.endpoint}/v1/beat",
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-    )
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=10) as r:
-        assert r.status == 200
+    beat(registry.endpoint, body, timeout=10)
     took = (time.monotonic() - t0) * 1000
     assert took < 300, f"不要求挂起的请求被挂了 {took:.0f}ms"
 
@@ -205,9 +198,7 @@ def test_publishing_flat_out_does_not_starve_the_heartbeat(registry):
     """
 
     def registry_says() -> int:
-        url = f"http://{registry.endpoint}/v1/pools"
-        with urllib.request.urlopen(url, timeout=2) as r:
-            return json.loads(r.read()).get("p", {}).get("members", 0)
+        return debug_pools(registry.endpoint, timeout=2).get("p", {}).get("members", 0)
 
     with tinyray.join("p", slot=0, size=1) as m:
         m.ready()
@@ -337,6 +328,25 @@ def test_publishing_never_makes_the_loop_fall_back_to_a_timer(long_lease):
         assert got == 0, f"发布了二十次之后，循环有 {got} 次是等在定时器上而不是等在注册中心上"
 
 
+def test_idle_heartbeats_do_not_broadcast_cache_changes(registry):
+    with tinyray.join("semantic-bell", coalesce_ms=0) as me:
+        me.ready(step=0).flush()
+        pool = tinyray.pool(me.pool)
+        pool.snapshot()
+        revision = me._c.cache_revision()
+        wakeups = me.stats()["watch_wakeups"]
+        target = me.stats()["beats_ok"] + 4
+        deadline = time.monotonic() + 5
+        while me.stats()["beats_ok"] < target:
+            beat = me._c.debug_beat_revision()
+            left = deadline - time.monotonic()
+            assert left > 0
+            me._c.debug_wait_beat_revision(beat, int(left * 1000) + 1)
+        assert me._c.cache_revision() == revision
+        assert me.stats()["watch_wakeups"] == wakeups
+        assert pool.snapshot().members[0].state == {"step": 0}
+
+
 def _held_beat_as(registry, who: int, hold_ms: int, seen: dict, timeout: float):
     """同 `_held_beat`，但由调用方指定身份 —— 抖动是按 id 取模的。"""
     return _held_beat(registry, hold_ms, seen, timeout, who=who, watch="quiet")
@@ -345,31 +355,24 @@ def _held_beat_as(registry, who: int, hold_ms: int, seen: dict, timeout: float):
 def _held_beat(
     registry, hold_ms: int, seen: dict, timeout: float, who: int = 5150, watch: str = "cap"
 ) -> tuple[float, dict]:
-    body = json.dumps(
-        {
-            "pool": "cap",
-            "id": who,
-            "incarnation": 9,
-            "policy": "churn",
-            "ttl_ms": registry.ttl_ms,
-            "ready": True,
-            "state": {},
-            "methods": [],
-            "watch": [watch],
-            "seen": seen,
-            "hold_ms": hold_ms,
-            "leaving": False,
-            "exclusive": False,
-        }
-    ).encode()
-    req = urllib.request.Request(
-        f"http://{registry.endpoint}/v1/beat",
-        data=body,
-        headers={"content-type": "application/json"},
-    )
+    body = {
+        "pool": "cap",
+        "id": who,
+        "incarnation": 9,
+        "policy": "churn",
+        "ttl_ms": registry.ttl_ms,
+        "ready": True,
+        "state": {},
+        "methods": [],
+        "watch": [watch],
+        "seen": seen,
+        "hold_ms": hold_ms,
+        "leaving": False,
+        "exclusive": False,
+    }
     started = time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return time.monotonic() - started, json.load(r)
+    reply = beat(registry.endpoint, body, timeout=timeout)
+    return time.monotonic() - started, reply
 
 
 def test_a_beat_is_never_parked_longer_than_half_a_lease(registry):
@@ -472,7 +475,7 @@ def test_flush_waits_for_its_own_state_not_for_two_more_beats(long_lease):
 def test_a_beat_that_follows_close_on_the_last_one_is_not_held_by_nagle(registry):
     """连着发布两次，第二拍会撞上 Nagle 与对端 delayed ACK 的组合。
 
-    hyper 的 connector 默认不开 `TCP_NODELAY`。一次心跳是"写请求、读应答"，
+    Tokio 的 TCP socket 默认不开 `TCP_NODELAY`。一次心跳是"写请求、读应答"，
     紧接着又写一次时，Nagle 会扣住第二个小包等前一个被 ACK，而对端的 delayed
     ACK 要等 40ms 才发。于是每一拍多出一个和代码无关的固定 40ms。
 

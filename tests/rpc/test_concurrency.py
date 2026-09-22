@@ -239,10 +239,9 @@ def test_a_fleet_connecting_at_once_does_not_wait_out_a_syn_retransmit(served):
     这里量的是首次连接本身，不是 RPC —— 慢在握手上，跟服务端算得多快无关。
     """
     import socket as _socket
-    from urllib.parse import urlsplit
 
-    url = urlsplit(tinyray.pool("s").slot(0).url)
-    n = 64
+    host, port = tinyray.pool("s").slot(0).url.rsplit(":", 1)
+    n = 400
     gate = threading.Barrier(n + 1)
     took: list[float] = []
     errs: list[str] = []
@@ -251,7 +250,7 @@ def test_a_fleet_connecting_at_once_does_not_wait_out_a_syn_retransmit(served):
         gate.wait()
         t0 = time.monotonic()
         try:
-            s = _socket.create_connection((url.hostname, url.port), timeout=15)
+            s = _socket.create_connection((host, int(port)), timeout=15)
         except OSError as exc:
             errs.append(repr(exc))
             return
@@ -268,8 +267,9 @@ def test_a_fleet_connecting_at_once_does_not_wait_out_a_syn_retransmit(served):
     assert not errs, f"连接失败：{errs[:3]}"
     assert len(took) == n, f"只有 {len(took)}/{n} 个连接回来了"
     worst = max(took)
-    # 失败模式是一次 1s 的 SYN 重传，正常是十几毫秒。500ms 两边都离得很远。
-    assert worst < 500, (
+    # 失败模式是一次 1s 的 SYN 重传，正常是几十毫秒。800ms 两边都离得很远，
+    # 又给 400 个本地线程一起调度留下余量。
+    assert worst < 800, (
         f"最慢的一次连接花了 {worst:.0f}ms，像是在等 SYN 重传；"
         f"超过 100ms 的有 {sum(1 for x in took if x > 100)}/{n} 个"
     )

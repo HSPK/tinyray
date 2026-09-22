@@ -16,10 +16,11 @@ import subprocess
 import sys
 import textwrap
 import time
-import urllib.request
 
 import pytest
 import tinyray
+
+from tests.support.registry_wire import beat, debug_pools
 
 BUMP = textwrap.dedent(
     """
@@ -141,8 +142,7 @@ def test_a_restart_does_not_freeze_the_cache(registry):
                 break
             time.sleep(0.1)
         else:
-            with urllib.request.urlopen(f"http://{registry.endpoint}/v1/pools", timeout=5) as r:
-                server_side = json.loads(r.read()).get("w")
+            server_side = debug_pools(registry.endpoint).get("w")
             raise AssertionError(
                 f"never saw the newcomer; registry has {server_side}, client is "
                 f"stuck at version {watched._c.pool_info('w')}"
@@ -219,8 +219,7 @@ def _ask(observer: subprocess.Popen) -> dict:
 
 
 def _server_version(endpoint: str, pool: str) -> int | None:
-    with urllib.request.urlopen(f"http://{endpoint}/v1/pools", timeout=5) as r:
-        got = json.loads(r.read()).get(pool)
+    got = debug_pools(endpoint).get(pool)
     return None if got is None else got["version"]
 
 
@@ -403,7 +402,8 @@ def test_a_frozen_owner_waking_after_a_restart_does_not_take_the_seat_back(regis
 
 def _raw_beat(registry, seen: dict[str, int]) -> dict:
     """一个手写的心跳，绕开客户端。老客户端看到的就是这个。"""
-    body = json.dumps(
+    return beat(
+        registry.endpoint,
         {
             "pool": "probe",
             "id": 987654321,
@@ -418,15 +418,9 @@ def _raw_beat(registry, seen: dict[str, int]) -> dict:
             "hold_ms": 0,
             "leaving": False,
             "exclusive": False,
-        }
-    ).encode()
-    req = urllib.request.Request(
-        f"http://{registry.endpoint}/v1/beat",
-        data=body,
-        headers={"content-type": "application/json"},
+        },
+        timeout=10,
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
 
 
 def test_asking_from_a_version_the_registry_never_issued_gets_the_whole_roster(registry):

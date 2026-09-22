@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import textwrap
 import time
 
-import httpx
 import pytest
 import tinyray
+
+from tests.support.registry_wire import beat
 
 
 # 直接构造任期号：毫秒左移 20 位，低位是打平用的随机数
@@ -35,13 +35,7 @@ def _beat(registry, **kw):
         state={},
     )
     body.update(kw)
-    r = httpx.post(
-        f"http://{registry.endpoint}/v1/beat",
-        content=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-        timeout=30,
-    )
-    return r.json()["accepted"]
+    return beat(registry.endpoint, body, timeout=30)["accepted"]
 
 
 def test_a_clock_that_goes_backwards_cannot_take_a_seat_back(registry):

@@ -22,7 +22,8 @@ from contextlib import ExitStack as _ExitStack
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 from typing import Any
 
-from msgspec.json import decode as _json_decode
+from msgspec.msgpack import decode as _msgpack_decode
+from msgspec.msgpack import encode as _msgpack_encode
 
 from . import _rpc
 from ._errors import (
@@ -40,19 +41,33 @@ from ._errors import (
     TinyrayError,
     Unreachable,
 )
+from ._msgpack import BlobError, BlobRef, blob
+from ._msgpack import close_blobs_after_fork as _close_blobs_after_fork
 from ._rpc import AsyncHandleMixin as _AsyncHandleMixin
 from ._rpc import Call, abatch, batch, request_id
 from ._serve import CallContext
 from ._serve import MethodServer as _MethodServer
+from ._tinyray import BLOB_MAX_BYTES as MAX_BLOB_BYTES
+from ._tinyray import BLOB_MAX_MAPPED_BYTES_PER_MESSAGE as MAX_BLOB_MAPPED_BYTES_PER_MESSAGE
+from ._tinyray import BLOB_MAX_REFS_PER_MESSAGE as MAX_BLOB_REFS_PER_MESSAGE
+from ._tinyray import WAIT_CLOSED as _WAIT_CLOSED
+from ._tinyray import WAIT_FENCED as _WAIT_FENCED
+from ._tinyray import WAIT_MISMATCH as _WAIT_MISMATCH
+from ._tinyray import WAIT_NO_SIZE as _WAIT_NO_SIZE
+from ._tinyray import WAIT_PENDING as _WAIT_PENDING
+from ._tinyray import WAIT_READY as _WAIT_READY
+from ._tinyray import WAIT_STALE as _WAIT_STALE
+from ._tinyray import WAIT_TIMEOUT as _WAIT_TIMEOUT
 from ._tinyray import Client as _Client
+from ._tinyray import NativeMember as _NativeMember
+from ._tinyray import NativeSnapshot as _NativeSnapshot
+from ._tinyray import NativeWait as _NativeWait
 
 if _TYPE_CHECKING:
     # Only ever used in annotations, and `from __future__ import annotations`
     # keeps those as strings. Importing them for real would put `Callable` and
     # `Sequence` in `tinyray.*`, where they are not part of anything.
     from collections.abc import Callable, Sequence
-
-    from ._rpc import BoundMethod
 
 try:
     __version__ = _metadata.version("tinyray")
@@ -71,6 +86,9 @@ __all__ = [
     "Epoch",
     "CallContext",
     "Call",
+    "BlobRef",
+    "BlobError",
+    "blob",
     "batch",
     "abatch",
     "BatchError",
@@ -93,6 +111,9 @@ __all__ = [
     "RemoteError",
     "apool",
     "MAX_STATE",
+    "MAX_BLOB_BYTES",
+    "MAX_BLOB_MAPPED_BYTES_PER_MESSAGE",
+    "MAX_BLOB_REFS_PER_MESSAGE",
     "FIRST_BEAT_S",
 ]
 
@@ -121,17 +142,20 @@ def _endpoint(explicit: str | None = None) -> str:
     raw = raw.strip()
     if not raw:
         raise ValueError("the registry address is empty; give host:port")
-    # A list composes into a URL nobody can reach -- "http://a:1,b:2" -- and the
-    # process then reports that the registry never answered, which is true and
-    # useless. There is deliberately no failover here (see above), and the docs
-    # used to write the variable as `host:port,...`, so this was invited.
+    # There is deliberately no failover here (see above), and the docs used to
+    # write the variable as `host:port,...`, so accepting a list was invited.
     if "," in raw:
         raise ValueError(
             f"the registry address {raw!r} looks like a list, and there is only "
             f"ever one registry: the delta cursor is per-registry, so failing "
             f"over between them silently freezes the cache. Give one host:port."
         )
-    return raw if "://" in raw else f"http://{raw}"
+    if "://" in raw:
+        raise ValueError(
+            f"the registry address {raw!r} is a URL, but the registry uses its "
+            f"native length-prefixed MessagePack protocol. Give host:port."
+        )
+    return raw
 
 
 def _advertise() -> str:
@@ -143,19 +167,14 @@ def _advertise() -> str:
     explicit = os.environ.get("TINYRAY_ADVERTISE")
     if explicit:
         host = explicit.strip()
-        # Only a bare host composes into an address here -- the scheme and the
-        # port are added around it. Anything else is pasted in whole and makes
-        # a URL nobody can reach, while the process registers perfectly
-        # happily: measured, `http://10.0.0.5` became
-        # `http://http://10.0.0.5:33097`, and `10.0.0.5:8080` became
-        # `http://10.0.0.5:8080:33097`. Both only fail later, at whoever tried
-        # to call -- which is the same silent misrouting the loopback rule
-        # below exists to prevent, so it is refused the same way.
+        # Only a bare host composes with the native listener's chosen port.
+        # Schemes, paths, and caller-supplied ports would advertise an invalid
+        # endpoint while registration itself still appeared healthy.
         if not host or any(c in host for c in "/: "):
             raise ValueError(
                 f"TINYRAY_ADVERTISE is {explicit!r}, which is not a bare host. "
-                f"Set it to a hostname or IP and nothing else -- the scheme and "
-                f"this process's port are added for you. To advertise a "
+                f"Set it to a hostname or IP and nothing else -- this process's "
+                f"port is added for you. To advertise a "
                 f"different address entirely, pass join(url=...)."
             )
         return host
@@ -177,22 +196,32 @@ def _advertise() -> str:
 def _checked_pool_name(name: str) -> str:
     """A pool name, or a refusal saying why this one cannot be used.
 
-    The name travels on every call, in the header naming who is speaking and
-    the header naming who is meant to answer, and a header value has to be
-    printable ASCII. Nothing stops a non-ASCII name from registering, being
-    discovered or being watched -- only from being *called*, which failed with
-    a raw UnicodeEncodeError out of httpx, at the call site, a long way from
-    the name. Half a working system is worse than a clear no.
+    The name travels in every method envelope and is part of request IDs and
+    fencing tokens. Keep the established printable-ASCII contract so every
+    process constructs the same identity bytes.
     """
     if not name:
         raise ValueError("a pool needs a name")
     if not name.isascii() or any(c < " " or c == "\x7f" for c in name):
         raise ValueError(
-            f"pool name {name!r} has to be printable ASCII: it is sent as an "
-            f"HTTP header on every call, and anything else cannot be encoded "
-            f"there. Membership would work and calling would not."
+            f"pool name {name!r} has to be printable ASCII: it is sent in every "
+            f"native RPC envelope. Membership would work and calling would not."
         )
     return name
+
+
+def _checked_method_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if not endpoint:
+        raise ValueError("the method endpoint is empty; give host:port")
+    if "://" in endpoint:
+        raise ValueError(
+            f"the method endpoint {endpoint!r} is a URL, but method RPC uses "
+            "native framed MessagePack. Give host:port."
+        )
+    if "," in endpoint or ":" not in endpoint:
+        raise ValueError(f"the method endpoint {endpoint!r} is not one host:port")
+    return endpoint
 
 
 # Seats and world sizes are unsigned on the wire, and a launcher that got one
@@ -225,33 +254,145 @@ def _from_env(names: tuple[str, ...]) -> int | None:
     return None
 
 
+_STATE_UNMATERIALIZED = object()
+
+
+class _StateBatch:
+    __slots__ = ("_native", "_states")
+
+    def __init__(self, native: Any):
+        self._native = native
+        self._states: list[Any] | None = None
+
+    def get(self, index: int) -> Any:
+        states = self._states
+        if states is None:
+            states = _msgpack_decode(self._native.materialize())
+            self._states = states
+            self._native = None
+        return states[index]
+
+
 class Handle:
     """One member. Attribute access proxies to a method on the far side."""
 
-    __slots__ = ("pool", "id", "slot", "incarnation", "url", "state", "ready", "_methods")
+    __slots__ = (
+        "_native",
+        "_methods",
+        "_state",
+        "_overrides",
+        "state",
+    )
 
     #: How a call goes out. `AsyncHandle` swaps this and changes nothing else.
     _send = staticmethod(_rpc.invoke)
 
     def __init__(self, pool_name: str, raw: dict[str, Any], methods: tuple[str, ...] = ()):
+        self._native: _NativeMember | None = None
         self._methods = methods
-        self.pool = pool_name
-        self.id = raw["id"]
-        self.slot = raw.get("slot")
-        self.incarnation = raw["incarnation"]
-        self.url = raw.get("url")
-        self.state = raw.get("state") or {}
-        self.ready = raw["ready"]
+        self.state: Any = raw.get("state") or {}
+        self._state = self.state
+        self._overrides: dict[str, Any] | None = {
+            "pool": pool_name,
+            "id": raw["id"],
+            "slot": raw.get("slot"),
+            "incarnation": raw["incarnation"],
+            "url": raw.get("url"),
+            "ready": raw["ready"],
+        }
+
+    @classmethod
+    def _from_native(
+        cls,
+        member: _NativeMember,
+        methods: tuple[str, ...],
+    ) -> Handle:
+        handle = cls.__new__(cls)
+        handle._native = member
+        handle._methods = methods
+        return handle
+
+    def _read(self, name: str) -> Any:
+        overrides = getattr(self, "_overrides", None)
+        if overrides is not None and name in overrides:
+            return overrides[name]
+        assert self._native is not None
+        return getattr(self._native, name)
+
+    def _write(self, name: str, value: Any) -> None:
+        overrides = getattr(self, "_overrides", None)
+        if overrides is None:
+            overrides = {}
+            self._overrides = overrides
+        overrides[name] = value
+
+    @property
+    def pool(self) -> str:
+        return self._read("pool")
+
+    @pool.setter
+    def pool(self, value: str) -> None:
+        self._write("pool", value)
+
+    @property
+    def id(self) -> int:
+        return self._read("id")
+
+    @id.setter
+    def id(self, value: int) -> None:
+        self._write("id", value)
+
+    @property
+    def slot(self) -> int | None:
+        return self._read("slot")
+
+    @slot.setter
+    def slot(self, value: int | None) -> None:
+        self._write("slot", value)
+
+    @property
+    def incarnation(self) -> int:
+        return self._read("incarnation")
+
+    @incarnation.setter
+    def incarnation(self, value: int) -> None:
+        self._write("incarnation", value)
+
+    @property
+    def url(self) -> str | None:
+        return self._read("url")
+
+    @url.setter
+    def url(self, value: str | None) -> None:
+        self._write("url", value)
+
+    @property
+    def ready(self) -> bool:
+        return self._read("ready")
+
+    @ready.setter
+    def ready(self, value: bool) -> None:
+        self._write("ready", value)
 
     @property
     def identity(self) -> str:
+        if self._native is not None and getattr(self, "_overrides", None) is None:
+            return self._native.identity
         return _identity(self.pool, self.slot, self.id, self.incarnation)
 
-    def __getattr__(self, name: str) -> BoundMethod:
+    def __getattr__(self, name: str) -> Any:
+        if name == "state":
+            assert self._native is not None
+            state = self._native.materialize_state() or {}
+            self.state = state
+            self._state = state
+            return state
         # Only names the pool actually serves. An earlier design proxied
         # everything, which made hasattr() always true and turned a typo into a
         # runtime failure much later.
-        if name.startswith("_") or name not in self._methods:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in self._methods:
             raise AttributeError(
                 f"{self.identity} serves {sorted(self._methods) or 'no methods'}, not {name!r}"
             )
@@ -261,6 +402,8 @@ class Handle:
     def label(self) -> str:
         """Short form for humans. `identity` stays exact -- it is the fencing
         token -- but a random 63-bit id is unreadable in a log line."""
+        if self._native is not None and getattr(self, "_overrides", None) is None:
+            return self._native.label
         seat = self.slot if self.slot is not None else f"{self.id & 0xFFFF:04x}"
         return f"{self.pool}/{seat}#{self.incarnation & 0xFFF:03x}"
 
@@ -290,45 +433,79 @@ class Epoch:
     holding the *same* list, which is what freezing gives.
     """
 
-    __slots__ = ("pool", "members", "roster", "_c")
+    __slots__ = ("pool", "roster", "_c", "_view", "_materialized", "_handle_cls")
 
     def __init__(self, pool_name: str, client: _Client, members: Sequence[Handle], roster: int):
         self.pool = pool_name
+        self.roster = roster
+        self._c = client
+        self._view: _NativeSnapshot | None = None
         # A tuple, because "frozen" has to mean it. Handed to every rank to
         # build the same process group from, a list is one in-place sort or
         # filter away from the ranks disagreeing -- which is the deadlock this
         # type exists to prevent, arrived at through the type meant to prevent
         # it. Measured before: `epoch.members.append(...)` changed `len(epoch)`.
-        self.members = tuple(members)
-        self.roster = roster
-        self._c = client
+        self._materialized: tuple[Handle, ...] | None = tuple(members)
+        self._handle_cls: type[Handle] = Handle
+
+    @classmethod
+    def _from_native(
+        cls,
+        pool_name: str,
+        client: _Client,
+        view: _NativeSnapshot,
+        handle_cls: type[Handle],
+    ) -> Epoch:
+        epoch = cls.__new__(cls)
+        epoch.pool = pool_name
+        epoch.roster = view.roster
+        epoch._c = client
+        epoch._view = view
+        epoch._materialized = None
+        epoch._handle_cls = handle_cls
+        return epoch
+
+    @property
+    def members(self) -> tuple[Handle, ...]:
+        if self._materialized is None:
+            assert self._view is not None
+            self._materialized = self._view.materialize(
+                self._handle_cls._from_native, _StateBatch, immutable=True
+            )
+        return self._materialized
 
     @property
     def valid(self) -> bool:
         """False once the occupants change. Checking this in a training loop is
         useless -- a stuck rank never reaches the check. Use a watchdog thread;
         NCCL releases the GIL while it blocks, so one can still run."""
-        info = self._c.pool_info(self.pool)
         # Losing the registry does not invalidate a group that is still
         # running; it only costs fast detection. Killing the round here would
         # contradict "the registry can die without stopping training".
-        return self._c.accepted and (info is None or info[1] == self.roster)
+        return self._c.epoch_valid(self.pool, self.roster)
 
     def __len__(self) -> int:
-        return len(self.members)
+        return len(self._view) if self._view is not None else len(self.members)
 
     def __iter__(self):
         return iter(self.members)
 
     def slot(self, k: int) -> Handle:
-        for h in self.members:
-            if h.slot == k:
-                return h
+        if self._materialized is not None:
+            for h in self._materialized:
+                if h.slot == k:
+                    return h
+        elif self._view is not None:
+            seat = _native_seat(k)
+            if seat is not None:
+                found = self._view.slot(seat, self._handle_cls._from_native)
+                if found is not None:
+                    return found
         raise NotFound(f"seat {k} is not in this round of {self.pool!r}")
 
     def __repr__(self) -> str:
         state = "valid" if self.valid else "broken"
-        return f"<Epoch {self.pool} members={len(self.members)} roster={self.roster} {state}>"
+        return f"<Epoch {self.pool} members={len(self)} roster={self.roster} {state}>"
 
 
 class Snapshot:
@@ -345,30 +522,60 @@ class Snapshot:
     of them wants a different reaction.
     """
 
-    __slots__ = ("pool", "revision", "members")
+    __slots__ = ("pool", "revision", "_view", "_materialized", "_handle_cls")
 
     def __init__(self, pool_name: str, revision: int, members: Sequence[Handle]):
         self.pool = pool_name
         self.revision = revision
+        self._view: _NativeSnapshot | None = None
         # Same reason as `Epoch`: a snapshot names one moment, and a moment
         # that can be edited afterwards is not one.
-        self.members = tuple(members)
+        self._materialized: tuple[Handle, ...] | None = tuple(members)
+        self._handle_cls: type[Handle] = Handle
+
+    @classmethod
+    def _from_native(
+        cls,
+        pool_name: str,
+        view: _NativeSnapshot,
+        handle_cls: type[Handle],
+    ) -> Snapshot:
+        snapshot = cls.__new__(cls)
+        snapshot.pool = pool_name
+        snapshot.revision = view.revision
+        snapshot._view = view
+        snapshot._materialized = None
+        snapshot._handle_cls = handle_cls
+        return snapshot
+
+    @property
+    def members(self) -> tuple[Handle, ...]:
+        if self._materialized is None:
+            assert self._view is not None
+            self._materialized = self._view.materialize(
+                self._handle_cls._from_native, _StateBatch, immutable=True
+            )
+        return self._materialized
 
     def __len__(self) -> int:
-        return len(self.members)
+        return len(self._view) if self._view is not None else len(self.members)
 
     def __iter__(self):
         return iter(self.members)
 
     def ready(self) -> list[Handle]:
-        return [h for h in self.members if h.ready]
+        if self._materialized is not None:
+            return [h for h in self._materialized if h.ready]
+        assert self._view is not None
+        return self._view.materialize_ready(self._handle_cls._from_native, _StateBatch)
 
     def slot(self, k: int) -> Handle | None:
         """The occupant of seat k, ready or not, or None if it is empty."""
-        for h in self.members:
-            if h.slot == k:
-                return h
-        return None
+        if self._materialized is not None:
+            return next((h for h in self._materialized if h.slot == k), None)
+        assert self._view is not None
+        seat = _native_seat(k)
+        return None if seat is None else self._view.slot(seat, self._handle_cls._from_native)
 
     def get(self, identity: str) -> Handle | None:
         """The member with this exact identity, tenure included, or None.
@@ -377,13 +584,15 @@ class Snapshot:
         incarnation still there" is a question about one moment, and asking the
         live pool twice can answer about two.
         """
-        for h in self.members:
-            if h.identity == identity:
-                return h
-        return None
+        if self._materialized is not None:
+            return next((h for h in self._materialized if h.identity == identity), None)
+        if not isinstance(identity, str):
+            return None
+        assert self._view is not None
+        return self._view.get(identity, self._handle_cls._from_native)
 
     def __repr__(self) -> str:
-        return f"<Snapshot {self.pool} rev={self.revision} members={len(self.members)}>"
+        return f"<Snapshot {self.pool} rev={self.revision} members={len(self)}>"
 
 
 class _LoopBell:
@@ -404,7 +613,7 @@ class _LoopBell:
         self._loop = loop
         self._r, self._w = os.pipe()
         os.set_blocking(self._r, False)
-        # Non-blocking on the write end too: the bell rings from the heartbeat
+        # Non-blocking on the write end too: the bell rings from the membership
         # thread, and a reader that has fallen behind must never stall it. A
         # byte already waiting says everything a second one would.
         os.set_blocking(self._w, False)
@@ -477,6 +686,7 @@ _bells: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], _LoopBell]] = {}
 # Watchers that are still running, so leave() can end them rather than leave a
 # thread parked on a client that has gone.
 _live_watches: weakref.WeakSet[_Watching] = weakref.WeakSet()
+_live_native_waits: weakref.WeakSet[_NativeWait] = weakref.WeakSet()
 
 
 def _loop_bell(client: _Client) -> _LoopBell:
@@ -503,13 +713,26 @@ def _left_ms(deadline: float | None) -> int | None:
 
     Every wait in here spelled this out, and eight copies of a deadline is
     eight chances to get one of them wrong. An unbounded wait still needs a
-    number to hand the Rust side: an hour, re-armed each time round, since the
-    bell rings far more often than that.
+    number to hand the Rust side: an hour, re-armed each time round. Semantic
+    cache changes normally ring first; a truly quiet unbounded wait simply
+    re-arms after the hour.
     """
     if deadline is None:
         return 3_600_000
     left = deadline - time.monotonic()
     return None if left <= 0 else int(left * 1000) + 1
+
+
+def _native_seat(value: Any) -> int | None:
+    try:
+        seat = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return seat if seat == value and 0 <= seat < 1 << 64 else None
+
+
+def _native_threshold(value: int) -> int:
+    return max(-(1 << 127), min((1 << 127) - 1, value))
 
 
 class RegistryInfo:
@@ -519,8 +742,8 @@ class RegistryInfo:
     request immediately and correctly -- it just does not park it -- so
     "parked and nothing happened" and "does not park" are indistinguishable
     from the client. Measured against a 0.6.1 registry: 14.5 requests a second
-    where a current one does 0.12, a hundredfold, with `/health` saying only
-    `{"status": "ok"}` and no attribute anywhere to probe.
+    where a current one does 0.12, a hundredfold, with its health probe saying
+    only "ok" and no attribute anywhere to probe.
 
     `protocol` is the number to branch on. It only goes up, and a registry too
     old to report one reads as 0.
@@ -532,7 +755,7 @@ class RegistryInfo:
     #: table rather than a per-feature flag: the registry says one number and
     #: the meaning of that number lives here, in the package that depends on
     #: it, so an old client never has to be taught about a future feature.
-    FEATURES = {"long_poll": 1, "publication_ordering": 2}
+    FEATURES = {"long_poll": 1, "publication_ordering": 2, "native_registry": 3}
 
     def __init__(self, protocol: int, version: str):
         self.protocol = protocol
@@ -658,11 +881,9 @@ class _Watching:
             return None, 0
         self._tick = self._c.cache_revision()
         info = self._c.pool_info(self._pool._name)
-        # The bell rings once a beat whether or not anything happened, so what
-        # decides a yield is the pool's own version. Waking on the bell but
-        # yielding on the beat was measured at 25 snapshots for 4 real changes
-        # -- and at 5,000 members a snapshot is 10.6ms spent rebuilding what
-        # did not move.
+        # The bell is semantic rather than per-heartbeat, but another watched
+        # pool or a lifecycle change can still ring it. The pool version is
+        # therefore what decides whether this stream yields.
         if info is not None and info[0] != self._seen:
             self._seen = info[0]
             if self._fields is None:
@@ -744,6 +965,60 @@ class AsyncWatch(_Watching):
         self.close()
 
 
+def _fenced_wait(pool_name: str) -> None:
+    raise Fenced(
+        f"cannot watch {pool_name!r} any further: this process lost its seat "
+        f"to a later tenure, so its view of the pool is frozen. Nothing here "
+        f"can recover; the process has to stop using whatever the seat "
+        f"entitled it to."
+    )
+
+
+def _timed_out(result: tuple[Any, ...]) -> tuple[Any, ...]:
+    return (_WAIT_TIMEOUT, None, *result[2:])
+
+
+def _wait_native(
+    waiter: _NativeWait, deadline: float | None
+) -> tuple[int, _NativeSnapshot | None, int, int, int]:
+    _live_native_waits.add(waiter)
+    try:
+        result = waiter.check(initial=True)
+        if result[0] != _WAIT_PENDING:
+            return result
+        if deadline is None:
+            return waiter.wait(None, initial=False)
+        ms = _left_ms(deadline)
+        return waiter.wait(0 if ms is None else ms, initial=False)
+    finally:
+        _live_native_waits.discard(waiter)
+
+
+async def _await_native(
+    client: _Client, waiter: _NativeWait, deadline: float | None
+) -> tuple[int, _NativeSnapshot | None, int, int, int]:
+    _live_native_waits.add(waiter)
+    initial = True
+    try:
+        while True:
+            # Register before checking: the cache can move, or fencing can be
+            # the final wakeup, in the gap before the await.
+            bell = _loop_bell(client)
+            result = waiter.check(initial=initial)
+            if not initial and result[0] not in (_WAIT_FENCED, _WAIT_CLOSED):
+                if _left_ms(deadline) is None:
+                    return _timed_out(result)
+            if result[0] != _WAIT_PENDING:
+                return result
+            ms = _left_ms(deadline)
+            if ms is None:
+                return _timed_out(result)
+            await bell.wait(ms / 1000)
+            initial = False
+    finally:
+        _live_native_waits.discard(waiter)
+
+
 class Pool:
     """One group. Lookups read the local cache: no network, so no timeouts."""
 
@@ -784,12 +1059,12 @@ class Pool:
 
     def _members(self, filt: dict[str, Any], require_ready: bool) -> list[Handle]:
         self._settle()
-        raw = self._c.lookup(self._name, json.dumps(filt), require_ready)
-        # The method list is stored once per pool, not once per member: members
-        # of a pool run the same code.
-        info = self._c.pool_info(self._name)
-        methods = tuple(info[3]) if info else ()
-        return [self._handle_cls(self._name, m, methods) for m in _json_decode(raw)]
+        view = self._c.snapshot_view(
+            self._name, None if not filt else _msgpack_encode(filt), require_ready
+        )
+        if view is None:
+            return []
+        return view.materialize(self._handle_cls._from_native, _StateBatch, immutable=False)
 
     def snapshot(self, include_unready: bool = True) -> Snapshot:
         """The pool as it stands, with the revision it stood at.
@@ -799,14 +1074,10 @@ class Pool:
         list and its fingerprint together.
         """
         self._settle()
-        info = self._c.pool_info(self._name)
-        got = self._c.frozen(self._name, not include_unready)
-        if got is None:
+        view = self._c.snapshot_view(self._name, None, not include_unready)
+        if view is None:
             return Snapshot(self._name, 0, [])
-        raw, _, _, version = got
-        methods = tuple(info[3]) if info else ()
-        members = [self._handle_cls(self._name, m, methods) for m in _json_decode(raw)]
-        return Snapshot(self._name, version, members)
+        return Snapshot._from_native(self._name, view, self._handle_cls)
 
     def changes(
         self,
@@ -828,15 +1099,17 @@ class Pool:
 
     def _replacement_target(
         self, slot: int | None, identity: str | None, who: str
-    ) -> tuple[int, str | None]:
+    ) -> tuple[int, str | None, bool]:
         """The seat to watch and the tenure that must give way."""
         if (slot is None) == (identity is None):
             raise TypeError(f"{who}() takes exactly one of slot= or identity=")
         if identity is not None:
-            return _seat_of(identity), identity
+            return _seat_of(identity), identity, False
         assert slot is not None
-        here = self.snapshot().slot(slot)
-        return slot, here.identity if here else None
+        seat = _native_seat(slot)
+        if seat is None:
+            raise ValueError(f"{slot!r} is not a usable seat")
+        return seat, None, True
 
     def wait_replacement(
         self,
@@ -855,38 +1128,37 @@ class Pool:
         None means the timeout ran out with the seat still held by the tenure
         it started with, or still empty.
         """
-        seat, was = self._replacement_target(slot, identity, "wait_replacement")
-        try:
-            snap = self.until(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))
-        except TimeoutError:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        seat, was, capture = self._replacement_target(slot, identity, "wait_replacement")
+        waiter = self._c.replacement_waiter(self._name, seat, was, capture)
+        result = _wait_native(waiter, deadline)
+        if result[0] == _WAIT_FENCED:
+            _fenced_wait(self._name)
+        if result[0] != _WAIT_READY or result[1] is None:
             return None
-        return snap.slot(seat)
+        return result[1].slot(seat, self._handle_cls._from_native)
 
     def all(self, **filt: Any) -> list[Handle]:
         return self._members(filt, require_ready=True)
 
     def pick(self, **filt: Any) -> Handle:
         self._settle()
-        raw = self._c.choose(self._name, json.dumps(filt), True)
-        if raw is None:
+        member = self._c.choose_ref(self._name, None if not filt else _msgpack_encode(filt), True)
+        if member is None:
             raise NotFound(f"no ready member of {self._name!r} matching {filt}")
         info = self._c.pool_info(self._name)
-        return self._handle_cls(self._name, _json_decode(raw), tuple(info[3]) if info else ())
+        return self._handle_cls._from_native(member, tuple(info[3]) if info else ())
 
     def slot(self, k: int, require_ready: bool = False) -> Handle:
         self._settle()
-        try:
-            seat = int(k)
-        except (TypeError, ValueError, OverflowError):
-            seat = -1
-        raw = (
-            self._c.lookup_slot(self._name, seat, require_ready)
-            if seat == k and 0 <= seat < 1 << 64
-            else None
+        seat = _native_seat(k)
+        member = (
+            self._c.lookup_slot_ref(self._name, seat, require_ready) if seat is not None else None
         )
-        if raw is not None:
+        if member is not None:
             info = self._c.pool_info(self._name)
-            return self._handle_cls(self._name, _json_decode(raw), tuple(info[3]) if info else ())
+            methods = tuple(info[3]) if info else ()
+            return self._handle_cls._from_native(member, methods)
         # Never silently substitute another member: routing a keyed request to
         # the wrong seat corrupts data instead of raising.
         raise NotFound(f"seat {k} of {self._name!r} is empty")
@@ -950,21 +1222,20 @@ class Pool:
         Gone covers all the ways: left, lease expired, or the seat changed
         hands. It is the tenure that is being watched, not the seat.
         """
-
-        def departed(snap: Snapshot) -> bool:
-            return snap.get(identity) is None
-
-        try:
-            self.until(departed, timeout=timeout, describe=f"{identity} to leave")
-        except TimeoutError:
-            return False
-        return True
+        deadline = None if timeout is None else time.monotonic() + timeout
+        result = _wait_native(
+            self._c.departure_waiter(self._name, identity),
+            deadline,
+        )
+        if result[0] == _WAIT_FENCED:
+            _fenced_wait(self._name)
+        return result[0] == _WAIT_READY
 
     def wait(self, count: int = 1, timeout: float = 30.0, **filt: Any) -> list[Handle]:
         """Block until `count` members match. Bounded, and the failure names them.
 
-        Written on `until()`, like every other wait. Its own loop used to be
-        the only one in the library that could not say it had been fenced: a
+        The condition and event handoff run in Rust. Its old Python loop was
+        the only wait in the library that could not say it had been fenced: a
         process whose seat had been taken sat out the whole timeout and then
         blamed the pool, because a frozen cache reports nobody. Measured on a
         fenced process asking for five members with a 4s budget:
@@ -976,18 +1247,24 @@ class Pool:
         The pool was not empty -- a replacement was in it. Only this process
         could no longer see it, which is a different thing to be told.
         """
-        found: list[Handle] = []
-
-        def enough(_: Snapshot) -> bool:
-            # Matching stays in Rust, where `all()` does it too: the rules are
-            # not obvious (numbers compare by value at any depth, booleans
-            # strictly) and a second implementation here would drift.
-            nonlocal found
-            found = self._members(filt, require_ready=True)
-            return len(found) >= count
-
-        self.until(enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}")
-        return found
+        deadline = time.monotonic() + timeout
+        waiter = self._c.count_waiter(
+            self._name,
+            _native_threshold(count),
+            None if not filt else _msgpack_encode(filt),
+        )
+        result = _wait_native(waiter, deadline)
+        if result[0] == _WAIT_FENCED:
+            _fenced_wait(self._name)
+        if result[0] == _WAIT_READY and result[1] is not None:
+            return result[1].materialize(
+                self._handle_cls._from_native, _StateBatch, immutable=False
+            )
+        raise TimeoutError(
+            f"waited {timeout}s for {count} ready member(s) matching {filt} in "
+            f"{self._name!r}; the pool holds {result[3]} member(s), "
+            f"last seen at revision {result[4]}"
+        )
 
     def epoch(self, min: int | None = None, timeout: float = 60.0) -> Epoch:
         """Wait for the round to be complete, then freeze it.
@@ -1011,59 +1288,37 @@ class Pool:
         them, so the fingerprint could describe occupants the list never saw.
         """
         deadline = time.monotonic() + timeout
-        self._check_fenced()
-        self._settle()
-        found, mismatched = 0, False
-        while True:
+        ms = _left_ms(deadline)
+        minimum = None if min is None else _native_threshold(min)
+        result = self._c.wait_epoch(self._name, 0 if ms is None else ms, minimum)
+        status, view, found, target, _mismatched, seen_pool, silence_ms = result
+        if status == _WAIT_FENCED:
             self._check_fenced()
-            # A stale roster is not safe to build a collective on: ranks could
-            # disagree. Refuse rather than freeze something we cannot trust.
-            if self._c.silence_ms > self._lease_ms():
-                raise Stale(
-                    f"cannot open a round of {self._name!r}: no contact with the "
-                    f"registry for {self._c.silence_ms}ms"
-                )
-            rev = self._c.cache_revision()
-            info = self._c.pool_info(self._name)
-            if info is None:
-                # No answer about this pool yet, so there is no fingerprint to
-                # freeze. min=0 used to reach the line below and crash on it.
-                ms = _left_ms(deadline)
-                if ms is None:
-                    raise TimeoutError(
-                        f"waited {timeout}s to open a round of {self._name!r}: "
-                        f"the registry has said nothing about it"
-                    )
-                self._c.wait_revision(rev, ms)
-                continue
-            target = min if min is not None else info[2]
-            if target is None:
-                raise PolicyError(f"{self._name!r} declares no size; pass min= or join with size=")
-            got = self._c.frozen(self._name, True)
-            if got is not None:
-                raw, ours, whole, _ = got
-                members = [
-                    self._handle_cls(self._name, m, tuple(info[3])) for m in _json_decode(raw)
-                ]
-                found, mismatched = len(members), ours != whole
-                if found >= target and not mismatched:
-                    self._check_fenced()
-                    return Epoch(self._name, self._c, members, whole)
-            ms = _left_ms(deadline)
-            if ms is None:
-                if mismatched and found >= target:
-                    raise TimeoutError(
-                        f"waited {timeout}s to open a round of {self._name!r}: "
-                        f"{found} member(s) ready, but the pool holds a seat whose "
-                        f"occupant has not declared itself ready, so the fingerprint "
-                        f"would not describe the list -- wait for it rather than "
-                        f"freeze a round no other rank can be held to"
-                    )
-                raise TimeoutError(
-                    f"waited {timeout}s to open a round of {self._name!r}: "
-                    f"{found} of {target} present"
-                )
-            self._c.wait_revision(rev, ms)
+        if status == _WAIT_STALE:
+            raise Stale(
+                f"cannot open a round of {self._name!r}: no contact with the "
+                f"registry for {silence_ms}ms"
+            )
+        if status == _WAIT_NO_SIZE:
+            raise PolicyError(f"{self._name!r} declares no size; pass min= or join with size=")
+        if status == _WAIT_READY and view is not None:
+            return Epoch._from_native(self._name, self._c, view, self._handle_cls)
+        if not seen_pool:
+            raise TimeoutError(
+                f"waited {timeout}s to open a round of {self._name!r}: "
+                f"the registry has said nothing about it"
+            )
+        if status == _WAIT_MISMATCH:
+            raise TimeoutError(
+                f"waited {timeout}s to open a round of {self._name!r}: "
+                f"{found} member(s) ready, but the pool holds a seat whose "
+                f"occupant has not declared itself ready, so the fingerprint "
+                f"would not describe the list -- wait for it rather than "
+                f"freeze a round no other rank can be held to"
+            )
+        raise TimeoutError(
+            f"waited {timeout}s to open a round of {self._name!r}: {found} of {target} present"
+        )
 
     def _check_fenced(self) -> None:
         if not self._c.accepted:
@@ -1076,11 +1331,12 @@ class Pool:
         return max(int(self._c.stats().get("interval_ms", 1000)) * 4, 1000)
 
     def __len__(self) -> int:
-        return len(self.all())
+        self._settle()
+        return self._c.count(self._name, None, True)
 
     def __repr__(self) -> str:
         info = self._c.pool_info(self._name)
-        return f"<Pool {self._name} members={len(self.all())} version={info[0] if info else None}>"
+        return f"<Pool {self._name} members={len(self)} version={info[0] if info else None}>"
 
 
 class Member:
@@ -1177,7 +1433,7 @@ class Member:
             self._state = fresh
         return self
 
-    def _encode_state(self, state: dict[str, Any]) -> str:
+    def _encode_state(self, state: dict[str, Any]) -> bytes:
         raw = json.dumps(state, allow_nan=False)
         # The registry would refuse this, but silently and in a background
         # thread. Refusing here names the call that did it. The bound exists
@@ -1189,7 +1445,9 @@ class Member:
                 f"registry copies it to every subscriber, so publish a "
                 f"reference and let peers fetch the payload themselves"
             )
-        return raw
+        # Preserve the JSON-facing state semantics (string keys, tuples as
+        # arrays, finite numbers) while crossing the native boundary as bytes.
+        return _msgpack_encode(json.loads(raw))
 
     def set_ready(self, state: dict[str, Any] | None = None) -> Member:
         """Replace the published state outright, rather than merging into it.
@@ -1225,19 +1483,16 @@ class Member:
         self._mine()
         mine, _ = self._c.publish_versions()
         deadline = time.monotonic() + timeout
-        while True:
-            rev = self._c.cache_revision()
-            if self._c.publish_versions()[1] >= mine:
-                return self
-            if not self._c.accepted:
-                raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")
-            ms = _left_ms(deadline)
-            if ms is None:
-                raise TimeoutError(
-                    f"waited {timeout}s for the registry to take this state; "
-                    f"last error was {self._c.last_error()!r}"
-                )
-            self._c.wait_revision(rev, ms)
+        ms = _left_ms(deadline)
+        confirmed, accepted = self._c.wait_publication(mine, 0 if ms is None else ms)
+        if confirmed >= mine:
+            return self
+        if not accepted:
+            raise SeatTaken(f"{self.pool} seat {self.slot} was taken while publishing")
+        raise TimeoutError(
+            f"waited {timeout}s for the registry to take this state; "
+            f"last error was {self._c.last_error()!r}"
+        )
 
     def wait_fenced(self, timeout: float | None = None) -> bool:
         """Block until a later tenure has taken this seat. True if it has.
@@ -1397,9 +1652,12 @@ class Member:
             # process alive indefinitely.
             for w in list(_live_watches):
                 w.close()
-            global _client, _left
+            for native_wait in list(_live_native_waits):
+                native_wait.close()
+            global _client, _method_server, _left
             if _client is self._c:
                 _client = None
+                _method_server = None
                 _left = True
             try:
                 self._c.leave()
@@ -1446,6 +1704,7 @@ MAX_STATE = 16 << 10
 FIRST_BEAT_S = 30.0
 
 _client: _Client | None = None
+_method_server: _MethodServer | None = None
 _left = False
 _owner_pid = os.getpid()
 
@@ -1460,10 +1719,14 @@ def _after_fork() -> None:
     them: measured as a child that hangs forever at ordinary exit, in native
     code with no Python frame to show why, taking the parent's waitpid with it.
     """
-    global _client, _left
+    global _client, _method_server, _left
+    _close_blobs_after_fork()
     if _client is not None:
         _client.abandon()
+    if _method_server is not None:
+        _method_server.abandon()
     _client = None
+    _method_server = None
     _left = False
     # The inherited pipes belong to the parent's loops and its heartbeat is
     # gone, so nothing will ever write to them again. Drop them without
@@ -1471,6 +1734,7 @@ def _after_fork() -> None:
     # the same for the transports, which had been left behind.
     _bells.clear()
     _live_watches.clear()
+    _live_native_waits.clear()
     _rpc.reset_after_fork()
 
 
@@ -1520,7 +1784,7 @@ def join(
     are batched between beats. Defaults to 50ms; zero opts out. The effective
     gap never exceeds a quarter of the lease, even for a larger requested gap.
     """
-    global _client, _left, _owner_pid
+    global _client, _method_server, _left, _owner_pid
     _left = False
     if _client is not None:
         raise RuntimeError(
@@ -1577,7 +1841,10 @@ def join(
             )
             cleanup.callback(server.close)
             methods = server.methods
-            url = url or server.url(_advertise())
+            url = _checked_method_endpoint(url) if url is not None else server.url(_advertise())
+            server.track_endpoint(url)
+        elif url is not None:
+            url = _checked_method_endpoint(url)
 
         c = _Client(
             endpoint=endpoint,
@@ -1602,14 +1869,9 @@ def join(
         # Include the first exchange in the budget, but leave time to retry
         # a dropped request rather than spending the whole budget on it.
         if not c.start(int(min(timeout, _FIRST_BEAT_S) * 1000)):
-            while not c.stats()["beats_ok"]:
-                rev = c.cache_revision()
-                if c.stats()["beats_ok"]:
-                    break
-                ms = _left_ms(deadline)
-                if ms is None:
-                    break
-                c.wait_revision(rev, ms)
+            ms = _left_ms(deadline)
+            if ms is not None:
+                c.wait_registered(ms)
             if not c.stats()["beats_ok"]:
                 raise Unreachable(
                     f"no answer from the registry at {endpoint} after "
@@ -1655,6 +1917,7 @@ def join(
         atexit.register(member._leave_at_exit)
         _rpc.set_identity(member.identity)
         _client = c
+        _method_server = server
         _owner_pid = os.getpid()
         cleanup.pop_all()
         return member
@@ -1726,32 +1989,36 @@ class AsyncPool(Pool):
         Wrapping it in `asyncio.to_thread` is the caller doing the library's
         job, and it strands a worker for as long as the wait lasts.
         """
-        found: list[Handle] = []
-
-        def enough(_: Snapshot) -> bool:
-            # Matching stays in Rust, where `wait()` does it too: the rules are
-            # not obvious (numbers compare by value, booleans strictly) and a
-            # second implementation here would drift from the first.
-            nonlocal found
-            found = self._members(filt, require_ready=True)
-            return len(found) >= count
-
-        await self.auntil(
-            enough, timeout=timeout, describe=f"{count} ready member(s) matching {filt}"
+        deadline = time.monotonic() + timeout
+        waiter = self._c.count_waiter(
+            self._name,
+            _native_threshold(count),
+            None if not filt else _msgpack_encode(filt),
         )
-        return found
+        result = await _await_native(self._c, waiter, deadline)
+        if result[0] == _WAIT_FENCED:
+            _fenced_wait(self._name)
+        if result[0] == _WAIT_READY and result[1] is not None:
+            return result[1].materialize(
+                self._handle_cls._from_native, _StateBatch, immutable=False
+            )
+        raise TimeoutError(
+            f"waited {timeout}s for {count} ready member(s) matching {filt} in "
+            f"{self._name!r}; the pool holds {result[3]} member(s), "
+            f"last seen at revision {result[4]}"
+        )
 
     async def await_departure(self, identity: str, timeout: float | None = None) -> bool:
         """`wait_departure()` for an event loop."""
-
-        def departed(snap: Snapshot) -> bool:
-            return snap.get(identity) is None
-
-        try:
-            await self.auntil(departed, timeout=timeout, describe=f"{identity} to leave")
-        except TimeoutError:
-            return False
-        return True
+        deadline = None if timeout is None else time.monotonic() + timeout
+        result = await _await_native(
+            self._c,
+            self._c.departure_waiter(self._name, identity),
+            deadline,
+        )
+        if result[0] == _WAIT_FENCED:
+            _fenced_wait(self._name)
+        return result[0] == _WAIT_READY
 
     async def await_replacement(
         self,
@@ -1760,41 +2027,18 @@ class AsyncPool(Pool):
         timeout: float | None = None,
     ) -> Handle | None:
         """`wait_replacement()` for an event loop."""
-        seat, was = self._replacement_target(slot, identity, "await_replacement")
-        try:
-            snap = await self.auntil(_taken_over(seat, was), timeout=timeout, describe=_WHO(seat))
-        except TimeoutError:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        seat, was, capture = self._replacement_target(slot, identity, "await_replacement")
+        result = await _await_native(
+            self._c,
+            self._c.replacement_waiter(self._name, seat, was, capture),
+            deadline,
+        )
+        if result[0] == _WAIT_FENCED:
+            _fenced_wait(self._name)
+        if result[0] != _WAIT_READY or result[1] is None:
             return None
-        return snap.slot(seat)
-
-
-def _WHO(seat: int) -> str:
-    return f"a different tenure in seat {seat}"
-
-
-def _taken_over(seat: int, was: str | None) -> Callable[[Snapshot], bool]:
-    """Seat `seat` held by anyone other than `was`.
-
-    Both waits go through `until()` now. Each used to drive its own watch,
-    subscribing to what came *next* without first looking at what was already
-    true -- and asking who took over a seat usually happens after the fact, a
-    call comes back `Fenced` and only then does anyone go looking.
-
-    A takeover that had already finished was therefore invisible: measured
-    against a completed handover with the pool quiet, both sat out the whole
-    5s timeout and returned None. What made this hard to see is that any
-    unrelated change arriving afterwards -- the departed member being cleaned
-    up will do -- finds the condition already true and the wait answers
-    correctly by luck. The first run of this measurement had the blocking one
-    answer in 0.04s for exactly that reason, which made it look like only the
-    async one was broken.
-    """
-
-    def taken(snap: Snapshot) -> bool:
-        now = snap.slot(seat)
-        return now is not None and now.identity != was
-
-    return taken
+        return result[1].slot(seat, self._handle_cls._from_native)
 
 
 def _identity(pool: str, slot: int | None, ident: int, incarnation: int) -> str:

@@ -12,15 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import gc
-import json
 import os
 import threading
 import time
-import urllib.request
 
 import pytest
 import tinyray
-from tinyray import _rpc, _serve
+from tinyray import _serve, _tinyray
+
+from tests.support.registry_wire import debug_pools
 
 _KINDS = {
     "Member": tinyray.Member,
@@ -28,16 +28,20 @@ _KINDS = {
     "Watching": tinyray._Watching,
     "Handle": tinyray.Handle,
     "LoopBell": tinyray._LoopBell,
+    "Snapshot": tinyray.Snapshot,
+    "Epoch": tinyray.Epoch,
 }
 
 
 def census() -> dict[str, int]:
     gc.collect()
+    rpc = _tinyray.rpc_debug_state()
     out = {name: sum(1 for o in gc.get_objects() if type(o) is cls) for name, cls in _KINDS.items()}
     out["线程"] = threading.active_count()
     out["fd"] = len(os.listdir(f"/proc/{os.getpid()}/fd"))
     out["_bells"] = len(tinyray._bells)
-    out["_loops"] = len(_rpc._loops)
+    out["_rpc_pools"] = rpc["pools"]
+    out["_rpc_idle"] = rpc["idle_connections"]
     out["_SHAPES"] = len(_serve._SHAPES)
     return out
 
@@ -80,6 +84,17 @@ def _with_loop(name: str) -> None:
     m.leave()
 
 
+def _with_views(name: str) -> None:
+    m = tinyray.join(name, "collective", slot=0, size=1)
+    m.ready()
+    pool = tinyray.pool(name)
+    snapshot = pool.snapshot()
+    epoch = pool.epoch(timeout=5)
+    assert len(snapshot.members) == len(epoch.members) == len(pool.all()) == 1
+    assert snapshot.members[0].state == {}
+    m.leave()
+
+
 @pytest.mark.parametrize(
     "tag,round_trip",
     [
@@ -87,6 +102,7 @@ def _with_loop(name: str) -> None:
         ("c", _with_call),
         ("w", _with_watch),
         ("l", _with_loop),
+        ("v", _with_views),
     ],
 )
 def test_a_round_of_membership_leaves_nothing_behind(registry, tag, round_trip):
@@ -122,8 +138,7 @@ def registry_census(reg) -> dict[str, int]:
         parts = line.split()
         if len(parts) >= 2 and parts[0].endswith(":"):
             fields[parts[0][:-1]] = parts[1]
-    with urllib.request.urlopen(f"http://{reg.endpoint}/v1/pools", timeout=5) as r:
-        pools = json.load(r)
+    pools = debug_pools(reg.endpoint)
     return {
         "注册中心线程": int(fields["Threads"]),
         "注册中心 fd": len(os.listdir(f"/proc/{pid}/fd")),

@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import textwrap
 import time
-import urllib.request
 
 import pytest
 import tinyray
 
 from tests.support.ordering_proxy import OrderingProxy
 from tests.support.registry import BIN, RegistryProc, free_port
+from tests.support.registry_wire import debug_pools
 
 MEMBER = textwrap.dedent(
     """
@@ -120,8 +119,7 @@ def test_delayed_downlink_does_not_stop_renewing_a_reachable_registry(ttl_ms):
         deadline = started + 0.8
         samples = 0
         while time.monotonic() < deadline:
-            with urllib.request.urlopen(f"http://{reg.endpoint}/v1/pools", timeout=2) as r:
-                count = json.load(r)[me.pool]["members"]
+            count = debug_pools(reg.endpoint, timeout=2)[me.pool]["members"]
             assert count == 1, "reply timeout stopped renewals beyond the lease"
             samples += 1
             time.sleep(0.003)

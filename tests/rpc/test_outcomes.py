@@ -9,16 +9,17 @@ operation can be repeated." —— 照做就会重试一个可能已经执行过
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import tinyray
 from tinyray import _rpc
+from tinyray._msgpack import dumps
 
 SLOW = textwrap.dedent(
     """
@@ -83,7 +84,7 @@ def test_a_refused_connection_says_it_never_arrived(served):
             "id": 0,
             "slot": 0,
             "incarnation": real.incarnation,
-            "url": "http://127.0.0.1:1",
+            "url": "127.0.0.1:1",
             "ready": True,
         },
         ("quick",),
@@ -112,12 +113,8 @@ def test_a_timeout_refuses_to_claim_it_never_arrived(served):
 def test_no_address_never_left_this_process(served):
     """没有地址的成员，报错要点名**为什么**没有。
 
-    `join()` 时不给 `serves=` 就不会有地址，而这是个很常见的手误 —— 尤其是把一个
-    只监听的成员和一个提供方法的成员写在同一份代码里的时候。
-
-    只断言异常类是不够的：把这条检查拆掉，httpx 自己也会失败，也一样归进
-    `NotDelivered`，测试照样绿。区别全在那句话上 —— 实测拆掉之后拿到的是
-    `Request URL is missing a scheme`，一个字都没提到真正的原因。
+    `join()` 时不给 `serves=` 就不会有地址，而这是个很常见的手误。错误必须
+    点明这个原因，而不是让底层 host:port 解析失败来代替。
     """
     urlless = tinyray.Handle("svc", {"id": 9, "incarnation": 1, "ready": True}, ("quick",))
     with pytest.raises(tinyray.NotDelivered) as e:
@@ -215,36 +212,34 @@ def test_the_limit_is_opt_in(registry):
 
 
 @pytest.mark.parametrize(
-    "status,expected,why",
+    "status,expected",
     [
-        (200, None, "答复正常"),
-        (409, tinyray.Fenced, "座位换人了，重新查地址"),
-        (503, tinyray.NotDelivered, "到并发上限，派发之前就拒了"),
-        (400, tinyray.NotDelivered, "长度或 body 读不完整"),
-        (408, tinyray.NotDelivered, "body 发到一半停住"),
-        (411, tinyray.NotDelivered, "chunked 的 body 根本不读"),
-        (500, tinyray.OutcomeUnknown, "handler 跑到一半散架了"),
-        (502, tinyray.OutcomeUnknown, "中间那层说上游坏了，不知道跑没跑"),
-        (404, AttributeError, "没有这个方法"),
-        (422, TypeError, "参数装不进签名"),
-        (413, ValueError, "payload 太大 —— 我们自己的服务端不发，中间代理会"),
-        (403, tinyray.OutcomeUnknown, "谁也没约定过的码，只能说不知道"),
+        (tinyray._tinyray.RPC_STATUS_SUCCESS, None),
+        (tinyray._tinyray.RPC_STATUS_FENCED, tinyray.Fenced),
+        (tinyray._tinyray.RPC_STATUS_CONCURRENCY_REFUSED, tinyray.NotDelivered),
+        (tinyray._tinyray.RPC_STATUS_CALLER_FAULT, TypeError),
+        (tinyray._tinyray.RPC_STATUS_METHOD_NOT_FOUND, AttributeError),
+        (tinyray._tinyray.RPC_STATUS_REMOTE_ERROR, tinyray.RemoteError),
+        (tinyray._tinyray.RPC_STATUS_MALFORMED_PROTOCOL, tinyray.NotDelivered),
+        (tinyray._tinyray.RPC_STATUS_INTERNAL, tinyray.OutcomeUnknown),
+        (255, tinyray.OutcomeUnknown),
     ],
 )
-def test_every_status_lands_in_the_right_class(status, expected, why):
-    """状态码到异常的对照表，一条一条钉住。
-
-    这张表就是调用方判断"能不能原样重发"的全部依据，而它有两支从来没人守着：
-    `413`（我们自己的方法服务端不发，中间代理会）和最后那个兜底 —— 拆掉之后
-    任何没约定过的码都会被当成正常答复，把一个 403 的 body 当结果返回给调用方。
-
-    端到端测不到这些，因为它们要么来自中间层，要么来自一个坏掉的对端。而
-    `_decode` 是个纯函数，直接问它就行 —— 和 `beat_timeout` 一样的道理。
-    """
-    body = json.dumps({"error": "x", "result": None}).encode()
+def test_every_native_status_lands_in_the_right_class(status, expected):
+    outcome = SimpleNamespace(
+        kind=tinyray._tinyray.RPC_OUTCOME_REPLY,
+        status=status,
+        payload=dumps(7),
+        message="x",
+        error_type="ValueError",
+        traceback="trace",
+        batch_index=None,
+        completed=None,
+    )
     if expected is None:
-        assert _rpc._decode(status, json.dumps({"result": 7}).encode(), "p/0#1") == 7
+        assert _rpc._decode(outcome, "p/0#1") == 7
         return
     with pytest.raises(expected) as e:
-        _rpc._decode(status, body, "p/0#1")
-    assert not isinstance(e.value, tinyray.RemoteError), f"{status}: {why} —— 方法并没有跑"
+        _rpc._decode(outcome, "p/0#1")
+    if status != tinyray._tinyray.RPC_STATUS_REMOTE_ERROR:
+        assert not isinstance(e.value, tinyray.RemoteError)

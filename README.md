@@ -36,12 +36,20 @@ tinyray.pool("collector").slot(0).assign("task-7")
 await tinyray.apool("collector").slot(0).assign("task-7")
 ```
 
-Underneath it is ordinary HTTP, so nothing is lost for debugging with `curl`:
+From 0.18, both method calls and registry traffic use native persistent TCP.
+Endpoints are bare `host:port`; every message is a big-endian `u32` length
+followed by MessagePack. There is no HTTP/JSON compatibility listener.
 
-```bash
-curl -X POST http://host:port/call/assign -d '{"task":"t"}'
-curl http://host:port/_methods
+```text
+call  = {v: 1, id, from, to, op: "call", method, body: <MessagePack bytes>}
+reply = {v: 1, id, status, body: <MessagePack bytes>, error?, batch_index?, completed?}
 ```
+
+Rust owns framing, persistent connection pooling, correlation and admission;
+Python owns standard dataclass and typed-container conversion. See
+[`examples/15_native_rpc.py`](examples/15_native_rpc.py) for a raw socket probe.
+Method frames are capped at 32 MiB before allocation and admitted through
+bounded global/per-server connection and byte budgets.
 
 Seats, tenures and a frozen roster:
 
@@ -102,7 +110,7 @@ Python tests are grouped by subsystem:
 | `tests/discovery/` | Cached lookups, filters, subscriptions and waiting |
 | `tests/collectives/` | Epochs and roster fingerprints |
 | `tests/registry/` | Wire contracts, admission, leases, ordering and network recovery |
-| `tests/rpc/` | Calling, validation, HTTP, payloads, concurrency and call statistics |
+| `tests/rpc/` | Calling, validation, framed transport, payloads, concurrency and call statistics |
 | `tests/examples/` | Example programs and their domain logic |
 | `tests/project/` | Public API, documentation and CI contracts |
 
@@ -113,8 +121,17 @@ with, for example, `pytest tests/rpc/ -q`. Rust tests remain in their crates.
 
 ## How it is built
 
-Around 2,900 lines: a Rust registry and client (`crates/`) behind a Python API
-(`python/tinyray/`), wired together with pyo3 and maturin.
+The Rust workspace is split into fork-safe runtime primitives (`tinyray-core`),
+shared wire types (`tinyray-proto`), native membership/cache machinery
+(`tinyray-membership`), the registry (`tinyray-registry`), the public Rust SDK
+(`tinyray`), and a thin PyO3 adapter (`tinyray-client`). The ergonomic Python
+API and Python-specific type semantics live in `python/tinyray/`.
+
+Rust applications can also embed the public `tinyray` crate directly. Its
+`MemberBuilder`, `DiscoveryPool`, `Snapshot`, `Epoch`, `Router`, `Service`,
+`Client`, and `Target` APIs use the same registry, Arc-backed discovery cache,
+event-driven waits, and multiplexed MessagePack transport without Python or PyO3; see
+[`crates/tinyray/examples/rust_service.rs`](crates/tinyray/examples/rust_service.rs).
 
 Every behaviour in here was measured before it was changed, and every one of
 them has an entry in `mutation_check.py` -- put the bug back, and a named test

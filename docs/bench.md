@@ -10,12 +10,18 @@ python bench.py --json out.json       # 机器可读
 python bench.py --only rpc_latency    # 只跑一项
 python bench.py --check               # 对着 bench-baseline.json 比，退化就非零退出
 python bench.py --only point_lookup rpc_batch
-python bench.py --only rpc_models     # dict、dataclass、Pydantic 与手写转换
+python bench.py --only rpc_models     # dict、dataclass、类型化容器与手写转换
+python bench.py --only rust_service   # Rust handler 与 Python/GIL handler 对照
+python bench.py --only blobref        # 普通 bytes 与 Linux 同机 sealed memfd
+python bench.py --only filter_index   # 100/1,000/5,000 成员标量过滤冷/热路径
+python bench.py --only registry_connections  # 1000 成员持久连接与逐拍重连 A/B
+python bench.py --only idle_waiters    # 1000 个安静 watcher 是否被 heartbeat 惊醒
 python bench.py --only discovery watch_wakeup --coalesce-ms 1
 ```
 
-每个场景都做特性探测：这一份脚本要能跑在老 wheel 上，做不到的报 `n/a` 而不是
-崩掉，否则没法跨版本比。
+每个场景都做特性探测：同一代 wire 里做不到的报 `n/a` 而不是崩掉。
+0.18 的原生注册中心和方法传输都是硬切换，没有 HTTP fallback；更老的 wheel
+要用与它配套的历史 benchmark 脚本。
 
 已知缺失的功能标记为 `unsupported`；执行失败则报错并非零退出。`--check` 还会
 拒绝缺失指标、空比较、旧基线格式和不同的工作负载设置，不会把失败测量当成变快。
@@ -25,42 +31,166 @@ python bench.py --only discovery watch_wakeup --coalesce-ms 1
 或校准硬件改变后，用 `--json` 重录基线；低延迟参数不能和默认参数的基线混比。
 
 `rpc_latency` / `rpc_throughput` 保留历史上的同进程拓扑；独立服务进程用
-`rpc_latency_separate` / `rpc_concurrency`。`rpc_batch` 比较同样的 32 项逻辑
+`rpc_latency_separate` / `rpc_concurrency`。`rpc_concurrency` 量
+1/4/8/32/128 个调用方的吞吐、p50/p99 与物理客户端连接数，能区分“真复用”与
+“只是多开 socket”。`rpc_batch` 比较同样的 32 项逻辑
 操作逐个调用和合成一批的代价，不混淆请求数与操作数。`point_lookup` 使用最多
-5,000 个成员的稳定座位池；`all_filtered_ms` 和 `pick_filtered_ms` 各量自己的操作。
-`rpc_models` 交错测普通 dict、自动 dataclass/Pydantic 和应用手写的同等转换，
+5,000 个成员的稳定座位池，并把 `snapshot_ms`（只创建原生冻结视图）与
+`snapshot_materialize_ms`（第一次生成全部 Handle）分开；另报冻结视图的
+len/slot/get、已满足的 `wait(count)`、epoch 创建与 epoch 物化。state 路径同时
+分开记录第一次批量解码（`all_state_ms` / `snapshot_state_ms`）和同一批 Handle
+再次直接读取 slot（`cached_all_state_ms` / `cached_snapshot_state_ms`）。
+5,000 成员五轮中位数分别为 4.8658 / 5.0067 ms 和 0.1648 / 0.2499 ms；
+Handle-only 的 all / snapshot 物化为 1.3480 / 1.3778 ms。
+`all_filtered_ms` 和 `pick_filtered_ms` 各量自己的操作。
+`filter_index` 在 100/1,000/5,000 成员下分别报告 count、pick、all、wait 的冷构建
+与热命中，并记录当前条目/字节数和全部配置上限。5,000 成员三轮中位数：热 count
+0.000561 ms、热 pick 0.001783 ms；第一次构建分别为 0.444125/0.447807 ms。
+缓存一份含 625 个成员的结果估算 5,143 字节；热 all/wait 仍要物化这些匹配者，
+分别为 0.160748/0.162572 ms。
+`rpc_models` 交错测普通 dict、自动 dataclass/类型化容器和应用手写的同等转换，
 同时报告纯 codec 微秒数与完整 RPC 往返，避免把网络成本冒充序列化成本。
 
 默认 50 ms 合并预算是请求量与延迟的取舍，不是网络下限。`discovery` 量突发变化，
 `discovery_spaced` 每 150 ms 变一次；显式调整 `coalesce_ms` 再比较不同策略。
+`idle_beat_rate` 同时报窗口内新连接数和复用次数；`registry_connections` 让
+1,000 个成员各发 6 拍，持久模式 6,000 拍只 accept 1,000 次，逐拍重连则
+accept 6,000 次，减少 **83.3%**，frame 数和成功 beat 数都保持 6,000。
+该场景还要求 1,000 份租约全部仍在、失败 beat 为 0，并同时报告持久/逐拍重连的
+p50/p99/max 延迟；benchmark gate 监控两种模式的中位延迟比。
+`idle_waiters` 在同一事件循环挂 1,000 个安静 watcher，再等四拍续租；当前五轮
+中位为 **0 次重检、0 次 discovery wake、1.684 ms CPU**。旧的逐拍广播会产生
+4,000 次重检、约 55 ms CPU，因此 `rechecks` 和 `watch_wakeups` 都是硬 gate。
+
+按最小负载扩连接后三轮独立进程中位数：8 个调用方 12,552 calls/s、32 个
+12,253、128 个 11,543。4/8 调用方分别用 2/4 条客户端连接，32/128 仍封顶 4 条；
+128 调用方比一调用一连接减少 96.875%。8 调用方 p50/p99 为
+0.602158/1.832874 ms，三轮 p99 全部不超过 2.734274 ms。
+
+`rust_service` 用同一个独立 Rust SDK client 和同一套 native transport 分别调用
+Python 与 Rust handler，三轮中位数：
+
+| 工作量 | Python handler | Rust handler |
+|---|---:|---:|
+| raw no-op p50 | 0.174334 ms | **0.097581 ms** |
+| 64 KiB p50 | 0.339040 ms | **0.216983 ms** |
+| typed payload p50 | 0.181216 ms | **0.098363 ms** |
+| 32 项 batch | 0.364817 ms | **0.114883 ms** |
+| 8 调用方 | 14,233/s | **56,090/s** |
+| 32 调用方 | 13,703/s | **114,551/s** |
+| 128 调用方 | 13,184/s | **129,489/s** |
+
+两边在 8/32/128 调用方时都使用 4 条客户端连接。Rust handler 直接在 Tokio
+执行；Python handler 走同一 listener/transport 上的兼容 adapter。
+
+`rust_discovery` 比较公开 Rust SDK 的 Arc-backed view 与旧 `Member::members()`
+owned clone。100/1,000/5,000 成员三轮中位数中，snapshot 创建均约
+0.00007 ms；5,000 个 `MemberRef` 物化约 0.0778 ms，而完整 member/state clone
+约 2.518 ms，快 **34.1 倍**。warm filter count 约 0.00027 ms，pick 约
+0.00033 ms。运行前需构建
+`cargo build --release -p tinyray --example rust_discovery_bench`。
+
+`rpc_copy_profile` 把 payload clone、envelope encode 和 decode 分开测量。服务端
+改用 borrowed MessagePack request 后，64 KiB payload 的 decode + 单次 Arc-owned
+copy 为 1.693 us，旧 owned decode 为 81.782 us，约快 **48.5 倍**；1 MiB 为
+30.136 / 59.911 us，约快 **2.0 倍**。三轮端到端中位数里，普通 64 KiB RPC
+从基线 0.4443 ms 降到 0.4104 ms，Rust handler 64 KiB 从 0.2170 ms 降到
+0.1786 ms。wire 与公开 API 均未改变。
+
+`rust_runtime` 直接统计 serving Rust member 的 native worker：membership 固定
+2 个，RPC client/server 共用 4 个，总计 **6 个**；合并前是 2 + 4 + 4，共
+10 个。三次冷 join 为 0.94–1.18 ms，中位 1.02 ms。公共 `RpcRuntime` 也允许
+应用显式让多个 client/server 共用同一 worker pool。
+
+`blobref` 把一次创建复制、复用调用和映射访问分开报告。三轮中位数：
+
+| 16 MiB 拓扑 | 普通 bytes 调用 | 复用 BlobRef 调用 | Blob wire |
+|---|---:|---:|---:|
+| Python 同进程 | 24.446 ms | **0.329 ms** | 166 B |
+| Python 跨进程 | 24.630 ms | **0.311 ms** | 167 B |
+| Rust 同进程 | 160.679 ms | **0.150 ms** | 165 B |
+| Rust 跨进程 | 63.360 ms | **0.179 ms** | 168 B |
+
+普通 MessagePack 参数为 16,777,236 字节。BlobRef 创建是独立的一次复制（Python
+约 7 ms，Rust 同进程校准 12.8 ms）；之后的复用调用和 mmap 访问基本不随大小增长。
 
 注册中心的独立测量可构建运行 `crates/tinyray-registry/examples/perf_registry.rs`。
-它明确区分拥有数据的应答组装与 HTTP/共享应答，不把前者冒充端到端吞吐。
+它明确区分拥有数据的应答组装与原生 framed MessagePack/共享应答，不把前者冒充
+端到端吞吐。
 
-### 类型化 RPC 实测
+### 原生方法 RPC 硬切换实测（0.18）
 
-Python 3.12.13、24-vCPU AMD EPYC，同一进程拓扑，五种路径每轮轮换顺序，各跑
-1,000 次，下面是三次独立运行的中位数：
+Python 3.11.15、24-vCPU AMD EPYC，同机顺序比较 PyPI 0.17.0 wheel
+（HTTP/JSON）和 0.18 release-mode 原生 TCP/MessagePack，各跑三次取中位数。
+这台机器是共享环境，一分钟 load average 在 12.7–16.5 之间，所以这些数已记录、
+可复现，但**不是**空闲机噪声校准。
 
-| 路径 | 编码 | 恢复 | RPC p50 |
+| 场景（除注明外均为 p50） | 0.17 HTTP | 0.18 native | 变化 |
 |---|---:|---:|---:|
-| 普通 dict | 5.13 us | — | 0.7123 ms |
-| 自动 dataclass | 5.58 us | 1.33 us | 0.7305 ms |
-| 手写 dataclass 转换 | — | — | 0.7239 ms |
-| 自动 Pydantic | 6.37 us | 1.74 us | 0.7540 ms |
-| 手写 Pydantic 转换 | — | — | 0.7571 ms |
+| 同进程调用 | 0.7735 ms | **0.2326 ms** | -69.9% |
+| 独立进程调用 | 0.6982 ms | **0.2705 ms** | -61.3% |
+| 异步调用 | 1.4525 ms | **0.3675 ms** | -74.7% |
+| 抛异常调用 | 0.9130 ms | **0.4289 ms** | -53.0% |
+| 32 项 batch 总耗时 | 1.3109 ms | **0.4841 ms** | -63.1% |
+| 1 / 4 / 8 并发调用方 | 1,342 / 1,204 / 1,019 次/秒 | **3,175 / 6,588 / 6,383 次/秒** | +137% / +447% / +526% |
+| 普通 model-shaped dict | 0.8211 ms | **0.3417 ms** | -58.4% |
+| dataclass | 0.8406 ms | **0.2719 ms** | -67.7% |
+| 64 KiB 字符串回声 | 1.0201 ms | **0.4470 ms** | -56.2% |
 
-自动 Pydantic 已不慢于应用手写 `model_dump()` / `model_validate()`；自动 dataclass
-比手写最佳路径多约 6.6 us，即完整调用的 0.9%。普通 RPC 对旧 `json.dumps` 与
-新缓存编码器做六轮平衡 A/B，p50 中位数为 0.6725/0.6717 ms，没有可测回退。
+第一版硬切换记录的 64 KiB +105.3% 退化来自在 Python/Rust 边界把 bytes 直接提取
+成 `Vec<u8>`。所有三处边界改成 `PyBackedBytes` 后，三轮中位数变为 0.3758 ms；
+最终 MemberRef/Pydantic-free build 的三次复测为 0.4470 ms（仍比 0.17 快
+56.2%），没有越过既有回归门。1 MiB 的提示线及“只警告、不拒绝”语义不变，数据面仍应
+传引用而不是把大块内容塞进控制面。
+
+0.18 不再提供 Pydantic benchmark 或 extra；`rpc_models` 的新三轮中位数只包含
+普通值、标准 dataclass、TypedDict/NamedTuple 容器和 100 项 dataclass batch：
+编码 plain/dataclass/typed-container 分别为 0.641/0.742/0.871 us，恢复 dataclass
+和 typed-container 为 0.772/1.052 us；完整 RPC p50 为
+0.2675/0.2719/0.2763 ms，100 项 batch 为 0.4934 ms。旧 Pydantic workload 已删除，
+不能把它的 payload 大小与新 dataclass batch 直接作同工作量比较。
+
+后续完整审计发现 BlobRef 安全层曾让**没有 BlobRef** 的普通值也无条件创建
+thread-local encode/decode scope。改为先走无扩展快速路径、遇到 MessagePack
+extension 才重试受控路径后，五轮中位数为 0.681/0.781/0.911 us 和
+0.862/1.142 us；完整 plain/dataclass/typed RPC p50 为
+0.2535/0.2605/0.2629 ms。上述五个 codec 固定成本现在都进入 benchmark gate。
+
+### 原生 Snapshot/Epoch 视图实测
+
+同一台共享 24-vCPU 主机、同一份 0.18 原生 RPC 代码。原始架构结果取三轮中位数，
+最终 state 路径取五轮中位数。5,000 成员的 `snapshot()` 现在只创建缓存的
+Arc-backed 原生视图；`snapshot().members` 单独量第一次 Handle 物化。
+
+| 操作 | 改前 | 改后 | 变化 |
+|---|---:|---:|---:|
+| 5,000 成员 `snapshot()` 创建 | 4.0072 ms | **0.001032 ms** | -99.97% |
+| 5,000 成员全部 Handle 物化 | 4.0072 ms | **1.3778 ms** | -65.6% |
+| 5,000 成员 `all()` | 4.0622 ms | **1.3480 ms** | -66.8% |
+| 5,000 成员冻结视图 `len()` | — | **0.000230 ms** | 新指标 |
+| 5,000 成员冻结视图 `slot()` / `get()` | — | **0.000712 / 0.000611 ms** | 新指标 |
+| 5,000 成员 `epoch()` 创建 | — | **0.001664 ms** | 新指标 |
+| 1,000 成员 `epoch()` 创建 | 0.7953 ms | **0.001648 ms** | -99.8% |
+| 5,000 成员 `pool.slot()` / `pick()` | 0.002144 / 0.002214 ms | **0.001353 / 0.001373 ms** | 更快 |
+
+Handle 物化不复制 state。第一次访问全部 5,000 份 state 时，名单级批量编码和
+单次 decode 让 `all()` / snapshot 总计 4.8658 / 5.0067 ms；同一批 Handle
+再次读取真实 state slot 只需 0.1648 / 0.2499 ms。对用户实测的 0.17 五轮中位数，
+这四条路径分别快 4.9%、4.8%、5.8%、3.9%，而 Handle-only 仍快约 67%。
+有界标量索引把 5,000 成员已满足的
+`wait(count=1, idx=...)` 从 0.4823 ms 降到 0.003246 ms；嵌套或容器过滤仍走
+语义完全相同的 O(n) 扫描。方法 RPC 多路复用后，普通 p50/p99 为
+0.263066/0.399071 ms、64 KiB 为 0.444255/0.731057 ms、32 项 batch
+0.564224 ms，独立进程 8 调用方在 4 条连接上为 12,552 calls/s。
 
 ## 基线
 
-当前格式 2 基线取三个独立优化版运行的逐指标中位数，再用两次独立运行核对；
-23 项受监控指标两次都通过。相对容差仍为 20%，叠加按噪声校准的绝对下限。
-亚毫秒 `flush()` 的绝对下限现为 0.1 ms，不再沿用历史上的 50 ms。
+当前格式 2 基线取上面那台共享主机的三次 0.18 release 运行逐指标中位数；
+calibration metadata 明确记录 `host_idle: false` 和当时的 load 范围。最后一次独立
+核对受监控指标全部通过。相对容差仍为 20%，叠加按噪声校准的绝对下限；
+亚毫秒 `flush()` 的绝对下限是 0.1 ms。
 
-### 本次优化实测
+### 早先的优化实测（0.16）
 
 同一份脚本、Python 3.11.15、同一台 24-vCPU AMD EPYC 机器，顺序运行，不与
 测试或构建并发。修前使用保留的 v0.15.0 wheel，修后使用 v0.16.0 的优化代码，
@@ -81,7 +211,7 @@ Python 3.12.13、24-vCPU AMD EPYC，同一进程拓扑，五种路径每轮轮�
 1.12 ms，按逻辑操作计约快 18.5 倍。单次 RPC 仍在约 0.69 ms。
 
 注册中心独立基准中，已同步游标的拥有数据应答组装从 39.4 us 降至 0.58 us，
-长历史的新单项 delta 从 2.29 us 降至 0.73 us。另一个 HTTP 探针中，共享约
+长历史的新单项 delta 从 2.29 us 降至 0.73 us。另一个原生 wire 探针中，共享约
 1 MiB 名单的往返从 3.27 ms 降至 2.84 ms；组装收益不能冒充网络吞吐倍数。
 
 缓存以有界内存换重复读取速度：客户端每个池最多保留两份各 1 MiB 的序列化快照

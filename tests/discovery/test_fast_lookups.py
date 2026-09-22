@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import multiprocessing
 import os
 import time
 from contextlib import ExitStack
 
-import httpx
+import msgspec
 import pytest
 import tinyray
 from tinyray._tinyray import Client
+
+from tests.support.registry_wire import beat
 
 
 @pytest.fixture
@@ -26,7 +27,7 @@ def fleet(registry):
         ]:
             state["nested"] = {"items": [3], "meta": {"value": "original"}}
             peer = Client(
-                endpoint=f"http://{registry.endpoint}",
+                endpoint=registry.endpoint,
                 pool="fast",
                 policy="stateful",
                 id=ident,
@@ -37,7 +38,7 @@ def fleet(registry):
                 coalesce_ms=0,
             )
             cleanup.callback(peer.leave)
-            peer.set_state(json.dumps(state), ready)
+            peer.set_state(msgspec.msgpack.encode(state), ready)
             peer.watch(["fast"])
             assert peer.start()
             assert peer.accepted
@@ -57,26 +58,20 @@ def test_single_member_lookups_never_materialize_the_roster(fleet, monkeypatch, 
         pytest.fail("single-member lookup materialized the full roster")
 
     monkeypatch.setattr(pool, "_members", no_roster)
-    decoded = []
-    original_decode = tinyray._json_decode
-
-    def decode_one(raw):
-        value = original_decode(raw)
-        assert isinstance(value, dict), "only one member should cross the boundary"
-        decoded.append(value["id"])
-        return value
-
-    monkeypatch.setattr(tinyray, "_json_decode", decode_one)
     picked = pool.pick(tag="two")
     seated = pool.slot(0)
-    expected_type = tinyray.AsyncHandle if pool_type is tinyray.AsyncPool else tinyray.Handle
+    expected_type = pool._handle_cls
     assert type(picked) is expected_type
     assert type(seated) is expected_type
     assert picked.id == 902 and picked.slot == 2
     assert seated.id == 104 and not seated.ready
     assert picked._methods == ("ping",)
     assert picked.ping is not None
-    assert decoded == [902, 104]
+    assert picked._native is not None and seated._native is not None
+    assert getattr(picked, "_state", tinyray._STATE_UNMATERIALIZED) is tinyray._STATE_UNMATERIALIZED
+    assert getattr(seated, "_state", tinyray._STATE_UNMATERIALIZED) is tinyray._STATE_UNMATERIALIZED
+    assert picked.state["tag"] == "two"
+    assert seated.state["tag"] == "zero"
     with pytest.raises(tinyray.NotFound):
         pool.slot(0, require_ready=True)
 
@@ -121,7 +116,7 @@ def test_slots_are_not_wire_ids_and_missing_slots_never_fall_back(fleet, pool_ty
 def test_duplicate_slots_choose_the_lowest_eligible_wire_id(fleet, registry):
     _, pool, _ = fleet
     duplicate = Client(
-        endpoint=f"http://{registry.endpoint}",
+        endpoint=registry.endpoint,
         pool="fast",
         policy="stateful",
         id=5,
@@ -132,13 +127,15 @@ def test_duplicate_slots_choose_the_lowest_eligible_wire_id(fleet, registry):
         coalesce_ms=0,
     )
     try:
-        duplicate.set_state('{"tag":"duplicate"}', False)
+        duplicate.set_state(msgspec.msgpack.encode({"tag": "duplicate"}), False)
         assert duplicate.start() and duplicate.accepted
         pool.until(lambda snap: len(snap) == 4, timeout=5)
         for view in [pool, tinyray.apool("fast")]:
             assert view.slot(2).id == 5
             assert view.slot(2, require_ready=True).id == 902
-        duplicate.set_state('{"tag":"duplicate"}', True)
+            assert view.snapshot().slot(2).id == 5
+            assert view.snapshot(include_unready=False).slot(2).id == 902
+        duplicate.set_state(msgspec.msgpack.encode({"tag": "duplicate"}), True)
         pool.wait(count=3, timeout=5)
         assert pool.slot(2, require_ready=True).id == 5
         duplicate.leave()
@@ -164,7 +161,7 @@ def _same_native_value(actual, expected):
         assert actual == expected
 
 
-def test_native_json_readers_match_stdlib_on_actual_native_output(registry):
+def test_native_messagepack_preserves_values_on_actual_native_output(registry):
     state = {
         "floats": [
             -0.0,
@@ -212,24 +209,28 @@ def test_native_json_readers_match_stdlib_on_actual_native_output(registry):
             for require_ready in [False, True]:
                 for _ in range(2):  # cold and cached serialization
                     raws = [
-                        native.lookup(pool._name, "{}", require_ready),
+                        native.lookup(pool._name, msgspec.msgpack.encode({}), require_ready),
                         native.lookup(
-                            pool._name, json.dumps({"publication": publication}), require_ready
+                            pool._name,
+                            msgspec.msgpack.encode({"publication": publication}),
+                            require_ready,
                         ),
                         native.frozen(pool._name, require_ready)[0],
-                        native.choose(pool._name, "{}", require_ready),
+                        native.choose(pool._name, msgspec.msgpack.encode({}), require_ready),
                         native.lookup_slot(pool._name, 0, require_ready),
                     ]
                     for raw in raws:
-                        _same_native_value(tinyray._json_decode(raw), json.loads(raw))
-            expected = json.loads(native.lookup_slot(pool._name, 0))["state"]
+                        decoded = msgspec.msgpack.decode(raw)
+                        member = decoded[0] if isinstance(decoded, list) else decoded
+                        _same_native_value(member["state"], {**state, "publication": publication})
+            expected = msgspec.msgpack.decode(native.lookup_slot(pool._name, 0))["state"]
             assert expected["publication"] == publication
             for view in [pool, tinyray.apool(pool._name)]:
                 for handle in [view.all()[0], view.snapshot().slot(0), view.pick(), view.slot(0)]:
                     _same_native_value(handle.state, expected)
 
 
-def test_cached_native_json_never_shares_mutable_python_state(fleet):
+def test_cached_native_messagepack_never_shares_mutable_python_state(fleet):
     _, pool, _ = fleet
     readers = [
         lambda: pool.all(tag="one")[0],
@@ -249,24 +250,43 @@ def test_cached_native_json_never_shares_mutable_python_state(fleet):
             assert "local" not in state
 
 
+def test_roster_state_batch_decodes_only_once(fleet, monkeypatch):
+    _, pool, _ = fleet
+    decode = tinyray._msgpack_decode
+    calls = 0
+
+    def counted(raw):
+        nonlocal calls
+        calls += 1
+        return decode(raw)
+
+    monkeypatch.setattr(tinyray, "_msgpack_decode", counted)
+    handles = pool.snapshot().members
+    assert calls == 0
+    assert handles[0].state["tag"] == "zero"
+    assert handles[1].state["tag"] == "one"
+    assert handles[2].state["tag"] == "two"
+    assert calls == 1
+
+
 def test_all_and_frozen_share_order_but_readiness_has_its_own_fingerprint(fleet):
     _, pool, peers = fleet
     for _ in range(3):
         all_raw, all_hash, roster, version = pool._c.frozen("fast", False)
         ready_raw, ready_hash, ready_roster, ready_version = pool._c.frozen("fast", True)
-        assert [m["id"] for m in json.loads(all_raw)] == [104, 703, 902]
-        assert [m["id"] for m in json.loads(ready_raw)] == [703, 902]
+        assert [m["id"] for m in msgspec.msgpack.decode(all_raw)] == [104, 703, 902]
+        assert [m["id"] for m in msgspec.msgpack.decode(ready_raw)] == [703, 902]
         assert all_hash == roster == ready_roster
         assert ready_hash != roster
         assert version == ready_version
-    peers[0].set_state('{"tag":"zero","changed":true}', True)
+    peers[0].set_state(msgspec.msgpack.encode({"tag": "zero", "changed": True}), True)
     pool.wait(count=3, timeout=5)
     assert pool.pick(tag="zero").state["changed"] is True
     assert pool.slot(0, require_ready=True).ready
     raw, mine, whole, new_version = pool._c.frozen("fast", True)
     assert mine == whole == roster
     assert new_version > version
-    assert len(json.loads(raw)) == 3
+    assert len(msgspec.msgpack.decode(raw)) == 3
 
 
 def test_state_digests_replacement_and_removal_invalidate_warm_paths(fleet, registry):
@@ -275,7 +295,7 @@ def test_state_digests_replacement_and_removal_invalidate_warm_paths(fleet, regi
     before = pool._c.field_digest("fast", ["tag", "ready", "url"])
     pool.snapshot()
     pool.all()
-    peers[1].set_state('{"tag":"updated"}', False)
+    peers[1].set_state(msgspec.msgpack.encode({"tag": "updated"}), False)
     pool.until(lambda snap: snap.slot(1).state.get("tag") == "updated", timeout=5)
     assert pool._c.field_digest("fast", ["tag", "ready", "url"]) != before
     assert not pool.slot(1).ready
@@ -284,7 +304,7 @@ def test_state_digests_replacement_and_removal_invalidate_warm_paths(fleet, regi
     assert old.state["tag"] == "one"
 
     replacement = Client(
-        endpoint=f"http://{registry.endpoint}",
+        endpoint=registry.endpoint,
         pool="fast",
         policy="stateful",
         id=703,
@@ -295,7 +315,7 @@ def test_state_digests_replacement_and_removal_invalidate_warm_paths(fleet, regi
         coalesce_ms=0,
     )
     try:
-        replacement.set_state('{"tag":"replacement"}', True)
+        replacement.set_state(msgspec.msgpack.encode({"tag": "replacement"}), True)
         assert replacement.start()
         got = pool.wait_replacement(identity=old.identity, timeout=5)
         assert got is not None and got.incarnation == 2
@@ -320,24 +340,22 @@ def test_unknown_and_restarted_pools_drop_every_warm_index(registry):
         for lookup in [empty.pick, lambda: empty.slot(0)]:
             with pytest.raises(tinyray.NotFound):
                 lookup()
-        with httpx.Client(trust_env=False) as wire:
-            response = wire.post(
-                f"http://{registry.endpoint}/v1/beat",
-                json={
-                    "pool": "fast",
-                    "id": 997,
-                    "slot": 2,
-                    "incarnation": 1,
-                    "policy": "stateful",
-                    "size": 3,
-                    "state": {"tag": "old"},
-                    "ready": True,
-                    "watch": [],
-                    "seen": {},
-                },
-            )
-            response.raise_for_status()
-            assert response.json()["accepted"]
+        response = beat(
+            registry.endpoint,
+            {
+                "pool": "fast",
+                "id": 997,
+                "slot": 2,
+                "incarnation": 1,
+                "policy": "stateful",
+                "size": 3,
+                "state": {"tag": "old"},
+                "ready": True,
+                "watch": [],
+                "seen": {},
+            },
+        )
+        assert response["accepted"]
         pool = tinyray.pool("fast")
         assert pool.wait(timeout=5)[0].id == 997
         assert pool.slot(2).id == 997

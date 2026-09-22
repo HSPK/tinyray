@@ -1,0 +1,15 @@
+[package]
+name = "tinyray-membership"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tinyray-core = { path = "../tinyray-core" }
+tinyray-proto = { path = "../tinyray-proto" }
+serde_json.workspace = true
+rmp-serde.workspace = true
+tokio.workspace = true
+fastrand = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

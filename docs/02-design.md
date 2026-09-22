@@ -115,7 +115,7 @@ h.url
 
 ### 数据结构：6 个
 
-**线上跑的只有两条消息**，全系统没有第三种格式：
+**membership 线上只有两种 payload**：
 
 ```python
 Beat:                             # 我发出去的
@@ -141,6 +141,10 @@ PoolDelta:
     full:    bool                 # true = 你落后太多了，这是全量
 ```
 
+它们外面统一套 registry envelope，并用 `u32` 大端长度前缀加 MessagePack。
+方法 RPC 是另一组 request/reply envelope，但复用同一个 framing helper；应用参数
+在 `body` 里是 opaque MessagePack bytes，transport 不解释 Python 类型。
+
 ```python
 Member:                           # 你看得到的
     slot, incarnation, url, state, ready
@@ -156,10 +160,19 @@ Member:                           # 你看得到的
 **本地两个对象**：
 
 ```python
-Handle:  slot, incarnation, url, state, <方法名> → 调用代理
-Epoch:   members: list[Handle]
-         valid:   bool          # 现在的名单指纹 == 冻住时的指纹
+Handle:    NativeMember(Arc<Member>) + 可写覆盖
+           state: dict              # 第一次访问才复制并缓存
+           <方法名> → 调用代理
+Snapshot:  Arc<Member> 名单 + 原生 id/slot 索引
+           members: tuple[Handle]   # 第一次访问/迭代时才物化一次
+Epoch:     同一份冻结原生视图
+           members: tuple[Handle]   # 同样懒物化
+           valid:   bool            # 现在的名单指纹 == 冻住时的指纹
 ```
+
+每个缓存 pool 最多保留 all/ready 两份原生视图。成员更新时换一个 `Arc<Member>` 并
+同时失效序列化快照、摘要和原生视图；已经交出去的 Snapshot/Epoch 继续持有旧 Arc，
+所以 state 很大时也不复制，缓存变化或注册中心重启也改不动冻结值。
 
 ### 为什么要两个数字
 
@@ -198,28 +211,75 @@ XOR 是自反的，所以进来和出去是同一个 O(1) 操作，不用重算�
 
 ## 3. join 之后，你的进程里多了什么
 
-三样东西，第三样是可选的：
+### 代码分层
 
+```text
+tinyray-core
+  └─ fork-safe FdTable
+
+tinyray-proto
+  ├─ registry / RPC envelope
+  └─ framing、大小限制、listener helper
+
+tinyray-membership
+  ├─ cache.rs       roster、索引、冻结视图
+  ├─ wait.rs        count/departure/replacement waiter
+  ├─ shared.rs      publication、revision、通知域
+  └─ heartbeat.rs   persistent registry connection + long poll
+
+tinyray-registry
+  └─ lease、fencing、publication ordering、delta log
+
+tinyray
+  ├─ Member / DiscoveryPool
+  ├─ transport/client.rs
+  ├─ transport/server.rs
+  ├─ Router / Service
+  └─ BlobRef
+
+tinyray-client
+  └─ PyO3 adapter；不再维护第二套 RPC transport
+
+python/tinyray
+  └─ Python API、签名绑定、类型恢复和异常语义
 ```
+
+`tinyray-core` / `proto` 是叶子层；membership 和 registry 互不依赖；公开
+`tinyray` crate 组合 membership 与 method RPC；`tinyray-client` 只负责把这套
+Rust 内核交给 Python，并把 registry binary 一起装进 wheel。
+
+### 进程和线程
+
+典型 Python 进程有两套不依赖 GIL 的 native runtime：
+
+```text
 一个 Python 进程
-├─ 主线程         你的代码（Megatron / SGLang / agent）
-│                 ↑ 可能长时间占着 GIL
-├─ [Rust] 固定 2 个系统线程
-│   ├─ 心跳        不碰 Python，GIL 归谁跟它无关
-│   └─ 名单缓存    存在 Rust 那边的内存里
-└─ [Python] 一个小 server + 线程池
-               只在你给了 serves= 时才有
+├─ 主线程 / event loop
+│   └─ 你的代码（Megatron / SGLang / agent）
+├─ [Rust membership] 固定 2 个 worker
+│   ├─ heartbeat + persistent registry connection
+│   └─ roster cache / long-poll wakeup
+├─ [Rust RPC] 进程共享 4 个 worker（第一次调用或 serves= 时创建）
+│   ├─ multiplexed client connections
+│   └─ native listener / framing / admission
+└─ [Python handler adapter] 只在 serves= 时存在
+    └─ Rust listener 进入 blocking worker，再拿 GIL 执行签名与方法
 ```
 
-**只有心跳必须是 Rust。** 收调用那部分留在 Python ——
-拦掉一个过期调用是罕见的错误路径，而正常调用要进 Python 照样得拿 GIL，
-写成 Rust 几乎不省什么。
+旧实现只有 heartbeat 在 Rust，方法 listener、连接和 framing 在 Python。现在凡是
+**必须在 GIL 被占住时继续推进的状态机**都在 Rust：heartbeat、long poll、cache、
+RPC reader/writer、timeout、cancel、fencing、backpressure 和 Blob ACK。
 
-**不给 `serves=` 就不起 server，连端口都不占。**
+Python 只保留必须知道动态语言语义的部分：签名绑定、dataclass/TypedDict 恢复、
+Python exception 和真正的应用 handler。Rust `Service` 则从 listener 直接在 Tokio
+上 await，完全不进 Python。
+
+**不给 `serves=` 就不起 listener，连端口都不占。** 出站 RPC client 按需创建并
+复用进程级 runtime。
 
 ### 为什么不能用 Python 线程
 
-这是用 Rust 的**唯一理由**。
+这是最初引入 Rust 的理由，也是后来把 transport/state machine 继续下沉的判断标准。
 
 Python 线程要跑任何一行代码，都得先拿到 GIL。假设主线程正卡在
 `dist.all_reduce()` 里 —— Megatron **通常**会把 GIL 放开，心跳线程能跑。
@@ -232,7 +292,7 @@ Rust 起的是系统线程，**只要它不去调 Python，主线程在干嘛跟
 心跳不调 Python。**实测**：抢 GIL 的时候，系统线程只慢 **1.04 倍**，
 Python 发起的慢 **49 倍**。
 
-一句话：**「再忙也必须能应答」的放 Rust，剩下全放 Python。**
+一句话：**「再忙也必须继续推进」的放 Rust；必须理解 Python 对象的才留 Python。**
 
 （也想过起个独立的小进程。放弃了：方法调用要跨进程传参数，
 又绕回序列化；而且那个小进程被 OOM killer 干掉，主进程根本不知道。）
@@ -274,18 +334,19 @@ barrier 要的是单调的证据（「到过至少 N」），通讯录给的是�
 
 ### 所以 collective 的成员几乎不该暴露方法
 
-心跳在 Rust 那边，**进程再忙也一定应答**；
-你的业务方法要 GIL，**卡在 Python 里就答不了**。
+心跳和方法 transport 都在 Rust 那边，进程再忙仍能续租、收 frame、执行 fencing
+和 timeout；但 Python 业务方法最终仍要 GIL，**卡在 Python 里就跑不了 handler**。
+如果服务本身实现为 Rust `Service`，则没有这层限制。
 所以一个 trainer rank 卡在 `all_reduce` 里的时候，
 它**活着，但你叫不动它**。
 
-真实的框架正好印证：训练 worker 通常**不起独立的 HTTP 服务**，只有负责派发的
+真实的框架正好印证：训练 worker 通常**不起独立的 RPC 服务**，只有负责派发的
 那几个 rank 才起 server。它们能工作是因为训练框架在 C 扩展里放开了 GIL，
 **这是运气，不是设计**。
 
 **那训练进程收 batch 怎么办？batch 根本不走这一层。**
 常见做法是先发一条元数据，**然后用 `dist.send` 发张量**。
-HTTP 上走的只有那条元数据。
+控制通道上走的只有那条元数据。
 
 ### 四个容易踩的坑
 
@@ -441,9 +502,8 @@ pull 天生队列深度 ≤ 1 —— **任务被领走的那一刻才绑定模�
 | trainer 之间 | 都不是，走 NCCL |
 
 pull 的经典反驳是轮询太贵 —— 一万个 worker 每秒问 10 次就是 100k 次/秒，
-超过实测的 57k。解法是长轮询，而**长轮询在 HTTP/1.1 下等于一万条常驻连接**，
-正是实测里把吞吐打到 0 的那个死法。h2c 之后它变成共用少数连接的 stream ——
-**这个权衡是被传输层改掉的。**
+超过实测的 57k。解法是长轮询，而长轮询仍意味着每个成员有一条在途 TCP 请求；
+这也是注册中心传输必须原生、有界、低开销的原因。
 
 ## 5. 互相调用
 
@@ -459,15 +519,15 @@ me = tinyray.join("collector", policy="stateful", slot=k,
 ```
 
 `serves=` 在 `join()` 的时候：扫出不带下划线的方法、读它们的类型标注建一张
-检查表、起一个 h2c server、把地址和方法名单写进注册记录。
+检查表、起一个 Tokio TCP listener、把裸 `host:port` 和方法名单写进注册记录。
 
 ### `h.assign(task)` 到底发生了什么
 
 ```
 你这边   查方法名单 → 没这个名字当场报错
-         打包成 JSON → 超过 1 MB 出一句警告，照发
-         POST /call/assign，头里带上 x-tinyray-target: collector/3#7
-对方     对一下任期号 → 对不上直接返回 409
+         application value 打包成 MessagePack → 超过 1 MB 出一句警告，照发
+         写一帧 call envelope，target=collector/3#7
+对方     对一下任期号 → 对不上返回 fenced status
          查方法表 → 按类型标注检查参数 → 调你写的那个方法
 ```
 
@@ -533,8 +593,9 @@ tinyray.pool("collector").slot(3).assign(task)          # 阻塞
 await tinyray.apool("collector").slot(3).assign(task)   # 异步
 ```
 
-对方不用区分：`async def` 的方法会被扔到 `join()` 时所在的事件循环上，
-同步方法走线程池。**不自己新建循环** —— 你的 httpx client 都绑在你自己的循环上。
+对方不用区分：`async def` 的方法会被投递到 `join()` 时所在的事件循环，
+同步方法走 blocking worker。**不自己新建 Python 循环** —— 应用已有的 client、
+锁和 task 都可能绑定在原来的循环上。
 
 ### 边界：30 秒、1 MB
 
@@ -568,7 +629,7 @@ tinyray 走的是 Consul 那条路，因为**它的协议里本来就有那个�
   │◀──── ack(delta) ────────│ 立刻回
 ```
 
-那条 h2 流本来就开着，只是先不关它。应答本身成了推送通道。
+那条持久 TCP 请求本来就在飞，只是先不回 frame。应答本身成了推送通道。
 
 **关键是同一个请求身兼两职，而它的延迟会自适应**：没事发生时它是一次很长的租约
 续期，有事发生时它是一次即时推送。所以客户端请求挂起的时长，就设成它本来要睡的
@@ -608,12 +669,52 @@ tinyray 走的是 Consul 那条路，因为**它的协议里本来就有那个�
 一个）。注册中心按调用方 id 加抖动摊开，「大池子只该被少数人订阅」这条原则在
 长轮询下变得更硬。
 
-底下就是 HTTP，所以 `curl` 排障的本事一点没丢：
+0.18 以后方法调用与注册中心统一为 `u32` 大端长度加 MessagePack。方法连接持久
+多路复用：一条串行 writer、一个 reader 和 request ID -> waiter 表让同一 socket
+最多承载 128 个在途调用，回复可乱序；端点/进程上限为 256/512 个在途调用，
+物理连接上限为每端点 4 条、每进程 256 条。客户端按负载最小选择连接；当每条现有
+连接都已有两个预留调用时就开下一条，避免单 writer/reader 队列过深。完整写出后
+取消或超时只删自己的 waiter，迟到回复按已知 ID 丢弃；未知/重复 ID、坏 frame
+或协议错才毒掉整条连接。每个
+客户端的心跳循环仍持有一条**严格串行**连接：完整相关的 ack 才交回下一拍，取消
+或任何协议/网络错误直接 drop socket，所以 beat 不需要 response map。端点是裸
+`host:port`，
+没有 HTTP/JSON listener。手工排障时用 socket 读写 frame，完整例子见
+`examples/15_native_rpc.py`。两个 listener 都用 socket2 请求内核的 SOMAXCONN，
+不再把 accept queue 固定在 128。方法 frame 在分配前受 32 MiB 硬上限、连接数/
+在途 frame 数和 global/per-server 字节预算约束；大 frame 与普通控制消息分预算。
+方法客户端池的 10 秒复用窗口短于方法服务端 15 秒 idle deadline；注册中心连接
+另有 35 秒 idle deadline，覆盖客户端最多 30 秒的合并间隔，同时让沉默连接必然
+收场。
 
-```bash
-curl -X POST http://collector-7:9000/call/assign -d '{...}'
-curl http://collector-7:9000/_methods
-```
+方法 client 与 listener 的 framing、连接池、admission、multiplexing、fencing、
+stats、fork 和 shutdown 现在都位于不依赖 PyO3 的公开 `tinyray` crate。Python
+同步/异步调用只把参数、取消句柄和带 Blob ACK guard 的 reply 适配到这一个
+`Client`；不会再维护第二份 socket/writer/reader 状态机。listener 接
+`Arc<dyn Service>`：Rust router future 直接在 Tokio worker 上 await，不拿 GIL、
+不经过 `spawn_blocking`；Python `serves=` 只在应用 handler adapter 内进入
+blocking pool 并拿 GIL。因此 mixed Python/Rust pool 的连接语义、方法表、
+request ID、错误分类与 batch 语义完全一致，差别只在应用 handler 从哪里执行。
+
+连接 reader 的首字节边界只竞争 `readable()` readiness，不把 consuming `read()`
+future 放进可能被 request completion、Blob activity 或 shutdown 取消的 `select!`。
+readiness 分支胜出后再用 `try_read` 取首字节，`WouldBlock` 回到事件循环。这样即使
+handler 完成和下一 frame 同时到达，也不会丢 prefix 的第一个 byte。
+
+大 payload 另有显式 `BlobRef` 路径，但只承诺 Linux 同机。descriptor 不带任意
+路径，只带 boot fingerprint、pid/fd、size、device/inode 和 sealed header token；
+接收端按这个顺序先验证再只读 mmap。发送端的 memfd 没有 `/dev/shm` 名字，最后
+一个 fd/mapping 消失时由内核回收，进程 SIGKILL 也一样。跨 boot、没有 `/proc`、
+权限不符或未 seal 都直接失败，不会偷换成复制 bytes 或网络传输。普通 bytes 路径
+仍走原 MessagePack frame。每条消息限制 64 个 BlobRef 和 512 MiB 不重复映射，
+重复 descriptor 共享同一 `Arc<BlobInner>`；进程级兜底准入继续限制直接 serde 与
+公开 descriptor 打开。调用参数 owner 随 pending/abandoned RPC 保留到迟到 reply
+或断连，响应 owner 则先通过 reply/connection/server/process 四层准入，再由
+request-ID 相关的 `blob_ack` 在接收方完成解码后释放。Rust raw API 返回带 ACK
+guard 的 `ReceivedRawReply` / `ReceivedRpcReply`，不在调用方解码前提前释放；
+guard 存活期间 client/server 都暂停普通 idle eviction，server 仍用 60 秒硬上限
+约束恶意不确认连接。client connect 在 await 前创建并登记非阻塞 socket，fork
+child 因而能连同 established socket 一起关闭正在连接的 fd。
 
 ## 6. 撑得住吗，靠谱吗
 
@@ -717,7 +818,7 @@ curl http://collector-7:9000/_methods
 | `WORLD_SIZE=0` | 声明零个座位的池子会让 `epoch()` **冻结在"此刻在场的人"**身上 —— 实测一个孤零零的成员 82ms 就冻结了一整轮 |
 | `slot >= size` | 4 个座位的世界里报 9 号，之后每一次凑齐判断都不可能成立 |
 | 负数或超大的 `RANK` | 原来会漏出 `OverflowError: can't convert negative int to unsigned` |
-| 非 ASCII 的池名、方法名、request id | 它们要进 HTTP 头和 URL；方法名 `a/b`、`a?b` 原来"能用"纯属服务端逐字读路径的巧合 |
+| 非 ASCII 的池名、方法名、request id | 它们是 protocol identity/metadata；统一限制为可打印 ASCII，避免各语言构造出不同字节 |
 
 报错点名是哪个环境变量 —— 这类问题十有八九出在 launcher 的模板里。
 

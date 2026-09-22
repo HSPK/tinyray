@@ -8,9 +8,65 @@ import subprocess
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 import tinyray
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_public_rust_sdk_has_no_python_runtime_dependency():
+    manifest = (ROOT / "crates/tinyray/Cargo.toml").read_text()
+    service_path = ROOT / "crates/tinyray/src/service.rs"
+    transport = ROOT / "crates/tinyray/src/transport"
+    source = service_path.read_text() + (ROOT / "crates/tinyray/src/transport.rs").read_text()
+    source += "".join(path.read_text() for path in transport.glob("*.rs"))
+    assert "pyo3" not in manifest.lower()
+    assert "Python::" not in source
+    assert "spawn_blocking" not in source
+
+
+def test_rust_workspace_keeps_core_membership_and_sdk_layers_separate():
+    workspace = (ROOT / "Cargo.toml").read_text()
+    core = ROOT / "crates/tinyray-core"
+    membership_manifest = (ROOT / "crates/tinyray-membership/Cargo.toml").read_text()
+    membership = (ROOT / "crates/tinyray-membership/src/lib.rs").read_text()
+    membership_dir = ROOT / "crates/tinyray-membership/src"
+    sdk = (ROOT / "crates/tinyray/src/lib.rs").read_text()
+    member = (ROOT / "crates/tinyray/src/member.rs").read_text()
+    discovery = (ROOT / "crates/tinyray/src/discovery.rs").read_text()
+
+    assert '"crates/tinyray-core"' in workspace
+    assert core.is_dir()
+    assert 'tinyray-core = { path = "../tinyray-core" }' in membership_manifest
+    assert "use tinyray_core::FdTable;" in membership
+    assert "pub(crate) use tinyray_core::{FdTable, RawFd};" in sdk
+    assert not (ROOT / "crates/tinyray-membership/src/fds.rs").exists()
+    assert len(member.splitlines()) <= 600
+    assert len(discovery.splitlines()) <= 500
+    assert {
+        "cache.rs",
+        "heartbeat.rs",
+        "shared.rs",
+        "wait.rs",
+    } <= {path.name for path in membership_dir.glob("*.rs")}
+    assert len(membership.splitlines()) <= 100
+    assert len((membership_dir / "cache.rs").read_text().splitlines()) <= 750
+    assert len((membership_dir / "heartbeat.rs").read_text().splitlines()) <= 500
+
+    transport = ROOT / "crates/tinyray/src/transport"
+    assert {"client.rs", "server.rs"} == {path.name for path in transport.glob("*.rs")}
+    assert len((ROOT / "crates/tinyray/src/transport.rs").read_text().splitlines()) <= 500
+    assert len((transport / "client.rs").read_text().splitlines()) <= 2000
+    assert len((transport / "server.rs").read_text().splitlines()) <= 1300
+
+
+def test_rust_member_registration_waits_on_one_event_deadline():
+    source = (ROOT / "crates/tinyray/src/member.rs").read_text()
+    assert "shared.wait_registered(timeout)" in source
+    assert "left.min(Duration::from_millis(100))" not in source
+
 
 SERVER = textwrap.dedent(
     """
@@ -68,6 +124,16 @@ def test_nothing_public_is_missing_from_all():
     # `Any`/`annotations` are typing imports Python leaves in the namespace.
     undeclared = public - set(tinyray.__all__) - {"POLICIES", "annotations", "Any"}
     assert not undeclared, f"public but not in __all__: {sorted(undeclared)}"
+
+
+def test_removed_rpc_framework_dependencies_stay_absent():
+    metadata = (ROOT / "pyproject.toml").read_text().lower()
+    assert "pydantic" not in metadata
+    assert "httpx" not in metadata
+    assert not (ROOT / "python/tinyray/_models.py").exists()
+    workflow = (ROOT / ".github/workflows/release.yml").read_text().lower()
+    assert "pydantic" not in workflow
+    assert "httpx" not in workflow
 
 
 # ---- module level --------------------------------------------------------
@@ -162,6 +228,7 @@ def test_pool_pick_slot_all_and_len(svc):
     pool = tinyray.pool("svc")
     assert pool.pick().slot == 0
     assert pool.slot(0).slot == 0
+    assert isinstance(pool.all(), list)
     assert len(pool.all()) == 1
     assert len(pool) == 1
     assert "svc" in repr(pool)
@@ -195,7 +262,7 @@ def test_handle_fields_and_calling(svc):
     h = tinyray.pool("svc").slot(0)
     assert h.pool == "svc" and h.slot == 0
     assert h.incarnation > 0 and h.ready is True
-    assert h.url.startswith("http://") and h.state == {"v": 1}
+    assert h.url and "://" not in h.url and ":" in h.url and h.state == {"v": 1}
     assert h.identity == f"svc/0#{h.incarnation}"
     assert h.label.startswith("svc/0#") and len(h.label) < 20
     assert h.echo(7) == 7
@@ -228,7 +295,7 @@ def test_every_exception_is_reachable(svc):
                 "id": 0,
                 "slot": 0,
                 "incarnation": h.incarnation,
-                "url": "http://127.0.0.1:1",
+                "url": "127.0.0.1:1",
                 "ready": True,
             },
             ("echo",),

@@ -11,7 +11,6 @@ import threading
 import time
 import warnings
 
-import httpx
 import pytest
 import tinyray
 
@@ -221,8 +220,7 @@ def test_the_unreachable_message_names_the_address_it_actually_dialled():
 
 
 def test_a_list_of_registries_is_refused_instead_of_dialled():
-    """给一串地址会拼出 `http://a:1,b:2` —— 一个谁也连不上的 URL，而进程只会报
-    "注册中心没应答"，这话是真的但没用。
+    """A comma-separated value is not one native registry endpoint.
 
     文档里这一条是自己挖的坑：它把变量写成 `TINYRAY_REGISTRY=host:port,...`，
     那个逗号看起来就是可以填多个。而故意不做故障转移是有理由的（增量游标是按
@@ -270,10 +268,12 @@ def test_failed_join_releases_every_acquired_resource(registry, monkeypatch, fai
         with pytest.raises((ValueError, TypeError, tinyray.OldRegistryWarning)):
             tinyray.join("failed-start", serves=Ping(), **kwargs)
     assert tinyray._client is None
+    assert tinyray._method_server is None
     for server in servers:
-        assert not server._thread.is_alive()
-        with httpx.Client(trust_env=False) as client, pytest.raises(httpx.ConnectError):
-            client.post(f"http://127.0.0.1:{server.port}/call/ping", json={})
+        assert server._closed
+        with socket.socket() as connection:
+            connection.settimeout(1)
+            assert connection.connect_ex(("127.0.0.1", server.port)) != 0
     # Constructor, post-construction and post-registration failures all permit
     # another ordinary join in the same process.
     monkeypatch.setenv("TINYRAY_ADVERTISE", "127.0.0.1")

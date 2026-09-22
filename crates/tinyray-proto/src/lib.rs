@@ -1,10 +1,12 @@
-//! Wire types shared by the registry and the in-process client.
-//!
-//! There are exactly two messages on the wire: `Beat` and `BeatAck`.
+//! Registry state and framed MessagePack wire types shared by the server and
+//! the in-process client.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+pub mod rpc;
+pub mod wire;
 
 /// A member as seen by other processes. Being in a pool listing means alive,
 /// so there is no `alive` field. `expires_at` is registry-internal and never
@@ -56,6 +58,28 @@ impl Member {
 /// registry refuse the whole beat, which stopped the loop and killed the
 /// member in silence.
 pub const MAX_WATCH: usize = 64;
+/// Matches serde_json's default nesting ceiling, which was part of the
+/// registry and FFI input contract before the MessagePack cutover.
+pub const MAX_VALUE_DEPTH: usize = 128;
+
+pub fn value_within_depth_limit(value: &Value) -> bool {
+    let mut pending = vec![(value, 0usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_VALUE_DEPTH {
+            return false;
+        }
+        match value {
+            Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    true
+}
 
 /// JSON keeps 3 and 3.0 apart and Python does not, so `shard=6/2` -- the
 /// obvious way to compute a shard index -- found nobody while `shard=3` found
@@ -211,7 +235,8 @@ pub struct BeatAck {
 ///      answers the moment a watched pool moves
 ///   2  honours `Beat.publication`: a delayed beat cannot roll back the
 ///      state, readiness or URL of the same incarnation
-pub const PROTOCOL: u32 = 2;
+///   3  uses the native length-prefixed MessagePack registry transport
+pub const PROTOCOL: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -289,5 +314,16 @@ mod tests {
         // 布尔仍然不是数字，任何深度都一样
         let b = member_with(json!({ "cfg": { "free": true } }));
         assert!(!b.matches(&json!({ "cfg": { "free": 1 } })));
+    }
+
+    #[test]
+    fn messagepack_inputs_keep_the_previous_json_recursion_ceiling() {
+        let mut within = Value::Null;
+        for _ in 0..MAX_VALUE_DEPTH {
+            within = json!({"nested": within});
+        }
+        assert!(value_within_depth_limit(&within));
+        let over = json!({"nested": within});
+        assert!(!value_within_depth_limit(&over));
     }
 }

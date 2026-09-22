@@ -12,10 +12,10 @@ readiness owner" 就不再是一条靠自觉遵守的约定，而是结构上做
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 
+import msgspec
 import tinyray
 
 
@@ -125,10 +125,11 @@ def test_key_order_is_not_a_change(registry):
     """
     with tinyray.join("p", slot=0, size=1) as m:
         m.set_ready({"a": 1, "b": 2, "cfg": {"x": 1, "y": 2}})
-        assert m._c.set_state(json.dumps({"a": 1, "b": 2, "cfg": {"x": 1, "y": 2}}), True) is False
-        assert m._c.set_state(json.dumps({"b": 2, "a": 1, "cfg": {"x": 1, "y": 2}}), True) is False
-        assert m._c.set_state(json.dumps({"a": 1, "b": 2, "cfg": {"y": 2, "x": 1}}), True) is False
-        assert m._c.set_state(json.dumps({"a": 1, "b": 3, "cfg": {"x": 1, "y": 2}}), True) is True
+        pack = msgspec.msgpack.encode
+        assert m._c.set_state(pack({"a": 1, "b": 2, "cfg": {"x": 1, "y": 2}}), True) is False
+        assert m._c.set_state(pack({"b": 2, "a": 1, "cfg": {"x": 1, "y": 2}}), True) is False
+        assert m._c.set_state(pack({"a": 1, "b": 2, "cfg": {"y": 2, "x": 1}}), True) is False
+        assert m._c.set_state(pack({"a": 1, "b": 3, "cfg": {"x": 1, "y": 2}}), True) is True
 
 
 def test_republishing_the_same_thing_costs_nothing(registry):

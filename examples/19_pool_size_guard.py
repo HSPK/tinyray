@@ -10,17 +10,19 @@ four processes watching a hundred thousand is a gigabyte and a half.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(HERE))
 from _harness import free_port, role_main  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
+from tests.support.registry_wire import debug_pools  # noqa: E402
+
 LOADGEN = ROOT / "target" / "release" / "loadgen"
 TINYRAY = Path(sys.executable).parent / "tinyray"
 
@@ -71,8 +73,7 @@ def measure(members: int, watchers: int, seconds: int = 8) -> tuple[float, int]:
     peak = rss_mb(reg.pid)
     for p in load:
         p.wait(timeout=60)
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/pools", timeout=5) as r:
-        seen = json.loads(r.read()).get("load", {}).get("members", 0)
+    seen = debug_pools(f"127.0.0.1:{port}").get("load", {}).get("members", 0)
     reg.terminate()
     reg.wait(timeout=10)
     return peak - base, seen
