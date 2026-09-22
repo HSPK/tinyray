@@ -17,7 +17,6 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "python"))
 sys.path.insert(0, str(HERE))
 import tinyray  # noqa: E402
 from _harness import Fleet, role_main  # noqa: E402

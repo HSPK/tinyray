@@ -30,6 +30,12 @@ def test_the_probe_found_some_examples():
     assert len(EXAMPLES) >= 20, f"只找到 {len(EXAMPLES)} 个示例，收集方式坏了"
 
 
+def test_examples_do_not_shadow_the_installed_wheel():
+    shadow = 'sys.path.insert(0, str(HERE.parent / "python"))'
+    offenders = [path.name for path in EXAMPLES if shadow in path.read_text()]
+    assert not offenders, f"这些示例会绕过已安装 wheel，直接导入无扩展的源码包: {offenders}"
+
+
 @pytest.mark.examples
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
 def test_example_runs_clean(path: pathlib.Path):
